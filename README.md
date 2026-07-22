@@ -89,6 +89,38 @@ The frontend apps are run with Vite dev servers during development (see `docker-
 
 多個 AI agent（Claude／GPT-5.5／Gemini）針對關鍵架構問題（WebSocket 斷線重連、Fallback 機制、時間同步）各自獨立提出的意見，以及整合後的分歧點與建議決定，記錄在 [docs/adr/](docs/adr/README.md)。
 
+## Roadmap
+
+開發按 Milestone 推進，初版範圍為 **M0–M5**：
+
+| Milestone | 名稱 | 狀態 |
+|---|---|---|
+| **M0** | Foundation Complete | 🔧 進行中 |
+| **M1** | Single-Session E2E | ⏳ 待開始 |
+| **M2** | Reliability Complete | ⏳ 待開始 |
+| **M3** | CASE001 Pilot-ready | ⏳ 待開始 |
+| **M4** | Mini-pilot Complete | ⏳ 待開始 |
+| **M5** | Formal Pilot Complete | ⏳ 待開始 |
+
+完整路線圖（Phase 分工、Agent 角色、多 Agent 協作規則）：[`docs/roadmap.md`](docs/roadmap.md)。
+
 ## Status
 
-This repository is a **scaffold** (`init`): file structure, schemas, and skeletons are in place; business logic is intentionally stubbed. Implement against `docs/spec.md`.
+**當前 Milestone：M0 — Foundation Complete**
+
+Repository 為 scaffold（`init`）狀態：目錄結構、schema、skeleton 已就位，業務邏輯為 stub。M0 目標是確保所有 Agent 可在不互相覆蓋的情況下開始工作。
+
+M0 驗收條件：
+
+```
+✓ 全新 clone 後可一鍵安裝
+✓ Student、Wizard、Teacher 全部 build 成功
+✓ Shared package typecheck 成功
+✓ Server pytest 通過
+✓ Docker Compose 可啟動
+✓ CASE001 可經 REST API 載入
+✓ Event、Command、Snapshot schema 已凍結
+✓ ADR-0001 至 0003 改為 Accepted
+```
+
+Implement against `docs/spec.md` (source of truth) and `docs/roadmap.md` (development plan).
