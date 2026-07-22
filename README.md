@@ -89,6 +89,32 @@ The frontend apps are run with Vite dev servers during development (see `docker-
 
 多個 AI agent（Claude／GPT-5.5／Gemini）針對關鍵架構問題（WebSocket 斷線重連、Fallback 機制、時間同步）各自獨立提出的意見，以及整合後的分歧點與建議決定，記錄在 [docs/adr/](docs/adr/README.md)。
 
+## Roadmap
+
+完整的 M0–M8 里程碑、Phase 0–7 開發階段、建議的 12 個 Agent 分工與協作規則，詳見 [`docs/roadmap.md`](docs/roadmap.md)。
+
+| 里程碑 | 名稱 | 狀態 |
+|---|---|---|
+| M0 | Scaffold & Contract Lock | 進行中 |
+| M1 | 核心即時管線 E2E（依 ADR-0004：0001→0003→0002） | 未開始 |
+| M2 | 錄影與教師回看 MVP | 未開始 |
+| M3 | CASE001 內容完整化 | 未開始 |
+| M4 | 內部 Go/No-go 關卡 | 未開始 |
+| M5 | Mini-pilot（真實學生） | 未開始 |
+
+完整 M0–M8 與後續 Phase 詳情見 [`docs/roadmap.md`](docs/roadmap.md)。
+
 ## Status
 
-This repository is a **scaffold** (`init`): file structure, schemas, and skeletons are in place; business logic is intentionally stubbed. Implement against `docs/spec.md`.
+**當前里程碑：M0（Scaffold & Contract Lock）—— 進行中。**
+
+file structure, schemas, and skeletons are in place；ADR-0001～0004 已定案；business logic 仍為 stub，尚未開始 M1 實作。
+
+M0 驗收條件：
+- [x] repo 結構符合本 README 所描述的 monorepo 佈局
+- [x] `packages/shared` 與 `server/app/events.py` 事件封套 schema 一致
+- [x] ADR-0001～0004 狀態均為「已接受」，且已寫回 `docs/spec.md`
+- [x] `docs/roadmap.md` 建立，並與本 README、`docs/adr/README.md` 保持同步
+- [ ] 進入 Phase 1，開始實作 ADR-0001（WebSocket）
+
+完整里程碑定義、Agent 分工與驗收標準見 [`docs/roadmap.md`](docs/roadmap.md)。Implement against `docs/spec.md`.
