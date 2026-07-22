@@ -85,6 +85,10 @@ docker compose up server
 
 The frontend apps are run with Vite dev servers during development (see `docker-compose.yml` notes).
 
+## 架構決策記錄（ADR）
+
+多個 AI agent（Claude／GPT-5.5／Gemini）針對關鍵架構問題（WebSocket 斷線重連、Fallback 機制、時間同步）各自獨立提出的意見，以及整合後的分歧點與建議決定，記錄在 [docs/adr/](docs/adr/README.md)。
+
 ## Status
 
 This repository is a **scaffold** (`init`): file structure, schemas, and skeletons are in place; business logic is intentionally stubbed. Implement against `docs/spec.md`.
