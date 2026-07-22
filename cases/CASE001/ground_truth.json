@@ -1,0 +1,18 @@
+{
+  "case_id": "CASE001",
+  "summary": "疑犯確實參與盜竊，但聲稱案發時已離開倉庫。真相與其供詞在離開時間及 CCTV 上存在矛盾。",
+  "facts": {
+    "actual_leave_time": "23:40",
+    "claimed_leave_time": "21:00",
+    "stolen_items": ["電子產品 x3 箱"],
+    "accomplice_exists": true,
+    "cctv_shows_suspect_at": "23:35",
+    "suspect_guilt": "involved"
+  },
+  "key_contradictions": [
+    {
+      "id": "leave_time_vs_cctv",
+      "description": "疑犯聲稱 21:00 離開，但 CCTV 於 23:35 拍到其在場。"
+    }
+  ]
+}

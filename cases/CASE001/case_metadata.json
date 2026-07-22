@@ -1,0 +1,17 @@
+{
+  "case_id": "CASE001",
+  "title": "夜間倉庫盜竊案 Warehouse Night Theft",
+  "language": "zh-HK",
+  "version": "0.1.0",
+  "description": "初版單一案件骨架：一名坐姿疑犯，涉嫌於夜間盜竊倉庫貨物。供學生練習審訊技巧。",
+  "suspect": {
+    "name": "陳大文 Chan Tai Man",
+    "role": "warehouse_night_shift_worker",
+    "posture": "seated"
+  },
+  "interview": {
+    "expected_duration_min": [10, 15],
+    "setting": "固定模擬審訊室 fixed mock interrogation room"
+  },
+  "clip_budget_target": [25, 35]
+}

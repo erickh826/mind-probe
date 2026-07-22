@@ -1,0 +1,24 @@
+{
+  "case_id": "CASE001",
+  "description": "披露規則：控制哪些事實在滿足前置條件後才可由疑犯透露，避免矛盾（spec §12）。",
+  "rules": [
+    {
+      "fact": "claimed_leave_time",
+      "requires": [],
+      "forbidden_after": [],
+      "note": "疑犯可隨時給出其聲稱的離開時間 21:00。"
+    },
+    {
+      "fact": "actual_leave_time",
+      "requires": ["cctv_evidence_presented", "student_confronts_contradiction"],
+      "forbidden_after": [],
+      "note": "只有當學生展示 CCTV 證據並施壓後，疑犯才可能鬆口。"
+    },
+    {
+      "fact": "accomplice_identity",
+      "requires": ["actual_leave_time_revealed", "rapport_established"],
+      "forbidden_after": [],
+      "note": "同伴身份為最難撬開的資訊。"
+    }
+  ]
+}

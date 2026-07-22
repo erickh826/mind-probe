@@ -1,0 +1,16 @@
+{
+  "case_id": "CASE001",
+  "description": "教師評分 rubric（spec §13），總分 100。系統只提供證據及標記，正式評分由教師負責。",
+  "total": 100,
+  "categories": [
+    { "key": "opening", "label": "開場及程序說明", "max": 10 },
+    { "key": "rapport", "label": "建立關係及尊重", "max": 10 },
+    { "key": "questioning", "label": "提問方式", "max": 20 },
+    { "key": "active_listening", "label": "主動聆聽及避免打斷", "max": 15 },
+    { "key": "follow_up", "label": "跟進細節及矛盾", "max": 15 },
+    { "key": "evidence_strategy", "label": "證據展示策略", "max": 10 },
+    { "key": "avoid_coercion", "label": "避免誘導、威嚇及不當承諾", "max": 10 },
+    { "key": "closing", "label": "總結及結束", "max": 5 },
+    { "key": "reflection", "label": "事後反思", "max": 5 }
+  ]
+}

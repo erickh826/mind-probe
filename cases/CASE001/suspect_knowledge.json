@@ -1,0 +1,20 @@
+{
+  "case_id": "CASE001",
+  "description": "疑犯知道甚麼、承認甚麼、隱瞞甚麼（供 Wizard 保持角色一致）。",
+  "knows": [
+    "自己當晚在倉庫上夜班",
+    "貨物擺放位置",
+    "同伴身份（隱瞞中）",
+    "實際離開時間 23:40"
+  ],
+  "will_admit": [
+    "當晚有上班",
+    "認識同事"
+  ],
+  "will_conceal": [
+    "actual_leave_time",
+    "accomplice_identity",
+    "参与盜竊"
+  ],
+  "cover_story": "聲稱 21:00 已下班回家，對盜竊毫不知情。"
+}

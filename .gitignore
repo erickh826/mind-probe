@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.uv/
+
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+npm-debug.log*
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data
+sessions/*
+!sessions/.gitkeep
+*.sqlite
+*.sqlite3
+*.db
+
+# Case media (large binaries)
+cases/*/media/*
+!cases/*/media/.gitkeep
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,51 @@
+{
+  "case_id": "CASE001",
+  "description": "Wizard 三層決策樹（spec §8）：分類(F1–F8) → 回答選項 → 語氣狀態。葉節點對應 clip_manifest 的 clip_id。",
+  "tiers": {
+    "categories": {
+      "F1": "identity",
+      "F2": "relationships",
+      "F3": "timeline",
+      "F4": "location",
+      "F5": "evidence",
+      "F6": "contradiction",
+      "F7": "procedural_rights",
+      "F8": "general"
+    },
+    "states": {
+      "N": "neutral",
+      "T": "thinking",
+      "D": "defensive",
+      "I": "impatient",
+      "R": "refusing"
+    }
+  },
+  "tree": {
+    "F3": {
+      "label": "時間線 Timeline",
+      "options": {
+        "1": { "label": "到達時間 arrival_time", "clips": { "N": null } },
+        "2": {
+          "label": "離開時間 leave_time",
+          "clips": {
+            "D": "C001_TIMELINE_LEAVE_02",
+            "N": null
+          }
+        },
+        "3": { "label": "中途行動 mid_actions", "clips": { "N": null } },
+        "4": { "label": "時間不確定 uncertain_time", "clips": { "N": null } },
+        "5": { "label": "否認時間 deny_time", "clips": { "R": null } },
+        "6": { "label": "CCTV 矛盾 cctv_contradiction", "clips": { "D": null } }
+      }
+    },
+    "F8": {
+      "label": "通用回答 General / Fallback",
+      "options": {
+        "1": { "label": "要求澄清 ask_clarify", "clips": { "N": "C001_FALLBACK_CLARIFY_01" } },
+        "2": { "label": "不明白 dont_understand", "clips": { "N": null } },
+        "3": { "label": "不記得 dont_remember", "clips": { "D": null } },
+        "4": { "label": "拒答 refuse", "clips": { "R": null } }
+      }
+    }
+  }
+}

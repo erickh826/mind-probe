@@ -1,0 +1,40 @@
+# mind-probe — Docker Compose
+#
+# Only the Session Server is containerized here. The three frontend apps
+# (apps/student, apps/wizard, apps/teacher) are Vite dev servers during
+# development; see the notes at the bottom for running them.
+
+services:
+  server:
+    build:
+      context: ./server
+    image: mind-probe-server
+    container_name: mind-probe-server
+    ports:
+      - "8000:8000"
+    environment:
+      # Session-level access token base (see spec §審閱後修訂 6 / access control).
+      MINDPROBE_ENV: "development"
+      MINDPROBE_DB_URL: "sqlite:////data/sessions/mind-probe.sqlite"
+      MINDPROBE_CASES_DIR: "/data/cases"
+      MINDPROBE_SESSIONS_DIR: "/data/sessions"
+    volumes:
+      # Server owns all local storage (cases library + session recordings).
+      - ./cases:/data/cases
+      - ./sessions:/data/sessions
+    # FFmpeg is required for MediaRecorder chunk remux (spec §10); the server
+    # image installs it (see server/Dockerfile).
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+# ---------------------------------------------------------------------------
+# Frontend apps (dev)
+# ---------------------------------------------------------------------------
+# The frontends are not containerized in the MVP. Run each in its own shell:
+#
+#   cd apps/student && npm install && npm run dev -- --host   # student player
+#   cd apps/wizard  && npm install && npm run dev -- --host   # wizard console
+#   cd apps/teacher && npm install && npm run dev -- --host   # teacher review
+#
+# Point each app at the server via its .env (VITE_SERVER_URL, e.g.
+# http://<lan-ip>:8000). For a pilot, run the student app on a separate
+# machine from the Session Server (spec §3 note on recording+playback).

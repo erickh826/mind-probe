@@ -1,0 +1,31 @@
+{
+  "case_id": "CASE001",
+  "clips": [
+    {
+      "clip_id": "C001_TIMELINE_LEAVE_02",
+      "category": "timeline",
+      "intent": "ask_leave_time",
+      "character_state": "defensive",
+      "text": "我已經說了，我大約九時左右離開。",
+      "reveals": ["claimed_leave_time"],
+      "requires": [],
+      "forbidden_after": ["actual_leave_time_revealed"],
+      "duration_ms": 4380,
+      "file": "media/C001_TIMELINE_LEAVE_02.mp4",
+      "hotkey": "F3-2-D"
+    },
+    {
+      "clip_id": "C001_FALLBACK_CLARIFY_01",
+      "category": "fallback",
+      "intent": "ask_clarify",
+      "character_state": "neutral",
+      "text": "你想問咩？我唔係好明你嘅意思。",
+      "reveals": [],
+      "requires": [],
+      "forbidden_after": [],
+      "duration_ms": 2960,
+      "file": "media/C001_FALLBACK_CLARIFY_01.mp4",
+      "hotkey": "F8-1-N"
+    }
+  ]
+}
