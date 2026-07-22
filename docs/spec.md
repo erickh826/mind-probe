@@ -13,7 +13,9 @@
 7. **Fallback 選擇機制明確化（ADR-0002 已定案）**：Wizard 按熱鍵選擇的是**語意類別**（`CLARIFY` 要求澄清／`ONE_AT_A_TIME` 要求逐一提問／`UNKNOWN_OR_UNSURE` 不知道或不確定／`DECLINE_OR_BOUNDARY` 拒答或程序界線），Server 再依案件狀態、角色情緒、合作程度、已披露事實解析出實際影片；Server 可在同類別內避免連續重複相同片段，但不得自行改變語意類別。若已有語意貼合、案件狀態允許的案件回答，應正常回答播放，不算 fallback。同一問題最多用一次 fallback；連續兩次 Wizard 端顯示警告，連續三次系統建議主持人暫停。Fallback 本身不自動影響學生評分。詳見 [`docs/adr/0002-fallback-mechanism.md`](adr/0002-fallback-mechanism.md)。
 8. **斷線期間學生端顯示、及時間同步演算法明確化（ADR-0002、ADR-0003 已定案）**：WebSocket 斷線 2 秒以內不顯示技術錯誤（可續播 Idle／Thinking，僅背景記錄）；超過 2 秒需顯示中性提示「系統正在重新連線，請稍候。訪談計時已暫停。」並暫停正式計時、禁止 Wizard 發新回答；超過 30 秒進入 `connection_lost`，由主持人決定恢復、重新開始當前問題或中止 session。時間同步初始取樣改為 9 次 ping／pong，取 RTT 最低的 5 個樣本算 offset 中位數（非平均值）；Session 開始改為 Server 發出 `session_start_scheduled`（目前時間＋2 秒）供各端同時進入 active；session 進行中每 60 秒、WebSocket 重連後、暫停恢復後、瀏覽器回前景時各補做 5 次輕量取樣校正，但不回寫已發生事件的時間戳，僅套用於後續事件。詳見 [`docs/adr/0002-fallback-mechanism.md`](adr/0002-fallback-mechanism.md) 與 [`docs/adr/0003-time-sync.md`](adr/0003-time-sync.md)。
 
-以上均為文件層級修正，不影響原文整體方向、範圍界定與時程規劃，不視為阻塞項目。上述第 5–8 項的完整背景（多模型意見比較、共識與分歧、決策理由）保存在 [`docs/adr/`](adr/README.md)，本節為定案後寫回 spec 的摘要版本，如有出入以 ADR 內容為準並回頭修訂本節。
+9. **跨 ADR 共同規定（ADR-0004 已定案）**：暫停必須記錄原因，取值之一為 `manual`／`network_failure`／`clock_sync_failure`／`recording_failure`／`ethical_or_safety_stop`，技術暫停期間不進入學生評分指標；Server 必須記錄審計事件：誰控制了影片、誰觸發 fallback、誰暫停 session、誰接管連線、誰檢視或下載錄影、token 何時簽發及撤銷，日誌不得儲存 token 原文；資料保留優先順序為「原始事件 > 原始 WebM > 最終 MP4 > 自動生成報告」，轉碼或報告失敗時不得刪除原始資料。實作優先順序：ADR-0001（snapshot、ACK、去重及 token）→ ADR-0003（時間同步）→ ADR-0002（fallback 及斷線暫停）→ CASE001 端到端 M1 測試。M1 通過標準：Wizard 可控制 CASE001 影片、Student 穩定播放並錄影；斷線重連後不會重播過期命令，事件與錄影 chunk 可以補送；技術斷線會被正確暫停及記錄；Teacher 端能按統一時間線回看。詳見 [`docs/adr/0004-cross-cutting-rules.md`](adr/0004-cross-cutting-rules.md)。
+
+以上均為文件層級修正，不影響原文整體方向、範圍界定與時程規劃，不視為阻塞項目。上述第 5–9 項的完整背景（多模型意見比較、共識與分歧、決策理由）保存在 [`docs/adr/`](adr/README.md)，本節為定案後寫回 spec 的摘要版本，如有出入以 ADR 內容為準並回頭修訂本節。
 
 ---
 
@@ -76,7 +78,7 @@
 - 顯示案件目前階段；以分類查看預設回答；使用鍵盤熱鍵快速選擇回答；預覽或立即播放影片；中止正在播放的影片；觸發「被打斷」反應；返回Idle狀態；選擇角色狀態；標記未覆蓋問題；標記操作錯誤；輸入觀察備註；暫停或結束session。
 
 ### C. Session Server
-- 建立及關閉session；管理學生端與Wizard端連線；管理案件及影片清單；發送影片播放指令；保存所有事件；管理session時間軸；接收錄影chunks；使用FFmpeg重新封裝錄影；驗證錄影是否完整；提供教師回看資料（透過REST API）。
+- 建立及關閉session；管理學生端與Wizard端連線；管理案件及影片清單；發送影片播放指令；保存所有事件；管理session時間軸；接收錄影chunks；使用FFmpeg重新封裝錄影；驗證錄影是否完整；提供教師回看資料（透過REST API）；記錄審計事件（依修訂9，包括影片控制、fallback觸發、session暫停、連線接管、錄影檢視或下載、token簽發及撤銷，日誌不存token原文）。
 
 ### D. 教師回看端
 - 播放學生錄影；根據事件時間線重播疑犯片段；查看Wizard操作紀錄；跳到指定時間；加入教師標記；填寫rubric；匯出JSON、CSV及評分報告。
@@ -155,7 +157,7 @@ Response播放中，Wizard按「Interrupted」→ 中止影片及聲音 → 記�
 
 三層結構：第一層案件主題（F1身份/F2人物關係/F3時間線/F4地點/F5證據/F6矛盾/F7程序權利/F8通用回答）；第二層回答選項（例如選「時間線」後顯示1到達時間/2離開時間/3中途行動/4時間不確定/5否認時間/6CCTV矛盾）；第三層語氣狀態（N中性/T思考/D防衛/I不耐煩/R拒絕）。Wizard可在兩至三次按鍵內選出回答。
 
-必備快捷鍵：Space播放/確認、Esc中止影片、I返回Idle、T播放Thinking、B被打斷反應、F Fallback（依修訂7，選擇的是`CLARIFY`／`ONE_AT_A_TIME`／`UNKNOWN_OR_UNSURE`／`DECLINE_OR_BOUNDARY`四個語意類別之一，由Server解析為實際影片）、M標記未覆蓋問題、P暫停session、Ctrl+Enter結束session。
+必備快捷鍵：Space播放/確認、Esc中止影片、I返回Idle、T播放Thinking、B被打斷反應、F Fallback（依修訂7，選擇的是`CLARIFY`／`ONE_AT_A_TIME`／`UNKNOWN_OR_UNSURE`／`DECLINE_OR_BOUNDARY`四個語意類別之一，由Server解析為實際影片）、M標記未覆蓋問題、P暫停session（依修訂9，需選擇暫停原因：`manual`／`network_failure`／`clock_sync_failure`／`recording_failure`／`ethical_or_safety_stop`，技術暫停期間不計入學生評分）、Ctrl+Enter結束session。
 
 # 九、時間同步設計（標準事件封套，依修訂8定案）
 
@@ -184,7 +186,7 @@ Server建立`session_id`；學生端與Wizard端進行9次ping/pong，取RTT最�
 ## 10.1 主要錄影
 瀏覽器使用MediaRecorder，每2秒輸出一個chunk（`mediaRecorder.start(2000)`），輸出WebM。每個chunk包含Session ID、Sequence、開始與結束時間、檔案大小、checksum、上載狀態。上傳失敗先進IndexedDB佇列背景重試（依修訂5），session結束前必須全部確認上傳成功。
 
-Server端流程：按sequence保存 → 確認首個header chunk存在 → 訪談完成後合併 → 使用FFmpeg remux（並轉mp4/H.264/AAC，依修訂4）→ 驗證時長及影音軌 → 驗證成功後才清除瀏覽器暫存。
+Server端流程：按sequence保存 → 確認首個header chunk存在 → 訪談完成後合併 → 使用FFmpeg remux（並轉mp4/H.264/AAC，依修訂4）→ 驗證時長及影音軌 → 驗證成功後才清除瀏覽器暫存。資料保留優先順序（依修訂9）：原始事件 > 原始WebM > 最終MP4 > 自動生成報告，轉碼或報告失敗時不得刪除原始資料。
 
 ## 10.2 備用錄影
 Pilot期間用手機或獨立攝影機固定拍攝學生及房間，Session開始時錄下同步聲，只在主要錄影失敗時使用，不必進入自動分析流程。
