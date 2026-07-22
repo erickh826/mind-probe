@@ -2,16 +2,18 @@
 
 > 本文為「初版系統定案與 Review 意見」文件的最終版本。文件開頭的「審閱後修訂」章節列出對原文的修正，其餘為原文全文，作為實作依據。
 
-## 審閱後修訂��優先於下方原文對應章節）
+## 審閱後修訂（優先於下方原文對應章節）
 
 1. **影片數量預算加總超出上限**：原文各類別數量上限相加最多可達 41 段，超過「25–35段」的總體目標。修訂：25–35 段為硬性總量上限，各類別為彈性配額，須互相取捨。第一批建議配額（總數 30）：Idle 2、Thinking 3、Reaction 6、案件專屬 12、Fallback 4、Barge-in 2、程序反應 1，其餘留待 mini-pilot 後依實際數據調整。
 2. **事件 JSON schema 前後不一致**：原文第七節 `clip_interrupted` 範例與第九節的標準事件封套（envelope）結構不同（缺少 `session_id`、`sequence`、`server_timestamp_ms`、`clock_offset_ms`、`source`，且欄位未包在 `payload` 內）。修訂：全案統一使用第九節封套格式，所有事件類型專屬欄位（如 `clip_id`、`played_duration_ms`、`reason`）放入 `payload` 物件內。
 3. **架構圖資料流向需澄清**：學生端（瀏覽器 React 應用）不能直接寫入伺服器檔案系統。錄影 chunk 一律經 WebSocket/HTTP 上傳至 Session Server，由 Server 負責寫入本地儲存（/cases、/sessions、SQLite）與執行 FFmpeg remux。教師回看端一律透過 Session Server 的 REST API 存取資料，不直接讀取本地檔案系統。
 4. **MediaRecorder 錄製格式明確化**：Chrome 的 MediaRecorder 預設輸出 WebM（VP8/VP9 + Opus）。修訂：學生端錄製維持瀏覽器預設 WebM；Session 完成後由 Server 端 FFmpeg 轉封裝/轉碼為 mp4 (H.264/AAC) 供教師回看與長期保存；預生成疑犯影片庫統一用 H.264 baseline profile mp4，確保雙播放器 crossfade 流暢與硬體解碼相容。
-5. **WebSocket 斷線與 chunk 上傳重試策略明確化**：WebSocket 斷線後需自動重連並補送遺漏的事件序號；chunk 上傳失敗時先寫入 IndexedDB 佇列背景重試，session 結束前必須確認所有 chunk 上傳成功才可提示「可安全關閉」。
-6. **存取控制**：MVP 階段加入 session-level token（由 Server 產生，Wizard／學生／教師端啟動時輸入），避免同網段其他裝置誤連或窺看錄影。
+5. **WebSocket 斷線與 chunk 上傳重試策略明確化（ADR-0001 已定案）**：心跳採應用層 ping／pong，每 10 秒 ping、5 秒等候 pong、連續 3 次無回應（約 25–30 秒）判定離線；重連採指數退避加隨機抖動（0.5s→1s→2s→4s→5s→5s……，每次 ±20% jitter）。重連後**先取得 Server 權威 snapshot，再補送 Client 尚未 ACK 的事件**（snapshot-first），禁止只憑本地 sequence 盲目要求 Server 全部重播，避免播出已過期的播放指令；短期執行命令（`play_clip`／`stop_clip`／`return_idle`／`pause_player`）需帶 `command_id`、`expires_at_ms`、`snapshot_revision`，過期或舊 revision 命令一律拒絕執行。事件另具 `event_id` 供 ACK 去重（`accepted`／`duplicate`／`rejected`）。chunk 上傳失敗時先寫入 IndexedDB 佇列背景重試，session 結束前必須確認所有 chunk 上傳成功才可提示「可安全關閉」。詳見 [`docs/adr/0001-websocket-architecture.md`](adr/0001-websocket-architecture.md)。
+6. **存取控制（ADR-0001 已定案）**：不使用單一、全角色共用的 session token，改用「一次性加入碼＋短期、角色綁定的 Session Token」——Server 為 Student／Wizard／Teacher 各自產生一次性加入碼，Client 以 HTTPS 提交換取角色綁定 token（預設有效期 2 小時，透過 `HttpOnly`／`Secure`／`SameSite` Cookie 儲存，WebSocket 升級時驗證），session 結束後立即撤銷；禁止把 token 放在 WebSocket URL query string 或寫入日誌。每個 session 最多一個 active Student 連線及一個 active Wizard 連線，Teacher 可多個只讀連線，重複連線需經 Admin 確認並記錄審計事件。詳見 [`docs/adr/0001-websocket-architecture.md`](adr/0001-websocket-architecture.md)。
+7. **Fallback 選擇機制明確化（ADR-0002 已定案）**：Wizard 按熱鍵選擇的是**語意類別**（`CLARIFY` 要求澄清／`ONE_AT_A_TIME` 要求逐一提問／`UNKNOWN_OR_UNSURE` 不知道或不確定／`DECLINE_OR_BOUNDARY` 拒答或程序界線），Server 再依案件狀態、角色情緒、合作程度、已披露事實解析出實際影片；Server 可在同類別內避免連續重複相同片段，但不得自行改變語意類別。若已有語意貼合、案件狀態允許的案件回答，應正常回答播放，不算 fallback。同一問題最多用一次 fallback；連續兩次 Wizard 端顯示警告，連續三次系統建議主持人暫停。Fallback 本身不自動影響學生評分。詳見 [`docs/adr/0002-fallback-mechanism.md`](adr/0002-fallback-mechanism.md)。
+8. **斷線期間學生端顯示、及時間同步演算法明確化（ADR-0002、ADR-0003 已定案）**：WebSocket 斷線 2 秒以內不顯示技術錯誤（可續播 Idle／Thinking，僅背景記錄）；超過 2 秒需顯示中性提示「系統正在重新連線，請稍候。訪談計時已暫停。」並暫停正式計時、禁止 Wizard 發新回答；超過 30 秒進入 `connection_lost`，由主持人決定恢復、重新開始當前問題或中止 session。時間同步初始取樣改為 9 次 ping／pong，取 RTT 最低的 5 個樣本算 offset 中位數（非平均值）；Session 開始改為 Server 發出 `session_start_scheduled`（目前時間＋2 秒）供各端同時進入 active；session 進行中每 60 秒、WebSocket 重連後、暫停恢復後、瀏覽器回前景時各補做 5 次輕量取樣校正，但不回寫已發生事件的時間戳，僅套用於後續事件。詳見 [`docs/adr/0002-fallback-mechanism.md`](adr/0002-fallback-mechanism.md) 與 [`docs/adr/0003-time-sync.md`](adr/0003-time-sync.md)。
 
-以上均為文件層級修正，不影響原文整體方向、範圍界定與時程規劃，不視為阻塞項目。
+以上均為文件層級修正，不影響原文整體方向、範圍界定與時程規劃，不視為阻塞項目。上述第 5–8 項的完整背景（多模型意見比較、共識與分歧、決策理由）保存在 [`docs/adr/`](adr/README.md)，本節為定案後寫回 spec 的摘要版本，如有出入以 ADR 內容為準並回頭修訂本節。
 
 ---
 
@@ -22,7 +24,7 @@
 1. 學生是否能自然地與虛擬疑犯訪談；
 2. Wizard 能否在合理時間內選擇回應；
 3. 預製影片能否支援基本自由對話；
-4. 學生��影、疑犯回應及事件能否同步；
+4. 學生錄影、疑犯回應及事件能否同步；
 5. 案件設計與評分 rubric 是否適用；
 6. 收集後續自動化所需的真實問題與操作資料。
 
@@ -153,11 +155,11 @@ Response播放中，Wizard按「Interrupted」→ 中止影片及聲音 → 記�
 
 三層結構：第一層案件主題（F1身份/F2人物關係/F3時間線/F4地點/F5證據/F6矛盾/F7程序權利/F8通用回答）；第二層回答選項（例如選「時間線」後顯示1到達時間/2離開時間/3中途行動/4時間不確定/5否認時間/6CCTV矛盾）；第三層語氣狀態（N中性/T思考/D防衛/I不耐煩/R拒絕）。Wizard可在兩至三次按鍵內選出回答。
 
-必備快捷鍵：Space播放/確認、Esc中止影片、I返回Idle、T播放Thinking、B被打斷反應、F Fallback、M標記未覆蓋問題、P暫停session、Ctrl+Enter結束session。
+必備快捷鍵：Space播放/確認、Esc中止影片、I返回Idle、T播放Thinking、B被打斷反應、F Fallback（依修訂7，選擇的是`CLARIFY`／`ONE_AT_A_TIME`／`UNKNOWN_OR_UNSURE`／`DECLINE_OR_BOUNDARY`四個語意類別之一，由Server解析為實際影片）、M標記未覆蓋問題、P暫停session、Ctrl+Enter結束session。
 
-# 九、時間同步設計（標準事件封套）
+# 九、時間同步設計（標準事件封套，依修訂8定案）
 
-Server建立`session_id`；學生端與Wizard端進行多次ping/pong估算clock offset；Server發送指定的`start_at`；所有事件同時保存client相對時間、server接收時間、clock offset、sequence number。
+Server建立`session_id`；學生端與Wizard端進行9次ping/pong，取RTT最低的5個樣本算offset中位數（非平均值）；Server再發送`session_start_scheduled`（目前monotonic time＋2秒）讓各端同時進入active；session進行中每60秒、重連後、暫停恢復後、瀏覽器回前景時各補做5次輕量取樣校正（同樣取最低RTT 3個樣本的中位數），但不回寫已發生事件的時間戳。所有事件同時保存client相對時間、server接收時間、clock offset、offset版本、sequence number。
 
 事件格式：
 ```json
