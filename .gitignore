@@ -33,3 +33,16 @@ cases/*/media/*
 .DS_Store
 .idea/
 .vscode/
+
+# Loop Engineer (local single-person task-loop tool, not part of the
+# project's tracked multi-agent workflow docs — see docs/roadmap.md)
+AGENTS.md
+orchestrator.md
+loop_orchestrator.py
+run_now.bat
+run_now.ps1
+state.json
+orchestrator.log
+agents/
+memo/
+tasks/
