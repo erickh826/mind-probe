@@ -1,6 +1,6 @@
 {
   "case_id": "CASE001",
-  "description": "Wizard 三層決策樹（spec §8）：分類(F1–F8) → 回答選項 → 語氣狀態。葉節點對應 clip_manifest 的 clip_id。",
+  "description": "Wizard 三層決策樹（spec §8）：分類(F1–F8) → 回答選項 → 語氣狀態。葉節點對應 clip_manifest 的 clip_id；null 表示該格無專屬片段，由 F8 fallback 語意類別兜底（ADR-0002）。Idle（I）、Thinking（T）、Barge-in（B）由獨立熱鍵觸發，不經此樹。",
   "tiers": {
     "categories": {
       "F1": "identity",
@@ -21,6 +21,20 @@
     }
   },
   "tree": {
+    "F1": {
+      "label": "身份 Identity",
+      "options": {
+        "1": { "label": "姓名及職業 name_and_role", "clips": { "N": "C001_ID_NAME_01" } },
+        "2": { "label": "當晚值班 duty_that_night", "clips": { "N": "C001_ID_SHIFT_01" } }
+      }
+    },
+    "F2": {
+      "label": "人物關係 Relationships",
+      "options": {
+        "1": { "label": "認識同事 knows_colleagues", "clips": { "N": "C001_REL_COLLEAGUE_01" } },
+        "2": { "label": "同夥／其他人在場 accomplice", "clips": { "R": "C001_REL_ACCOMPLICE_01" } }
+      }
+    },
     "F3": {
       "label": "時間線 Timeline",
       "options": {
@@ -28,23 +42,64 @@
         "2": {
           "label": "離開時間 leave_time",
           "clips": {
-            "D": "C001_TIMELINE_LEAVE_02",
-            "N": null
+            "N": "C001_TIMELINE_LEAVE_01",
+            "D": "C001_TIMELINE_LEAVE_02"
           }
         },
-        "3": { "label": "中途行動 mid_actions", "clips": { "N": null } },
-        "4": { "label": "時間不確定 uncertain_time", "clips": { "N": null } },
+        "3": { "label": "中途行動 mid_actions", "clips": { "T": "C001_TIMELINE_MIDACTIONS_01" } },
+        "4": { "label": "時間不確定 uncertain_time", "clips": { "N": "C001_TIMELINE_UNCERTAIN_01" } },
         "5": { "label": "否認時間 deny_time", "clips": { "R": null } },
-        "6": { "label": "CCTV 矛盾 cctv_contradiction", "clips": { "D": null } }
+        "6": { "label": "CCTV 矛盾 cctv_contradiction", "clips": { "D": "C001_CONTRA_CCTV_01" } }
+      }
+    },
+    "F4": {
+      "label": "地點 Location",
+      "options": {
+        "1": { "label": "貨物擺放位置 goods_location", "clips": { "N": "C001_LOC_GOODS_01" } }
+      }
+    },
+    "F5": {
+      "label": "證據 Evidence",
+      "options": {
+        "1": { "label": "出示 CCTV／證據 present_cctv", "clips": { "D": "C001_EVIDENCE_DENY_01" } }
+      }
+    },
+    "F6": {
+      "label": "矛盾 Contradiction",
+      "options": {
+        "1": { "label": "離開時間 vs CCTV leave_time_vs_cctv", "clips": { "D": "C001_CONTRA_CCTV_01" } },
+        "2": { "label": "施壓後鬆口 press_after_contradiction", "clips": { "T": "C001_CONTRA_CONFESS_01" } }
+      }
+    },
+    "F7": {
+      "label": "程序權利 Procedural rights",
+      "options": {
+        "1": { "label": "要求休息／律師 request_break_or_lawyer", "clips": { "R": "C001_PROC_LAWYER_01" } }
       }
     },
     "F8": {
       "label": "通用回答 General / Fallback",
       "options": {
         "1": { "label": "要求澄清 ask_clarify", "clips": { "N": "C001_FALLBACK_CLARIFY_01" } },
-        "2": { "label": "不明白 dont_understand", "clips": { "N": null } },
-        "3": { "label": "不記得 dont_remember", "clips": { "D": null } },
-        "4": { "label": "拒答 refuse", "clips": { "R": null } }
+        "2": { "label": "逐一提問 one_at_a_time", "clips": { "N": "C001_FALLBACK_ONEATATIME_01" } },
+        "3": { "label": "不知道 unknown", "clips": { "N": "C001_FALLBACK_UNKNOWN_01" } },
+        "4": { "label": "拒答 decline", "clips": { "R": "C001_FALLBACK_DECLINE_01" } },
+        "5": {
+          "label": "短反應（負面）negative_reaction",
+          "clips": {
+            "D": "C001_REACT_DEFENSIVE_01",
+            "I": "C001_REACT_IMPATIENT_01",
+            "R": "C001_REACT_LOOKAWAY_01"
+          }
+        },
+        "6": {
+          "label": "短反應（其他）other_reaction",
+          "clips": {
+            "N": "C001_REACT_SHAKEHEAD_01",
+            "T": "C001_REACT_CONFUSED_01",
+            "I": "C001_REACT_SCOFF_01"
+          }
+        }
       }
     }
   }
