@@ -118,3 +118,6 @@ M0 驗收條件：
 - [ ] 進入 Phase 1，開始實作 ADR-0001（WebSocket）
 
 完整里程碑定義、Agent 分工與驗收標準見 [`docs/roadmap.md`](docs/roadmap.md)。Implement against `docs/spec.md`.
+
+local run 
+(Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned) 

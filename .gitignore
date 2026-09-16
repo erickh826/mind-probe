@@ -38,6 +38,7 @@ cases/*/media/*
 # project's tracked multi-agent workflow docs — see docs/roadmap.md)
 AGENTS.md
 orchestrator.md
+MANUAL.zh-TW.md
 loop_orchestrator.py
 run_now.bat
 run_now.ps1
