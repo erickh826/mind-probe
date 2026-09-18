@@ -1,49 +1,151 @@
-import { useEffect, useRef, useState } from "react";
-import type { EventEnvelope } from "@mind-probe/shared";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ClipManifestEntry } from "@mind-probe/shared";
+import { fetchClipManifest, fetchSession, joinSession } from "./api";
+import { mediaUrl } from "./config";
+import { JoinSessionModal } from "./components/JoinSessionModal";
+import { StudentOverlay } from "./components/StudentOverlay";
+import { SuspectVideoPlayer } from "./components/SuspectVideoPlayer";
+import { useMediaRecorder } from "./useMediaRecorder";
+import { useStudentSocket } from "./useStudentSocket";
+import type { JoinedSession, PlaybackClip } from "./types";
+import "./App.css";
 
-// Student端（spec §3.2 A / §10）：全螢幕顯示虛擬疑犯 + getUserMedia/MediaRecorder。
-// This is a scaffold — capture/upload/playback logic is sketched as TODOs.
+function findIdleClip(clips: ClipManifestEntry[]): ClipManifestEntry | null {
+  return (
+    clips.find((clip) => /idle|loop/i.test(`${clip.clip_id} ${clip.intent}`)) ?? null
+  );
+}
+
+function toPlaybackClip(
+  caseId: string,
+  clip: ClipManifestEntry | null,
+  loop: boolean,
+): PlaybackClip | null {
+  if (clip === null) {
+    return null;
+  }
+  return {
+    clipId: clip.clip_id,
+    src: clip.file ? mediaUrl(caseId, clip.file) : null,
+    label: clip.text || clip.clip_id,
+    loop,
+  };
+}
 
 export default function App() {
-  const suspectVideoRef = useRef<HTMLVideoElement>(null);
-  const [recording, setRecording] = useState(false);
+  const [joined, setJoined] = useState<JoinedSession | null>(null);
+  const [joinPending, setJoinPending] = useState(false);
+  const [joinError, setJoinError] = useState<string | null>(null);
+  const [cameraVisible, setCameraVisible] = useState(true);
+  const autoRecordingAttemptedRef = useRef(false);
+  const previousRecorderStatusRef = useRef<string>("idle");
 
-  useEffect(() => {
-    // TODO(§10.1): capture student camera + mic and start MediaRecorder.
-    //   const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-    //   const recorder = new MediaRecorder(stream); // browser default = WebM
-    //   recorder.ondataavailable = (e) => queueChunkUpload(e.data); // 2s chunks
-    //   recorder.start(2000);
-    // Failed chunk uploads go to an IndexedDB queue for background retry (審閱後修訂 5).
+  const socket = useStudentSocket(joined?.sessionId ?? null);
+  const recorder = useMediaRecorder({
+    sessionId: joined?.sessionId ?? null,
+    onChunkUploaded: socket.sendChunkUploaded,
+  });
 
-    // TODO(§9): open WebSocket to /ws/{session_id}/student, run ping/pong clock sync,
-    // and on `clip_command` swap the suspect <video> src (dual-player crossfade).
-    // ws.onmessage = (ev) => handleEvent(JSON.parse(ev.data) as EventEnvelope);
-    const _typeAnchor: EventEnvelope | null = null;
-    void _typeAnchor;
+  const clipLookup = useMemo(() => {
+    const map = new Map<string, ClipManifestEntry>();
+    for (const clip of joined?.clips ?? []) {
+      map.set(clip.clip_id, clip);
+    }
+    return map;
+  }, [joined?.clips]);
+
+  const idleClip = useMemo(() => {
+    if (joined === null) {
+      return null;
+    }
+    return toPlaybackClip(joined.caseId, findIdleClip(joined.clips), true);
+  }, [joined]);
+
+  const activeClip = useMemo(() => {
+    if (joined === null || socket.currentClipId === null) {
+      return null;
+    }
+    const clip = clipLookup.get(socket.currentClipId) ?? null;
+    if (clip === null) {
+      return {
+        clipId: socket.currentClipId,
+        src: null,
+        label: socket.currentClipId,
+        loop: false,
+      };
+    }
+    return toPlaybackClip(joined.caseId, clip, false);
+  }, [clipLookup, joined, socket.currentClipId]);
+
+  const handleJoin = useCallback(async (sessionId: string, joinCode: string) => {
+    setJoinPending(true);
+    setJoinError(null);
+    try {
+      const join = await joinSession(sessionId, joinCode, "student-browser");
+      if (join.role !== "student") {
+        throw new Error(`Join code is for role "${join.role}", not student.`);
+      }
+      const session = await fetchSession(join.session_id);
+      const clips = await fetchClipManifest(session.case_id);
+      setJoined({
+        sessionId: session.session_id,
+        caseId: session.case_id,
+        clips,
+      });
+    } catch (cause) {
+      setJoinError(String(cause instanceof Error ? cause.message : cause));
+    } finally {
+      setJoinPending(false);
+    }
   }, []);
 
+  useEffect(() => {
+    if (joined === null || socket.status !== "open" || autoRecordingAttemptedRef.current) {
+      return;
+    }
+    autoRecordingAttemptedRef.current = true;
+    void recorder.start();
+  }, [joined, recorder.start, socket.status]);
+
+  useEffect(() => {
+    const previous = previousRecorderStatusRef.current;
+    previousRecorderStatusRef.current = recorder.status;
+    if (previous !== "recording" && recorder.status === "recording") {
+      socket.sendRecordingStarted();
+    }
+    if (
+      (previous === "recording" || previous === "stopping") &&
+      ["stopped", "error", "unavailable"].includes(recorder.status)
+    ) {
+      socket.sendRecordingStopped(recorder.status);
+    }
+  }, [recorder.status, socket.sendRecordingStarted, socket.sendRecordingStopped]);
+
+  if (joined === null) {
+    return (
+      <JoinSessionModal pending={joinPending} error={joinError} onJoin={handleJoin} />
+    );
+  }
+
   return (
-    <div style={{ position: "fixed", inset: 0, background: "#000", color: "#fff" }}>
-      {/* Fullscreen suspect video (§3.2 A). Dual <video> elements for crossfade (§7). */}
-      <video
-        ref={suspectVideoRef}
-        style={{ width: "100%", height: "100%", objectFit: "contain" }}
-        playsInline
+    <div className="app-shell">
+      <SuspectVideoPlayer
+        activeClip={activeClip}
+        idleClip={idleClip}
+        paused={socket.session.session_state === "paused"}
+        onClipStarted={socket.sendClipStarted}
+        onClipEnded={socket.sendClipEnded}
       />
-
-      {/* System + recording status overlay (§3.2 A). */}
-      <div style={{ position: "absolute", top: 12, left: 12, fontSize: 14 }}>
-        <span style={{ color: recording ? "#ff5555" : "#888" }}>
-          ● {recording ? "REC" : "idle"}
-        </span>
-        {/* TODO: optional suspect subtitles toggle (§3.2 A). */}
-      </div>
-
-      {/* TODO: start / pause / resume / end session controls (§3.2 A). */}
-      <button onClick={() => setRecording((r) => !r)} style={{ position: "absolute", bottom: 12, left: 12 }}>
-        toggle rec (placeholder)
-      </button>
+      <StudentOverlay
+        socket={socket}
+        recorder={recorder}
+        cameraVisible={cameraVisible}
+        onToggleCamera={() => setCameraVisible((visible) => !visible)}
+        onStartRecording={() => {
+          void recorder.start();
+        }}
+        onStopRecording={recorder.stop}
+      />
     </div>
   );
 }
