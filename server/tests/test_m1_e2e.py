@@ -675,9 +675,9 @@ def test_fallback_matrix_resolves_every_category_and_alerts_at_three(client):
     headers = _join_roles(client, session_id, "wizard", "student")
     expected = {
         "CLARIFY": "C001_FALLBACK_CLARIFY_01",
-        "ONE_AT_A_TIME": "GEN_ONE_AT_A_TIME_01",
-        "UNKNOWN_OR_UNSURE": "GEN_UNKNOWN_01",
-        "DECLINE_OR_BOUNDARY": "GEN_DECLINE_01",
+        "ONE_AT_A_TIME": "C001_FALLBACK_ONEATATIME_01",
+        "UNKNOWN_OR_UNSURE": "C001_FALLBACK_UNKNOWN_01",
+        "DECLINE_OR_BOUNDARY": "C001_FALLBACK_DECLINE_01",
     }
 
     with _socket(client, session_id, "wizard", headers["wizard"]) as wizard, \

@@ -1,68 +1,205 @@
-import { useEffect } from "react";
-import type { EventEnvelope } from "@mind-probe/shared";
+import { useCallback, useMemo, useState } from "react";
 
-// Teacher回看端（spec §3.2 D / §13）：雙畫面（學生錄影 + 疑犯片段）＋ 事件時間線
-// ＋ rubric 評分。透過 Session Server REST API 讀取資料（審閱後修訂 3）。
-// This is a scaffold sketching the dual-view + timeline layout.
+import { fetchAuditLogs, fetchClipManifest, fetchRecordingStatus, fetchRubric, fetchSession, fetchTimeline, joinSession } from "./api";
+import "./App.css";
+import { DualVideoPlayer } from "./components/DualVideoPlayer";
+import { InteractiveTimeline } from "./components/InteractiveTimeline";
+import { RubricScoringPanel } from "./components/RubricScoringPanel";
+import { SessionJoinBar, type SessionLoadRequest } from "./components/SessionJoinBar";
+import type { AuthContext, AuditResponse, ClipManifestEntry, RecordingStatus, RubricData, SessionInfo, TeacherMarker, TimelineResponse } from "./types";
 
-// Rubric 評分類別 (§13)，總分 100。
-const RUBRIC = [
-  { key: "opening", label: "開場及程序說明", max: 10 },
-  { key: "rapport", label: "建立關係及尊重", max: 10 },
-  { key: "questioning", label: "提問方式", max: 20 },
-  { key: "active_listening", label: "主動聆聽及避免打斷", max: 15 },
-  { key: "follow_up", label: "跟進細節及矛盾", max: 15 },
-  { key: "evidence_strategy", label: "證據展示策略", max: 10 },
-  { key: "avoid_coercion", label: "避免誘導、威嚇及不當承諾", max: 10 },
-  { key: "closing", label: "總結及結束", max: 5 },
-  { key: "reflection", label: "事後反思", max: 5 },
-];
+function App() {
+  const [auth, setAuth] = useState<AuthContext>({ mode: "cookie" });
+  const [session, setSession] = useState<SessionInfo | null>(null);
+  const [timeline, setTimeline] = useState<TimelineResponse | null>(null);
+  const [recordingStatus, setRecordingStatus] = useState<RecordingStatus | null>(null);
+  const [rubric, setRubric] = useState<RubricData | null>(null);
+  const [audit, setAudit] = useState<AuditResponse | null>(null);
+  const [clips, setClips] = useState<ClipManifestEntry[]>([]);
+  const [teacherMarkers, setTeacherMarkers] = useState<TeacherMarker[]>([]);
+  const [currentTimeMs, setCurrentTimeMs] = useState(0);
+  const [seekTarget, setSeekTarget] = useState<{ tMs: number; nonce: number } | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
-export default function App() {
-  useEffect(() => {
-    // TODO(審閱後修訂 3): fetch session list + events + clip manifest from the
-    //   Session Server REST API (GET /cases/{id}, session endpoints).
-    // TODO(§3.2 D): replay suspect clips against the event timeline in sync with
-    //   the student recording; support seek-to-time and teacher markers.
-    const _typeAnchor: EventEnvelope | null = null;
-    void _typeAnchor;
+  const caseId = timeline?.case_id ?? session?.case_id ?? rubric?.case_id ?? "";
+
+  const summaryItems = useMemo(() => {
+    if (!timeline) {
+      return [];
+    }
+    return [
+      ["Events", String(timeline.summary.entry_count)],
+      ["Clips", String(timeline.summary.clip_count)],
+      ["Recording spans", String(timeline.summary.recording_span_count)],
+      ["Origin", timeline.t0_source],
+    ];
+  }, [timeline]);
+
+  const loadSession = useCallback(async (request: SessionLoadRequest) => {
+    setIsLoading(true);
+    setLoadError(null);
+    setSession(null);
+    setTimeline(null);
+    setRecordingStatus(null);
+    setRubric(null);
+    setAudit(null);
+    setClips([]);
+    setTeacherMarkers([]);
+
+    try {
+      const nextAuth: AuthContext =
+        request.authMode === "bearer"
+          ? { mode: "bearer", token: request.credential }
+          : { mode: "cookie" };
+
+      if (request.authMode === "join_code") {
+        const joined = await joinSession(request.sessionId, request.credential, request.clientId);
+        if (joined.role !== "teacher" && joined.role !== "observer") {
+          throw new Error(`Join code opened role '${joined.role}', not a review role.`);
+        }
+      }
+
+      const loadedSession = await fetchSession(request.sessionId);
+      const loadedTimeline = await fetchTimeline(request.sessionId, nextAuth);
+      const loadedStatus = await fetchRecordingStatus(request.sessionId, nextAuth);
+      const loadedRubric = await fetchRubric(loadedTimeline.case_id || loadedSession.case_id);
+      const loadedClips = await fetchClipManifest(loadedTimeline.case_id || loadedSession.case_id);
+      const loadedAudit = await fetchAuditLogs(request.sessionId, nextAuth);
+
+      setAuth(nextAuth);
+      setSession(loadedSession);
+      setTimeline(loadedTimeline);
+      setRecordingStatus(loadedStatus);
+      setRubric(loadedRubric);
+      setClips(loadedClips);
+      setAudit(loadedAudit);
+      setCurrentTimeMs(0);
+      setSeekTarget({ tMs: 0, nonce: Date.now() });
+      const storedMarkers = localStorage.getItem(`mind-probe:teacher-markers:${request.sessionId}`);
+      try {
+        const parsed: unknown = storedMarkers ? JSON.parse(storedMarkers) : [];
+        setTeacherMarkers(Array.isArray(parsed) ? parsed as TeacherMarker[] : []);
+      } catch {
+        setTeacherMarkers([]);
+      }
+    } catch (error) {
+      setLoadError(error instanceof Error ? error.message : "Unable to load review session.");
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  const seekTo = useCallback((tMs: number) => {
+    setSeekTarget({ tMs: Math.max(0, tMs), nonce: Date.now() });
+  }, []);
+
+  const saveMarkers = useCallback((sessionId: string, markers: TeacherMarker[]) => {
+    setTeacherMarkers(markers);
+    localStorage.setItem(`mind-probe:teacher-markers:${sessionId}`, JSON.stringify(markers));
   }, []);
 
   return (
-    <div style={{ fontFamily: "system-ui", display: "grid", gridTemplateRows: "1fr auto auto", height: "100vh" }}>
-      {/* Dual view: student recording (left) + suspect clip playback (right) (§3.2 D). */}
-      <section style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, padding: 8 }}>
-        <figure style={{ margin: 0, background: "#111" }}>
-          <figcaption style={{ color: "#aaa" }}>學生錄影 Student recording</figcaption>
-          <video style={{ width: "100%" }} controls /> {/* TODO: src from REST (student.mp4) */}
-        </figure>
-        <figure style={{ margin: 0, background: "#111" }}>
-          <figcaption style={{ color: "#aaa" }}>疑犯片段 Suspect clips</figcaption>
-          <video style={{ width: "100%" }} controls /> {/* TODO: driven by event timeline */}
-        </figure>
-      </section>
+    <main className="app-shell">
+      <SessionJoinBar
+        isLoading={isLoading}
+        onLoadSession={loadSession}
+        recordingStatus={recordingStatus}
+        session={session}
+      />
 
-      {/* Event timeline (§3.2 D). Placeholder track. */}
-      <section style={{ borderTop: "1px solid #ccc", padding: 8 }}>
-        <h2 style={{ fontSize: 14 }}>時間線 Timeline</h2>
-        <div style={{ height: 48, background: "#f0f0f0", position: "relative" }}>
-          {/* TODO: render clip_started / clip_interrupted / fallback markers. */}
+      {loadError ? <div className="alert alert-error">{loadError}</div> : null}
+
+      <section className="review-grid" aria-label="Teacher review workspace">
+        <div className="review-main">
+          <DualVideoPlayer
+            auth={auth}
+            caseId={caseId}
+            clips={clips}
+            onTimeChange={setCurrentTimeMs}
+            seekTarget={seekTarget}
+            sessionId={session?.session_id ?? null}
+            timeline={timeline}
+          />
+
+          <InteractiveTimeline
+            currentTimeMs={currentTimeMs}
+            teacherMarkers={teacherMarkers}
+            onAddTeacherMarker={(note) => {
+              if (!session) return;
+              saveMarkers(session.session_id, [...teacherMarkers, { id: crypto.randomUUID(), t_ms: currentTimeMs, note, created_at: new Date().toISOString() }]);
+            }}
+            onRemoveTeacherMarker={(id) => {
+              if (!session) return;
+              saveMarkers(session.session_id, teacherMarkers.filter((marker) => marker.id !== id));
+            }}
+            onSeek={seekTo}
+            timeline={timeline}
+          />
         </div>
-      </section>
 
-      {/* Rubric input (§13) + export JSON/CSV (§3.2 D). */}
-      <section style={{ borderTop: "1px solid #ccc", padding: 8 }}>
-        <h2 style={{ fontSize: 14 }}>評分 Rubric（總分 100）</h2>
-        <ul style={{ listStyle: "none", padding: 0 }}>
-          {RUBRIC.map((r) => (
-            <li key={r.key}>
-              {r.label} — <input type="number" min={0} max={r.max} defaultValue={0} /> / {r.max}
-            </li>
-          ))}
-        </ul>
-        {/* TODO: export JSON / CSV / scoring report (§3.2 D). */}
-        <button>匯出 Export (placeholder)</button>
+        <aside className="review-side" aria-label="Session scoring and metadata">
+          <section className="panel compact-panel">
+            <div className="panel-heading">
+              <div>
+                <p className="eyebrow">Session</p>
+                <h2>{session?.session_id ?? "No session loaded"}</h2>
+              </div>
+              <span className={`status-pill ${session?.status ?? "idle"}`}>
+                {session?.status ?? "idle"}
+              </span>
+            </div>
+
+            <dl className="summary-list">
+              <div>
+                <dt>Case</dt>
+                <dd>{caseId || "-"}</dd>
+              </div>
+              <div>
+                <dt>Revision</dt>
+                <dd>{session?.snapshot_revision ?? "-"}</dd>
+              </div>
+              {summaryItems.map(([label, value]) => (
+                <div key={label}>
+                  <dt>{label}</dt>
+                  <dd>{value}</dd>
+                </div>
+              ))}
+              <div>
+                <dt>Recording</dt>
+                <dd>
+                  {recordingStatus
+                    ? `${recordingStatus.chunk_count} chunks, ${recordingStatus.missing_sequences.length} gaps`
+                    : "-"}
+                </dd>
+              </div>
+            </dl>
+          </section>
+
+          <RubricScoringPanel caseId={caseId} rubric={rubric} sessionId={session?.session_id ?? ""} teacherMarkers={teacherMarkers} />
+
+          <section className="panel compact-panel">
+            <div className="panel-heading">
+              <div>
+                <p className="eyebrow">Audit</p>
+                <h2>Access log</h2>
+              </div>
+              <span className="count-badge">{audit?.entries.length ?? 0}</span>
+            </div>
+            <div className="audit-list">
+              {audit?.entries.slice(-5).map((entry) => (
+                <article key={entry.id} className="audit-row">
+                  <strong>{entry.action}</strong>
+                  <span>{entry.actor_role ?? "unknown"}</span>
+                  <time>{entry.created_at ? new Date(entry.created_at).toLocaleString() : "-"}</time>
+                </article>
+              )) ?? <p className="muted">Load a session to inspect audit activity.</p>}
+            </div>
+          </section>
+        </aside>
       </section>
-    </div>
+    </main>
   );
 }
+
+export default App;

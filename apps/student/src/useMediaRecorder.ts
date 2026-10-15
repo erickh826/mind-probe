@@ -28,6 +28,23 @@ function pickMimeType(): string | undefined {
   return candidates.find((candidate) => MediaRecorder.isTypeSupported(candidate));
 }
 
+function describeMediaError(cause: unknown): { message: string; retryable: boolean } {
+  const name = cause instanceof DOMException ? cause.name : "";
+  switch (name) {
+    case "NotFoundError":
+    case "OverconstrainedError":
+      return { message: "No camera/microphone found. Connect one and recording will start automatically.", retryable: true };
+    case "NotReadableError":
+    case "AbortError":
+      return { message: "Camera is busy or unavailable (used by another app/tab?). Close it; retrying automatically.", retryable: true };
+    case "NotAllowedError":
+    case "SecurityError":
+      return { message: "Camera/microphone permission denied. Allow access in the browser address bar, then press Start.", retryable: false };
+    default:
+      return { message: `Unable to start recording: ${String(cause)}`, retryable: false };
+  }
+}
+
 export function useMediaRecorder({
   sessionId,
   onChunkUploaded,
@@ -40,6 +57,7 @@ export function useMediaRecorder({
   const [error, setError] = useState<string | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const sequenceRef = useRef(0);
+  const retryableRef = useRef(false);
   const sessionIdRef = useRef<string | null>(sessionId);
 
   useEffect(() => {
@@ -99,8 +117,10 @@ export function useMediaRecorder({
 
     setStatus("requesting");
     setError(null);
+    retryableRef.current = false;
+    let mediaStream: MediaStream | null = null;
     try {
-      const mediaStream = await navigator.mediaDevices.getUserMedia({
+      mediaStream = await navigator.mediaDevices.getUserMedia({
         video: true,
         audio: true,
       });
@@ -142,11 +162,32 @@ export function useMediaRecorder({
       recorder.start(2_000);
       setStatus("recording");
     } catch (cause) {
-      const message = `Unable to start recording: ${String(cause)}`;
+      mediaStream?.getTracks().forEach((track) => track.stop());
+      const { message, retryable } = describeMediaError(cause);
+      retryableRef.current = retryable;
       setError(message);
       setStatus("error");
     }
   }, [status, uploadChunk]);
+
+  const startRef = useRef(start);
+  useEffect(() => {
+    startRef.current = start;
+  }, [start]);
+
+  // Auto-retry when a device is plugged in, and periodically while the camera is busy.
+  useEffect(() => {
+    if (status !== "error" || !retryableRef.current || sessionId === null) {
+      return;
+    }
+    const retry = () => void startRef.current();
+    navigator.mediaDevices?.addEventListener("devicechange", retry);
+    const timer = window.setInterval(retry, 5_000);
+    return () => {
+      navigator.mediaDevices?.removeEventListener("devicechange", retry);
+      window.clearInterval(timer);
+    };
+  }, [status, sessionId]);
 
   const stop = useCallback(() => {
     const recorder = recorderRef.current;
@@ -168,15 +209,22 @@ export function useMediaRecorder({
     }
   }, [chunks, uploadChunk]);
 
+  const streamRef = useRef<MediaStream | null>(null);
+
+  useEffect(() => {
+    streamRef.current = stream;
+  }, [stream]);
+
   useEffect(() => {
     return () => {
       const recorder = recorderRef.current;
       if (recorder && recorder.state !== "inactive") {
         recorder.stop();
       }
-      stream?.getTracks().forEach((track) => track.stop());
+      recorderRef.current = null;
+      streamRef.current?.getTracks().forEach((track) => track.stop());
     };
-  }, [stream]);
+  }, []);
 
   const uploadedCount = chunks.filter((chunk) => chunk.status === "uploaded").length;
   const failedCount = chunks.filter((chunk) => chunk.status === "failed").length;

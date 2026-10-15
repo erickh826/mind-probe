@@ -15,6 +15,8 @@
 
 9. **跨 ADR 共同規定（ADR-0004 已定案）**：暫停必須記錄原因，取值之一為 `manual`／`network_failure`／`clock_sync_failure`／`recording_failure`／`ethical_or_safety_stop`，技術暫停期間不進入學生評分指標；Server 必須記錄審計事件：誰控制了影片、誰觸發 fallback、誰暫停 session、誰接管連線、誰檢視或下載錄影、token 何時簽發及撤銷，日誌不得儲存 token 原文；資料保留優先順序為「原始事件 > 原始 WebM > 最終 MP4 > 自動生成報告」，轉碼或報告失敗時不得刪除原始資料。實作優先順序：ADR-0001（snapshot、ACK、去重及 token）→ ADR-0003（時間同步）→ ADR-0002（fallback 及斷線暫停）→ CASE001 端到端 M1 測試。M1 通過標準：Wizard 可控制 CASE001 影片、Student 穩定播放並錄影；斷線重連後不會重播過期命令，事件與錄影 chunk 可以補送；技術斷線會被正確暫停及記錄；Teacher 端能按統一時間線回看。詳見 [`docs/adr/0004-cross-cutting-rules.md`](adr/0004-cross-cutting-rules.md)。
 
+10. **雲端部署、Bearer 認證與錄影保留（ADR-0005 已定案）**：認證改用 `Authorization: Bearer`，WebSocket 用 `Sec-WebSocket-Protocol` 傳 token（取代修訂 6 的 cookie 傳輸）；新增 review token（session 結束後審閱）與 operator token；所有 REST 端點依角色授權。錄影新增 `finalize` 與完整性狀態機（`complete`／`incomplete`／`recorder_lost` 優先），本機 chunks 與原始 WebM 僅在錄影完整且 MP4 驗證通過後才刪除（修訂 9 的保留順序因此更新）；新增 teacher 專用的錄影刪除（`deleting` → `deleted`，持久化清理與對帳）。詳見 [`docs/adr/0005-cloud-deployment-and-recording-retention.md`](adr/0005-cloud-deployment-and-recording-retention.md)。
+
 以上均為文件層級修正，不影響原文整體方向、範圍界定與時程規劃，不視為阻塞項目。上述第 5–9 項的完整背景（多模型意見比較、共識與分歧、決策理由）保存在 [`docs/adr/`](adr/README.md)，本節為定案後寫回 spec 的摘要版本，如有出入以 ADR 內容為準並回頭修訂本節。
 
 ---

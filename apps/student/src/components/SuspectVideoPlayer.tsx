@@ -114,7 +114,11 @@ export function SuspectVideoPlayer({
     }
   }, [activeSlot, displayedClip?.src, paused]);
 
-  const handleEnded = () => {
+  const handleEnded = (e: React.SyntheticEvent<HTMLVideoElement>) => {
+    const activeVideo = activeSlot === 0 ? videoARef.current : videoBRef.current;
+    if (e.currentTarget !== activeVideo) {
+      return;
+    }
     const clip = currentClipRef.current;
     if (clip && !clip.loop) {
       onClipEnded(clip.clipId);

@@ -1022,10 +1022,14 @@ def test_resolve_fallback_clip_prefers_the_case_manifest_without_changing_catego
     assert cases.resolve_fallback_clip("CASE001", "CLARIFY") == (
         "C001_FALLBACK_CLARIFY_01"
     )
-    # CASE001 has no approved clip for the other three categories; ADR-0002 §4
-    # forbids answering with a different category, so the generic clip stands.
+    assert cases.resolve_fallback_clip("CASE001", "ONE_AT_A_TIME") == (
+        "C001_FALLBACK_ONEATATIME_01"
+    )
     assert cases.resolve_fallback_clip("CASE001", "UNKNOWN_OR_UNSURE") == (
-        "GEN_UNKNOWN_01"
+        "C001_FALLBACK_UNKNOWN_01"
+    )
+    assert cases.resolve_fallback_clip("CASE001", "DECLINE_OR_BOUNDARY") == (
+        "C001_FALLBACK_DECLINE_01"
     )
 
 
@@ -1151,9 +1155,9 @@ def test_request_fallback_resolves_each_category_and_broadcasts_fallback_used(
     session_id = _fresh_session_id()
     expected = {
         "CLARIFY": "C001_FALLBACK_CLARIFY_01",
-        "ONE_AT_A_TIME": "GEN_ONE_AT_A_TIME_01",
-        "UNKNOWN_OR_UNSURE": "GEN_UNKNOWN_01",
-        "DECLINE_OR_BOUNDARY": "GEN_DECLINE_01",
+        "ONE_AT_A_TIME": "C001_FALLBACK_ONEATATIME_01",
+        "UNKNOWN_OR_UNSURE": "C001_FALLBACK_UNKNOWN_01",
+        "DECLINE_OR_BOUNDARY": "C001_FALLBACK_DECLINE_01",
     }
     with _connect(session_id, "wizard") as wizard, \
             _connect(session_id, "student") as student:
@@ -1192,7 +1196,7 @@ def test_request_fallback_resolves_each_category_and_broadcasts_fallback_used(
                     assert sock.receive_json()["type"] == "fallback_threshold_reached"
 
         assert websocket_module.manager.snapshot_for(session_id).active_clip == (
-            "GEN_DECLINE_01"
+            "C001_FALLBACK_DECLINE_01"
         )
 
     fallback_events = [
@@ -1530,7 +1534,7 @@ def _wait_for_session_pause(session_id: str, *, timeout_s: float = 1.0) -> None:
     """Poll the row until an async disconnect task has had a chance to run."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        if _session_row(session_id).status == "paused":
+        if _session_row(session_id).status == "paused" and _audit_rows(session_id, models.AUDIT_SESSION_PAUSED):
             return
         time.sleep(0.01)
     assert _session_row(session_id).status == "paused"

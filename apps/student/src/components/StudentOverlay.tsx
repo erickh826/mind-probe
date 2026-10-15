@@ -23,6 +23,9 @@ export function StudentOverlay({
   onStopRecording,
 }: StudentOverlayProps) {
   const paused = socket.session.session_state === "paused";
+  const isStoppedOrEnded = recorder.status === "stopped" || socket.session.session_state === "ended";
+  const hasPending = recorder.chunks.some((c) => c.status === "queued" || c.status === "uploading");
+  const isSafeToClose = isStoppedOrEnded && !hasPending && recorder.failedCount === 0 && recorder.uploadedCount > 0;
 
   return (
     <>
@@ -58,6 +61,19 @@ export function StudentOverlay({
           <strong>
             {recorder.uploadedCount} uploaded / {recorder.failedCount} failed
           </strong>
+          {isSafeToClose ? (
+            <span style={{ color: "#42d392", fontWeight: 700, marginTop: "4px", display: "block" }}>
+              ✅ 錄影已全數保存，可安全關閉 (Safe to close)
+            </span>
+          ) : isStoppedOrEnded && hasPending ? (
+            <span style={{ color: "#f2c14e", fontWeight: 600, marginTop: "4px", display: "block" }}>
+              ⏳ 正在上傳剩餘錄影，請勿關閉視窗...
+            </span>
+          ) : isStoppedOrEnded && recorder.failedCount > 0 ? (
+            <span style={{ color: "#ff8a8a", fontWeight: 600, marginTop: "4px", display: "block" }}>
+              ❌ 有片段上傳失敗，請點擊 Retry 重試
+            </span>
+          ) : null}
           {recorder.error ? <span className="panel-error">{recorder.error}</span> : null}
         </div>
         <div className="button-row">

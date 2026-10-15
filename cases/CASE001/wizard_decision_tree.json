@@ -1,6 +1,6 @@
 {
   "case_id": "CASE001",
-  "description": "Wizard 三層決策樹（spec §8）：分類(F1–F8) → 回答選項 → 語氣狀態。葉節點對應 clip_manifest 的 clip_id。",
+  "description": "Wizard 三層決策樹（spec §8）：分類(F1–F8) → 回答選項(1–6) → 語氣狀態(N/T/D/I/R)。葉節點對應 clip_manifest 的 clip_id。",
   "tiers": {
     "categories": {
       "F1": "identity",
@@ -21,30 +21,111 @@
     }
   },
   "tree": {
+    "F1": {
+      "label": "身份及背景 Identity",
+      "options": {
+        "1": {
+          "label": "姓名職位 confirm_name_job",
+          "clips": { "N": "C001_ID_NAME_01" }
+        },
+        "2": {
+          "label": "班次職責 explain_shift_duties",
+          "clips": { "N": "C001_ID_SHIFT_01" }
+        }
+      }
+    },
+    "F2": {
+      "label": "人際關係 Relationships",
+      "options": {
+        "1": {
+          "label": "同事關係 talk_about_colleagues",
+          "clips": { "N": "C001_REL_COLLEAGUE_01" }
+        },
+        "2": {
+          "label": "阿強關係 deny_accomplice_contact",
+          "clips": { "D": "C001_REL_ACCOMPLICE_01" }
+        }
+      }
+    },
     "F3": {
       "label": "時間線 Timeline",
       "options": {
-        "1": { "label": "到達時間 arrival_time", "clips": { "N": null } },
-        "2": {
-          "label": "離開時間 leave_time",
-          "clips": {
-            "D": "C001_TIMELINE_LEAVE_02",
-            "N": null
-          }
+        "1": {
+          "label": "聲稱離開時間 claim_leave_time_early",
+          "clips": { "N": "C001_TIMELINE_LEAVE_01" }
         },
-        "3": { "label": "中途行動 mid_actions", "clips": { "N": null } },
-        "4": { "label": "時間不確定 uncertain_time", "clips": { "N": null } },
-        "5": { "label": "否認時間 deny_time", "clips": { "R": null } },
-        "6": { "label": "CCTV 矛盾 cctv_contradiction", "clips": { "D": null } }
+        "2": {
+          "label": "堅持離開時間 insist_leave_time_defensive",
+          "clips": { "D": "C001_TIMELINE_LEAVE_02" }
+        },
+        "3": {
+          "label": "中途行動 explain_mid_actions",
+          "clips": { "N": "C001_TIMELINE_MIDACTIONS_01" }
+        },
+        "4": {
+          "label": "時間不確定 timeline_uncertain_vague",
+          "clips": { "T": "C001_TIMELINE_UNCERTAIN_01" }
+        }
+      }
+    },
+    "F4": {
+      "label": "地點及環境 Location",
+      "options": {
+        "1": {
+          "label": "電子貨物存放 describe_goods_location",
+          "clips": { "N": "C001_LOC_GOODS_01" }
+        }
+      }
+    },
+    "F5": {
+      "label": "物證與痕跡 Evidence",
+      "options": {
+        "1": {
+          "label": "否認撬門痕跡 deny_involvement_evidence",
+          "clips": { "D": "C001_EVIDENCE_DENY_01" }
+        }
+      }
+    },
+    "F6": {
+      "label": "矛盾與對質 Contradiction",
+      "options": {
+        "1": {
+          "label": "CCTV記錄矛盾 flustered_by_cctv",
+          "clips": { "D": "C001_CONTRA_CCTV_01" }
+        },
+        "2": {
+          "label": "局部招認 partial_confession_pressure",
+          "clips": { "D": "C001_CONTRA_CONFESS_01" }
+        }
+      }
+    },
+    "F7": {
+      "label": "程序權利 Procedural Rights",
+      "options": {
+        "1": {
+          "label": "要求律師權利 demand_lawyer_rights",
+          "clips": { "R": "C001_PROC_LAWYER_01" }
+        }
       }
     },
     "F8": {
-      "label": "通用回答 General / Fallback",
+      "label": "通用與 Fallback General",
       "options": {
-        "1": { "label": "要求澄清 ask_clarify", "clips": { "N": "C001_FALLBACK_CLARIFY_01" } },
-        "2": { "label": "不明白 dont_understand", "clips": { "N": null } },
-        "3": { "label": "不記得 dont_remember", "clips": { "D": null } },
-        "4": { "label": "拒答 refuse", "clips": { "R": null } }
+        "1": {
+          "label": "要求澄清 ask_clarify / 逐樣問",
+          "clips": {
+            "N": "C001_FALLBACK_CLARIFY_01",
+            "I": "C001_FALLBACK_ONEATATIME_01"
+          }
+        },
+        "2": {
+          "label": "不清楚 unknown_unsure",
+          "clips": { "N": "C001_FALLBACK_UNKNOWN_01" }
+        },
+        "3": {
+          "label": "拒絕回答 decline_boundary",
+          "clips": { "R": "C001_FALLBACK_DECLINE_01" }
+        }
       }
     }
   }

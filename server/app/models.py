@@ -421,6 +421,8 @@ def consume_join_code(
     if join_code is None:
         raise JoinCodeInvalid("invalid join code")
     if join_code.consumed_at is not None:
+        if join_code.role in ("teacher", "observer"):
+            return join_code
         raise JoinCodeConsumed("join code already consumed")
     consumed_at = _utcnow()
     result = db.execute(
@@ -623,6 +625,78 @@ def load_events(db: DBSession, session_id: str) -> list[Event]:
 
 
 # ---------------------------------------------------------------------------
+# Recording chunk metadata (spec §10.1, ADR-0004 §4)
+# ---------------------------------------------------------------------------
+
+
+def get_recording_chunks(db: DBSession, session_id: str) -> list[RecordingChunk]:
+    """Return a session's chunk metadata ordered by ``sequence``.
+
+    ``id`` breaks ties so the order is deterministic even if a sequence was
+    somehow recorded twice.
+    """
+    return list(
+        db.scalars(
+            select(RecordingChunk)
+            .where(RecordingChunk.session_id == session_id)
+            .order_by(RecordingChunk.sequence, RecordingChunk.id)
+        )
+    )
+
+
+def save_recording_chunk_metadata(
+    db: DBSession,
+    session_id: str,
+    sequence: int,
+    *,
+    size_bytes: int | None = None,
+    checksum: str | None = None,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    path: str | None = None,
+    upload_status: str = "received",
+    commit: bool = True,
+) -> RecordingChunk:
+    """Upsert the metadata row for one uploaded chunk.
+
+    Upload retries are normal (ADR-0002 §8), so a second call for the same
+    ``(session_id, sequence)`` refreshes the existing row rather than adding a
+    duplicate. The uniqueness is enforced here rather than by a
+    ``UniqueConstraint`` on the table: as :func:`init_db` notes, ``create_all``
+    does not alter existing tables and there is no migration tool wired up, so
+    a new constraint would apply to fresh databases and silently not to the
+    ``sessions/mind-probe.sqlite`` already on disk -- the worst of both.
+
+    Unlike events, chunk metadata *is* mutable: it describes a file whose
+    bytes are the real artefact, and ADR-0004 §4's immutability applies to the
+    raw event log and the media, not to this index over it.
+    """
+    existing = db.scalars(
+        select(RecordingChunk)
+        .where(RecordingChunk.session_id == session_id)
+        .where(RecordingChunk.sequence == sequence)
+        .order_by(RecordingChunk.id)
+        .limit(1)
+    ).first()
+
+    chunk = existing or RecordingChunk(session_id=session_id, sequence=sequence)
+    chunk.size_bytes = size_bytes
+    chunk.checksum = checksum
+    chunk.start_ms = start_ms
+    chunk.end_ms = end_ms
+    chunk.path = path
+    chunk.upload_status = upload_status
+    if existing is None:
+        db.add(chunk)
+
+    if commit:
+        db.commit()
+    else:
+        db.flush()
+    return chunk
+
+
+# ---------------------------------------------------------------------------
 # Audit log (ADR-0004 §3)
 # ---------------------------------------------------------------------------
 
@@ -801,3 +875,48 @@ def revoke_session_tokens(
     else:
         db.flush()
     return entries
+
+
+REVOKE_REASON_SESSION_ENDED = "session_ended"
+REVOKE_REASON_SECURITY = "security"
+
+
+def token_revocation_reason(
+    db: DBSession, session_id: str, token_hash: str
+) -> str | None:
+    """Why a token digest was revoked, or None when it is not revoked (ADR-0005 §1)."""
+    rows = db.scalars(
+        select(AuditLog)
+        .where(AuditLog.session_id == session_id)
+        .where(AuditLog.action == AUDIT_TOKEN_REVOKED)
+        .where(AuditLog.token_hash == token_hash)
+        .order_by(AuditLog.id)
+    ).all()
+    if not rows:
+        return None
+    # Any security revocation wins over a later session_ended one.
+    reasons = {(row.details or {}).get("reason") for row in rows}
+    if REVOKE_REASON_SECURITY in reasons:
+        return REVOKE_REASON_SECURITY
+    return REVOKE_REASON_SESSION_ENDED if REVOKE_REASON_SESSION_ENDED in reasons else str(next(iter(reasons)))
+
+
+def revoke_token_hash(
+    db: DBSession,
+    session_id: str,
+    token_hash: str,
+    *,
+    reason: str = REVOKE_REASON_SECURITY,
+    actor_role: str = "server",
+    commit: bool = True,
+) -> AuditLog:
+    """Revoke a single token digest, e.g. after a leak (ADR-0005 §1)."""
+    return record_audit(
+        db,
+        action=AUDIT_TOKEN_REVOKED,
+        actor_role=actor_role,
+        session_id=session_id,
+        token_hash=token_hash,
+        details={"reason": reason},
+        commit=commit,
+    )

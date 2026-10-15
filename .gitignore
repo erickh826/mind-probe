@@ -21,6 +21,7 @@ npm-debug.log*
 # Runtime data
 sessions/*
 !sessions/.gitkeep
+server/sessions/
 *.sqlite
 *.sqlite3
 *.db
@@ -33,6 +34,9 @@ cases/*/media/*
 .DS_Store
 .idea/
 .vscode/
+
+# backup
+bk/
 
 # Loop Engineer (local single-person task-loop tool, not part of the
 # project's tracked multi-agent workflow docs — see docs/roadmap.md)
@@ -47,3 +51,5 @@ orchestrator.log
 agents/
 memo/
 tasks/
+.loop/
+server/.pytest_temp/

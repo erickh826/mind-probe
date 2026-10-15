@@ -43,7 +43,7 @@
 
 - **目標**：完成錄影上傳、FFmpeg remux、教師端回看管線。
 - **主要負責 Agent**：
-  - Server/Media Agent — chunk ingest、FFmpeg remux、資料保留優先順序（依 ADR-0004：原始事件 > 原始 WebM > 最終 MP4 > 自動生成報告）
+  - Server/Media Agent — chunk ingest、FFmpeg remux、資料保留優先順序（依 ADR-0004 並經 ADR-0005 修訂：錄影完整且 MP4 驗證通過後才可刪除本機原始 WebM；incomplete 一律保留）
   - Teacher App Agent — 雙視角回看 UI、時間軸
   - Server/API & Auth Agent — Teacher REST API
 - **驗收條件**：完整 session 可被教師端依時間軸重播；所有 chunk 確認上傳成功才允許提示「可安全關閉」。

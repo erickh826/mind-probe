@@ -37,6 +37,8 @@ ethical_or_safety_stop
 ```
 轉碼或報告失敗時不得刪除原始資料。
 
+> 修訂（2026-10-15，[ADR-0005](0005-cloud-deployment-and-recording-retention.md)）：錄影完整且 MP4 驗證通過後，本機才可刪除原始 WebM／chunks，R2 上的 MP4 為長期保存版本；`incomplete`、`transcode_failed` 永不刪除。
+
 ## 實作優先順序
 1. ADR-0001：snapshot、ACK、去重及 token；
 2. ADR-0003：時間同步及統一開始時間；

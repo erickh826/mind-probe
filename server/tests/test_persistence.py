@@ -584,9 +584,14 @@ def test_join_sets_httponly_role_bound_cookie(client):
     )
 
     assert resp.status_code == 200
-    assert resp.json() == {"session_id": "S001", "role": "student", "status": "ok"}
-    # The token is delivered only as a cookie, never in the body.
-    assert "token" not in resp.text
+    body = resp.json()
+    assert {k: body[k] for k in ("session_id", "role", "status")} == {
+        "session_id": "S001",
+        "role": "student",
+        "status": "ok",
+    }
+    assert body["access_token"] and body["expires_at"] > 0
+    # The Bearer token is in the body; the cookie is only set in cookie mode.
 
     # Starlette normalises the samesite value to lowercase, so compare
     # case-insensitively rather than pinning its formatting.
