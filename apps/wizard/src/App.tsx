@@ -68,7 +68,7 @@ export default function App() {
   // it is running there is no server-supplied origin to subtract from.
   const [activeSinceMs, setActiveSinceMs] = useState<number | null>(null);
 
-  const socket = useSessionSocket(joined?.sessionId ?? null);
+  const socket = useSessionSocket(joined?.sessionId ?? null, joined?.accessToken ?? null);
   const { session, status } = socket;
 
   // 載入案件決策樹（cases/<case>/wizard_decision_tree.json）。

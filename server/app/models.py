@@ -850,8 +850,8 @@ def revoke_session_tokens(
 
     Stateless HMAC tokens cannot be recovered from the database, so revocation
     is represented by appending ``token_revoked`` rows for each previously
-    issued token hash. The WebSocket ASGI guard in ``main.py`` rejects any
-    cookie whose digest appears in this set.
+    issued token hash. The WebSocket upgrade rejects any token whose digest
+    appears in this set.
     """
     revoked = revoked_token_hashes(db, session_id)
     entries: list[AuditLog] = []

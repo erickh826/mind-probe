@@ -1,15 +1,12 @@
 // REST calls the Wizard console makes against the Session Server.
 //
-// Only three endpoints are needed: exchange a join code for the role-bound
-// cookie (ADR-0001 §8), read which case a session runs, and load that case's
-// three-tier decision tree (spec §12, `wizard_decision_tree.json`).
-//
-// Every request is credentialed: the session token is an HttpOnly cookie, so
-// the browser — not this code — attaches it. `credentials: "include"` is a
-// no-op on the same-origin dev-proxy path and is what makes the direct
-// `VITE_API_BASE_URL` path work at all.
+// Exchange a join code for a Bearer token (ADR-0005), read which case a
+// session runs, and load that case's three-tier decision tree
+// (spec §12, `wizard_decision_tree.json`). The token from `/join` is stored
+// in memory and sessionStorage and sent as `Authorization: Bearer`.
 
 import type { Role } from "@mind-probe/shared";
+import { currentAccessToken, rememberAccessToken } from "@mind-probe/shared";
 import { apiUrl } from "./config";
 import {
   CATEGORY_KEYS,
@@ -42,9 +39,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 async function request(path: string, init?: RequestInit): Promise<unknown> {
+  const headers = new Headers(init?.headers);
+  const token = currentAccessToken();
+  if (token && !headers.has("Authorization")) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+
   let response: Response;
   try {
-    response = await fetch(apiUrl(path), { credentials: "include", ...init });
+    response = await fetch(apiUrl(path), {
+      ...init,
+      headers,
+      credentials: "omit",
+    });
   } catch (cause) {
     throw new ApiError(0, `無法連線至 Session Server：${String(cause)}`);
   }
@@ -63,15 +70,17 @@ async function request(path: string, init?: RequestInit): Promise<unknown> {
 export interface JoinResult {
   session_id: string;
   role: Role | string;
+  access_token: string;
+  expires_at: number;
 }
 
 /**
- * `POST /sessions/{id}/join` — trades a one-time join code for the HttpOnly
- * `mindprobe_session_token` cookie the WebSocket upgrade then verifies.
+ * `POST /sessions/{id}/join` — trades a one-time join code for the Bearer
+ * token the WebSocket upgrade then verifies via `Sec-WebSocket-Protocol`.
  *
  * The role is derived server-side from the join code; this client never asks
  * for one. A code that is not a Wizard code therefore yields a token this
- * console cannot use, which surfaces as a 4401 close on the socket.
+ * console cannot use, which surfaces as a 4403 close on the socket.
  */
 export async function joinSession(
   sessionId: string,
@@ -86,12 +95,16 @@ export async function joinSession(
       ...(clientId ? { client_id: clientId } : {}),
     }),
   });
-  if (!isRecord(body)) {
-    throw new ApiError(500, "join 回應格式不正確");
+  if (!isRecord(body) || typeof body.access_token !== "string" || body.access_token.length === 0) {
+    throw new ApiError(500, "join 回應沒有 access token");
   }
+  const resolvedSessionId = String(body.session_id ?? sessionId);
+  rememberAccessToken(resolvedSessionId, body.access_token);
   return {
-    session_id: String(body.session_id ?? sessionId),
+    session_id: resolvedSessionId,
     role: typeof body.role === "string" ? body.role : "unknown",
+    access_token: body.access_token,
+    expires_at: typeof body.expires_at === "number" ? body.expires_at : 0,
   };
 }
 

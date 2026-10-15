@@ -76,6 +76,7 @@ export interface JoinedSession {
   sessionId: string;
   caseId: string;
   clips: ClipManifestEntry[];
+  accessToken: string;
 }
 
 export type ConsoleLogLevel = "info" | "warn" | "error";

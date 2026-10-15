@@ -128,6 +128,10 @@ PAUSE_REASONS = {
 }
 
 WS_SESSION_COOKIE = "mindprobe_session_token"
+# Offered by the browser as ``Sec-WebSocket-Protocol: mindprobe.v1, bearer.<token>``.
+# The server echoes only ``mindprobe.v1`` (ADR-0005 §1, design §6.6).
+WS_PROTOCOL = "mindprobe.v1"
+BEARER_SUBPROTOCOL_PREFIX = "bearer."
 WS_TOKEN_SECRET_ENV = "MINDPROBE_WS_TOKEN_SECRET"
 WS_TOKEN_TTL_SECONDS = 2 * 60 * 60
 
@@ -308,7 +312,14 @@ class ConnectionManager:
     def case_id_for(self, session_id: str) -> str | None:
         return self._case_ids.get(session_id)
 
-    async def connect(self, session_id: str, role: str, ws: WebSocket) -> bool:
+    async def connect(
+        self,
+        session_id: str,
+        role: str,
+        ws: WebSocket,
+        *,
+        subprotocol: str | None = None,
+    ) -> bool:
         """Accept `ws` for (session_id, role).
 
         Returns True if this connection replaced a stale prior connection for
@@ -316,6 +327,9 @@ class ConnectionManager:
         `role_connection_replaced`). Raises RoleConnectionConflict if a
         single-connection role already has a live connection -- the caller
         must reject the new socket without accepting it.
+
+        ``subprotocol`` is the negotiated application protocol. It is either
+        ``mindprobe.v1`` or omitted. A ``bearer.*`` value is never echoed.
         """
         replaced = False
         if role in SINGLE_CONNECTION_ROLES:
@@ -335,7 +349,9 @@ class ConnectionManager:
                 existing.clear()
                 replaced = True
 
-        await ws.accept()
+        if subprotocol not in (None, WS_PROTOCOL):
+            raise ValueError("refusing to echo a non-mindprobe subprotocol")
+        await ws.accept(subprotocol=subprotocol)
         now = _now_ms()
         self._connections[session_id][role].append(
             ConnectionInfo(
@@ -465,12 +481,12 @@ def create_session_token(
     client_id: str = "temporary-client-id",
     expires_at_s: int | None = None,
 ) -> str:
-    """Create a short-lived, role-bound token for the WS cookie.
+    """Create a short-lived, role-bound HMAC token for Bearer and WebSocket auth.
 
-    The join-code exchange endpoint that will issue this token belongs in a
-    later Integration Agent task. Keeping the signer here lets the WebSocket
-    upgrade validate a real HMAC-protected cookie now without trusting role or
-    session claims from the URL alone.
+    ``POST /sessions/{id}/join`` returns this token in the response body. The
+    WebSocket upgrade reads it from the ``bearer.<token>`` subprotocol, and
+    only falls back to the HttpOnly cookie when ``MINDPROBE_AUTH_COOKIE`` is
+    enabled. The path role is never trusted on its own (ADR-0001 §8, ADR-0005).
     """
     if role not in VALID_ROLES:
         raise ValueError(f"invalid role: {role}")
@@ -500,43 +516,83 @@ def _cookie_value(websocket: WebSocket, name: str) -> str | None:
     return morsel.value if morsel is not None else None
 
 
-def _verify_session_token(websocket: WebSocket, session_id: str, role: str) -> None:
-    token = _cookie_value(websocket, WS_SESSION_COOKIE)
+def _offered_subprotocols(websocket: WebSocket) -> list[str]:
+    """Subprotocols the client offered, never values taken from the query string."""
+    scope = getattr(websocket, "scope", None)
+    if not isinstance(scope, dict):
+        return []
+    raw = scope.get("subprotocols") or []
+    return [item for item in raw if isinstance(item, str)]
+
+
+def _selected_subprotocol(websocket: WebSocket) -> str | None:
+    """The protocol to echo: ``mindprobe.v1`` when the client offered it.
+
+    ``bearer.*`` is a credential, not a protocol the server may select.
+    """
+    if WS_PROTOCOL in _offered_subprotocols(websocket):
+        return WS_PROTOCOL
+    return None
+
+
+def _extract_session_token(websocket: WebSocket) -> str | None:
+    """Read the upgrade token from the subprotocol, then the dev cookie.
+
+    Clients send ``Sec-WebSocket-Protocol: mindprobe.v1, bearer.<token>``.
+    The query string is ignored on purpose: it would land in access logs.
+    A ``bearer.*`` offer without ``mindprobe.v1`` is rejected rather than
+    silently falling back to a cookie. The cookie is read only when
+    ``MINDPROBE_AUTH_COOKIE`` is enabled.
+    """
+    # Local import: auth.py imports this module for signing helpers.
+    from . import auth
+
+    protocols = _offered_subprotocols(websocket)
+    bearer_tokens = [
+        protocol[len(BEARER_SUBPROTOCOL_PREFIX) :]
+        for protocol in protocols
+        if protocol.startswith(BEARER_SUBPROTOCOL_PREFIX)
+    ]
+    if bearer_tokens:
+        if WS_PROTOCOL not in protocols:
+            raise WebSocketAuthError("missing_subprotocol")
+        token = bearer_tokens[0]
+        if not token:
+            raise WebSocketAuthError("malformed_session_token")
+        return token
+    if auth.cookie_auth_enabled():
+        return _cookie_value(websocket, WS_SESSION_COOKIE)
+    return None
+
+
+def _verify_session_token(websocket: WebSocket, session_id: str, role: str) -> str:
+    """Validate the upgrade token and return the raw token.
+
+    Signature, expiry, session binding and role binding go through
+    ``auth.verify_token`` so REST and WebSocket cannot drift. Join tokens
+    omit ``typ`` and count as ``live``. A ``review`` token is refused until
+    review grants exist (design §6.5): a signed ``typ=review`` with no grant
+    must not open a socket. ``teacher`` and ``observer`` use the same live
+    token ``/join`` already issues.
+
+    Raises :class:`WebSocketAuthError`. The caller maps
+    ``role_token_mismatch`` to close code 4403 and every other reason to 4401.
+    """
+    from . import auth
+
+    token = _extract_session_token(websocket)
     if not token:
         raise WebSocketAuthError("missing_session_token")
-
     try:
-        payload_b64, signature_b64 = token.split(".", 1)
-    except ValueError as exc:
-        raise WebSocketAuthError("malformed_session_token") from exc
-
-    expected_signature = hmac.new(
-        _token_secret(), payload_b64.encode("ascii"), hashlib.sha256
-    ).digest()
-    try:
-        supplied_signature = _b64decode(signature_b64)
-    except Exception as exc:
-        raise WebSocketAuthError("malformed_session_token") from exc
-
-    if not hmac.compare_digest(supplied_signature, expected_signature):
-        raise WebSocketAuthError("invalid_session_token")
-
-    try:
-        claims = json.loads(_b64decode(payload_b64))
-    except Exception as exc:
-        raise WebSocketAuthError("malformed_session_token") from exc
-
-    try:
-        expires_at_s = int(claims["exp"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise WebSocketAuthError("malformed_session_token") from exc
-
-    if expires_at_s < int(time.time()):
-        raise WebSocketAuthError("expired_session_token")
-    if claims.get("session_id") != session_id:
-        raise WebSocketAuthError("session_token_mismatch")
-    if claims.get("role") != role:
-        raise WebSocketAuthError("role_token_mismatch")
+        auth.verify_token(
+            token,
+            session_id=session_id,
+            roles={role},
+            typ="live",
+        )
+    except auth.TokenInvalid as exc:
+        raise WebSocketAuthError(exc.reason) from exc
+    return token
 
 
 def _event_dedup_key(envelope: EventEnvelope) -> str:
@@ -689,11 +745,9 @@ def _db_scope(websocket: WebSocket) -> Iterator[DBSession]:
     of work, exactly as ``models.session_scope``'s docstring prescribes.
 
     When the app carries a ``get_db`` dependency override the override wins.
-    That mirrors ``main._websocket_guard_db`` (main.py:84-107), which had to
-    solve the same problem for the ASGI-level revocation guard: tests point
-    ``get_db`` at a private in-memory database and open a real WebSocket
-    against a session that exists *only* there, so honouring the override is
-    what keeps the realtime layer writing to the same database as the REST
+    Tests point ``get_db`` at a private in-memory database and open a real
+    WebSocket against a session that exists *only* there, so honouring the
+    override keeps the realtime layer on the same database as the REST
     surface it is being tested against.
     """
     app = websocket.scope.get("app")
@@ -1306,7 +1360,7 @@ async def _handle_message(
         return
 
     # Anything else is expected to be a standard event envelope. The URL path
-    # role/session have already been bound to the verified cookie; never trust
+    # role/session have already been bound to the verified token; never trust
     # client-supplied identity fields in the envelope.
     payload = raw.get("payload", {})
     event_id = payload.get("event_id") if isinstance(payload, dict) else None
@@ -1528,28 +1582,41 @@ async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
     'teacher', 'observer' (multiple read-only connections allowed) per
     ADR-0001 §9.
 
-    The full join-code exchange endpoint belongs to a later Integration Agent
-    task, but the upgrade itself already requires an HMAC-protected,
-    role-bound cookie so the path role is never treated as authoritative by
-    itself (ADR-0001 §8).
+    The upgrade requires an HMAC token carried as the ``bearer.<token>``
+    subprotocol (or, only when ``MINDPROBE_AUTH_COOKIE`` is on, the dev
+    cookie). The path role is never treated as authoritative by itself
+    (ADR-0001 §8, ADR-0005 §6.6). Revocation and ended-session refusal live
+    here, in the same function that checks the signature, so there is one
+    upgrade path.
     """
     if role not in VALID_ROLES:
         await websocket.close(code=4400, reason="invalid_role")
         return
     try:
-        _verify_session_token(websocket, session_id, role)
+        token = _verify_session_token(websocket, session_id, role)
     except WebSocketAuthError as exc:
-        await websocket.close(code=4401, reason=exc.reason)
+        # 4403 is reserved for a valid token whose role does not match the
+        # path. Every other authentication failure stays 4401.
+        close_code = 4403 if exc.reason == "role_token_mismatch" else 4401
+        await websocket.close(code=close_code, reason=exc.reason)
         return
 
     # A valid token proves the bearer's role and session claim, not that the
-    # session it names was ever created. Refuse before any in-memory state is
-    # spun up for a session no event could be persisted against.
+    # session it names was ever created, is still live, or that the token
+    # has not been revoked. Refuse before any in-memory state is spun up.
     try:
         with _db_scope(websocket) as db:
             session = models.get_session(db, session_id)
-            session_exists = session is not None
-            if session is not None:
+            if session is None:
+                rejection = "session_not_found"
+            elif session.status == "ended":
+                rejection = "session_ended"
+            elif models.is_token_hash_revoked(
+                db, session_id, models.hash_token(token)
+            ):
+                rejection = "token_revoked"
+            else:
+                rejection = None
                 # Memoised here so ADR-0002 fallback resolution never needs a
                 # query of its own on the realtime path.
                 manager.remember_case_id(session_id, session.case_id)
@@ -1559,16 +1626,22 @@ async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
             session_id,
             role,
         )
-        # Same close signal main.py's ASGI guard already emits when it cannot
-        # read session state, so clients need no new code to handle this.
         await websocket.close(code=4401, reason="session_state_unavailable")
         return
-    if not session_exists:
+    if rejection == "session_not_found":
         await websocket.close(code=4404, reason="session_not_found")
+        return
+    if rejection is not None:
+        await websocket.close(code=4401, reason=rejection)
         return
 
     try:
-        replaced = await manager.connect(session_id, role, websocket)
+        replaced = await manager.connect(
+            session_id,
+            role,
+            websocket,
+            subprotocol=_selected_subprotocol(websocket),
+        )
     except RoleConnectionConflict:
         # ADR-0001 §9: a live connection must not be silently evicted by a
         # new one for the same role -- reject the new connection instead.

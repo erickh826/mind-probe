@@ -1,13 +1,13 @@
 import type { Role } from "@mind-probe/shared";
 
-export type AuthContext =
-  | { mode: "cookie" }
-  | { mode: "bearer"; token: string };
+export type AuthContext = { token: string };
 
 export interface JoinResult {
   session_id: string;
   role: Role;
   status: string;
+  access_token: string;
+  expires_at: number;
 }
 
 export interface SessionInfo {

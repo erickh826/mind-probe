@@ -2,15 +2,15 @@ import { useState } from "react";
 import type { FormEvent } from "react";
 import { ApiError, fetchSession, joinSession } from "../api";
 
-// Session 加入畫面（ADR-0001 §8）。
-// The Wizard trades a one-time join code for the HttpOnly session cookie the
-// WebSocket upgrade verifies. The *role* is decided server-side from the code,
-// so a non-Wizard code here surfaces later as a 4401 close, not a silent
-// mis-join.
+// Session 加入畫面（ADR-0005）。
+// The Wizard trades a one-time join code for a Bearer token. The WebSocket
+// upgrade sends that token as a subprotocol. The *role* is decided server-side
+// from the code, so a non-Wizard code is rejected here instead of on the socket.
 
 export interface JoinedSession {
   sessionId: string;
   caseId: string;
+  accessToken: string;
 }
 
 interface Props {
@@ -66,7 +66,11 @@ export default function SessionJoinModal({ onJoined }: Props) {
         return;
       }
       const info = await fetchSession(trimmedSession);
-      onJoined({ sessionId: trimmedSession, caseId: info.case_id });
+      onJoined({
+        sessionId: trimmedSession,
+        caseId: info.case_id,
+        accessToken: result.access_token,
+      });
     } catch (cause) {
       setError(cause instanceof ApiError ? cause.message : String(cause));
     } finally {

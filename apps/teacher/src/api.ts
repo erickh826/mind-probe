@@ -1,3 +1,4 @@
+import { rememberAccessToken } from "@mind-probe/shared";
 import { apiUrl } from "./config";
 import type {
   AuditResponse,
@@ -13,7 +14,7 @@ import type {
 } from "./types";
 
 function authHeaders(auth?: AuthContext): HeadersInit {
-  if (auth?.mode !== "bearer") {
+  if (!auth?.token) {
     return {};
   }
   return { Authorization: `Bearer ${auth.token}` };
@@ -28,7 +29,7 @@ async function fetchJson<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(apiUrl(path), {
     ...init,
     headers,
-    credentials: "include",
+    credentials: "omit",
   });
 
   if (!response.ok) {
@@ -52,15 +53,26 @@ async function fetchJson<T>(path: string, init: RequestInit = {}): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-export function joinSession(sessionId: string, joinCode: string, clientId: string): Promise<JoinResult> {
-  return fetchJson<JoinResult>(`/sessions/${encodeURIComponent(sessionId)}/join`, {
+export async function joinSession(
+  sessionId: string,
+  joinCode: string,
+  clientId: string,
+): Promise<JoinResult> {
+  const joined = await fetchJson<JoinResult>(`/sessions/${encodeURIComponent(sessionId)}/join`, {
     method: "POST",
     body: JSON.stringify({ join_code: joinCode, client_id: clientId }),
   });
+  if (!joined.access_token) {
+    throw new Error("Join response did not include an access token.");
+  }
+  rememberAccessToken(joined.session_id || sessionId, joined.access_token);
+  return joined;
 }
 
-export function fetchSession(sessionId: string): Promise<SessionInfo> {
-  return fetchJson<SessionInfo>(`/sessions/${encodeURIComponent(sessionId)}`);
+export function fetchSession(sessionId: string, auth: AuthContext): Promise<SessionInfo> {
+  return fetchJson<SessionInfo>(`/sessions/${encodeURIComponent(sessionId)}`, {
+    headers: authHeaders(auth),
+  });
 }
 
 export function fetchTimeline(sessionId: string, auth: AuthContext): Promise<TimelineResponse> {
@@ -75,13 +87,17 @@ export function fetchRecordingStatus(sessionId: string, auth: AuthContext): Prom
   });
 }
 
-export async function fetchRubric(caseId: string): Promise<RubricData> {
-  const response = await fetchJson<RubricResponse>(`/cases/${encodeURIComponent(caseId)}/rubric`);
+export async function fetchRubric(caseId: string, auth: AuthContext): Promise<RubricData> {
+  const response = await fetchJson<RubricResponse>(`/cases/${encodeURIComponent(caseId)}/rubric`, {
+    headers: authHeaders(auth),
+  });
   return response.rubric;
 }
 
-export async function fetchClipManifest(caseId: string): Promise<ClipManifestEntry[]> {
-  const response = await fetchJson<ClipManifestResponse>(`/cases/${encodeURIComponent(caseId)}/clips`);
+export async function fetchClipManifest(caseId: string, auth: AuthContext): Promise<ClipManifestEntry[]> {
+  const response = await fetchJson<ClipManifestResponse>(`/cases/${encodeURIComponent(caseId)}/clips`, {
+    headers: authHeaders(auth),
+  });
   return response.clips;
 }
 
@@ -93,7 +109,7 @@ export function fetchAuditLogs(sessionId: string, auth: AuthContext): Promise<Au
 
 export function fetchRecordingBlob(sessionId: string, auth: AuthContext, signal: AbortSignal): Promise<Blob> {
   return fetch(apiUrl(`/sessions/${encodeURIComponent(sessionId)}/recording`), {
-    credentials: "include",
+    credentials: "omit",
     headers: authHeaders(auth),
     signal,
   }).then((response) => {

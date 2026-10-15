@@ -40,7 +40,7 @@ export default function App() {
   const autoRecordingAttemptedRef = useRef(false);
   const previousRecorderStatusRef = useRef<string>("idle");
 
-  const socket = useStudentSocket(joined?.sessionId ?? null);
+  const socket = useStudentSocket(joined?.sessionId ?? null, joined?.accessToken ?? null);
   const recorder = useMediaRecorder({
     sessionId: joined?.sessionId ?? null,
     onChunkUploaded: socket.sendChunkUploaded,
@@ -91,6 +91,7 @@ export default function App() {
         sessionId: session.session_id,
         caseId: session.case_id,
         clips,
+        accessToken: join.access_token,
       });
     } catch (cause) {
       setJoinError(String(cause instanceof Error ? cause.message : cause));

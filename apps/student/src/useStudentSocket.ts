@@ -3,6 +3,8 @@ import {
   controlMessageType,
   isEventEnvelope,
   isWebSocketControlMessage,
+  readAccessToken,
+  websocketSubprotocols,
 } from "@mind-probe/shared";
 import type {
   AnyEventEnvelope,
@@ -29,7 +31,7 @@ const CLOCK_SYNC_SAMPLES = 9;
 const CLOCK_SYNC_KEEP_LOWEST = 5;
 const CLOCK_SYNC_SPACING_MS = 120;
 const MAX_LOG_ENTRIES = 80;
-const TERMINAL_CLOSE_CODES = new Set([4400, 4401, 4404, 4409]);
+const TERMINAL_CLOSE_CODES = new Set([4400, 4401, 4403, 4404, 4409]);
 
 const REVISION_BUMPING_EVENTS = new Set<EventType>([
   "session_started",
@@ -102,7 +104,10 @@ function payloadNumber(payload: BaseEventPayload, key: string): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-export function useStudentSocket(sessionId: string | null): StudentSocket {
+export function useStudentSocket(
+  sessionId: string | null,
+  accessToken: string | null,
+): StudentSocket {
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [closedReason, setClosedReason] = useState<string | null>(null);
   const [session, setSession] = useState<SessionView>(INITIAL_SESSION_VIEW);
@@ -624,12 +629,19 @@ export function useStudentSocket(sessionId: string | null): StudentSocket {
     hasConnectedOnceRef.current = false;
     let disposed = false;
 
+    const token = accessToken ?? readAccessToken(sessionId);
+    if (!token) {
+      setStatus("closed");
+      setClosedReason("missing_session_token");
+      return;
+    }
+
     const connect = () => {
       if (disposed || !shouldReconnectRef.current) {
         return;
       }
       setStatus(hasConnectedOnceRef.current ? "reconnecting" : "connecting");
-      const socket = new WebSocket(sessionSocketUrl(sessionId));
+      const socket = new WebSocket(sessionSocketUrl(sessionId), websocketSubprotocols(token));
       socketRef.current = socket;
 
       socket.onopen = () => {
@@ -706,6 +718,7 @@ export function useStudentSocket(sessionId: string | null): StudentSocket {
       socketRef.current = null;
     };
   }, [
+    accessToken,
     appendLog,
     clearHeartbeat,
     handleMessage,
