@@ -12,6 +12,15 @@ export const QUEUE_WARN_RATIO = 0.8;
 export type RecorderState = "recording" | "stopped" | "lost";
 export type ServerFinalizeState = "none" | "pending" | "complete" | "incomplete";
 
+/** Permanent upload failures. The queue stops retrying these. */
+export type UploadBlock =
+  | "sequence_conflict"
+  | "sequence_past_final"
+  | "checksum"
+  | "unauthorized"
+  | "final_below_stored"
+  | "invalid_finalize";
+
 export interface FinalizePayload {
   final_sequence: number;
   total_chunks: number;
@@ -34,6 +43,8 @@ export interface RecordingMeta {
   finalize_next_attempt_at: number | null;
   server_finalize_state: ServerFinalizeState;
   last_chunk_end_ms: number;
+  needs_operator: boolean;
+  upload_block: UploadBlock | null;
 }
 
 export interface StoredChunkDraft {
@@ -63,7 +74,8 @@ export type CloseBanner =
   | { kind: "confirming" }
   | { kind: "uploading"; pending: number }
   | { kind: "interrupted" }
-  | { kind: "incomplete" };
+  | { kind: "incomplete" }
+  | { kind: "needs_operator"; block: UploadBlock | null };
 
 export function emptyMeta(sessionId: string, now: number): RecordingMeta {
   return {
@@ -80,6 +92,8 @@ export function emptyMeta(sessionId: string, now: number): RecordingMeta {
     finalize_next_attempt_at: null,
     server_finalize_state: "none",
     last_chunk_end_ms: 0,
+    needs_operator: false,
+    upload_block: null,
   };
 }
 
@@ -248,6 +262,15 @@ export function sequencesAlreadyReceived(local: number[], received: number[]): n
   return local.filter((sequence) => have.has(sequence));
 }
 
+/**
+ * Merge a server status onto `meta`.
+ *
+ * Only `server_finalize_state`, `finalize_confirmed`, `finalize_pending`, and
+ * `finalize_confirmed_at` change. `next_sequence`, `recorder_state`, and
+ * `finalize_payload` are copied through so a caller that applies this to the
+ * latest row cannot rewind them. Callers must pass the row just read inside
+ * the same write transaction — never a snapshot taken before an await.
+ */
 export function applyServerStatus(
   meta: RecordingMeta,
   status: ServerUploadStatus,
@@ -268,6 +291,66 @@ export function applyServerStatus(
   return next;
 }
 
+/** 409/400/401/422 that will never succeed if retried as-is. */
+export function permanentUploadBlock(status: number, code: string | null): UploadBlock | null {
+  if (status === 401) {
+    return "unauthorized";
+  }
+  if (status === 409 && code === "sequence_past_final") {
+    return "sequence_past_final";
+  }
+  if (status === 409 && code === "final_sequence_below_stored") {
+    return "final_below_stored";
+  }
+  if (status === 409 && code === "sequence_conflict") {
+    return "sequence_conflict";
+  }
+  if (status === 409) {
+    return "sequence_conflict";
+  }
+  if (status === 400 && (code === "checksum_mismatch" || code === "checksum")) {
+    return "checksum";
+  }
+  if (status === 400 || status === 422) {
+    return "invalid_finalize";
+  }
+  return null;
+}
+
+/** Auth and finalize-shape failures must not be posted again. A bad chunk must not block the rest. */
+export function stopsFinalize(block: UploadBlock): boolean {
+  return block === "unauthorized" || block === "final_below_stored" || block === "invalid_finalize";
+}
+
+export function notePermanentFailure(meta: RecordingMeta, block: UploadBlock): RecordingMeta {
+  return {
+    ...meta,
+    needs_operator: true,
+    upload_block: block,
+    finalize_pending: stopsFinalize(block) ? false : meta.finalize_pending,
+    finalize_next_attempt_at: stopsFinalize(block) ? null : meta.finalize_next_attempt_at,
+  };
+}
+
+export function permanentBlockMessage(block: UploadBlock | null): string {
+  switch (block) {
+    case "sequence_conflict":
+      return "片段與伺服器已保存的內容衝突，請通知管理員";
+    case "sequence_past_final":
+      return "片段序號已超過結束範圍，請通知管理員";
+    case "checksum":
+      return "片段校驗失敗，無法上傳，請通知管理員";
+    case "unauthorized":
+      return "補傳時間已結束，請通知老師或管理員";
+    case "final_below_stored":
+      return "結束序號小於伺服器已收到的片段，請通知管理員";
+    case "invalid_finalize":
+      return "結束標記與伺服器的錄影不一致，請通知管理員";
+    default:
+      return "上傳無法繼續，請通知老師或管理員";
+  }
+}
+
 export function storageWarning(totalBytes: number): string | null {
   if (totalBytes < QUEUE_CAPACITY_BYTES * QUEUE_WARN_RATIO) {
     return null;
@@ -285,6 +368,9 @@ export function closeBanner(meta: RecordingMeta | null, pending: number): CloseB
   }
   if (meta.recorder_state === "lost") {
     return { kind: "interrupted" };
+  }
+  if (meta.needs_operator) {
+    return { kind: "needs_operator", block: meta.upload_block };
   }
   if (meta.server_finalize_state === "incomplete") {
     return { kind: "incomplete" };

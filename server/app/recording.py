@@ -45,7 +45,7 @@ import subprocess
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session as DBSession
 
@@ -830,6 +830,12 @@ class FinalizeRequest(BaseModel):
     total_chunks: int = Field(ge=0)
     total_duration_ms: int = Field(ge=0)
     reason: str | None = None
+
+    @model_validator(mode="after")
+    def total_chunks_matches_final_sequence(self) -> "FinalizeRequest":
+        if self.total_chunks != self.final_sequence + 1:
+            raise ValueError("total_chunks must equal final_sequence + 1")
+        return self
 
 
 @router.get("/{session_id}/status")

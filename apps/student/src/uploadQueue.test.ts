@@ -10,6 +10,8 @@ import {
   emptyMeta,
   finalizeDue,
   noteFinalizeAttempt,
+  notePermanentFailure,
+  permanentUploadBlock,
   persistRecorderLost,
   persistStop,
   planReload,
@@ -134,4 +136,43 @@ test("safe to close only after the server confirms complete", () => {
     7_000,
   );
   assert.equal(closeBanner(incomplete, 0).kind, "incomplete");
+});
+
+test("applyServerStatus does not touch sequence, recorder state, or the payload", () => {
+  const meta = persistStop(
+    { ...emptyMeta("S1", 0), next_sequence: 4, last_chunk_end_ms: 9000 },
+    5_000,
+  );
+  const next = applyServerStatus(
+    meta,
+    { finalize_state: "complete", recording_state: "complete", received_sequences: [0, 1, 2, 3] },
+    6_000,
+  );
+  assert.equal(next.next_sequence, 4);
+  assert.equal(next.recorder_state, "stopped");
+  assert.deepEqual(next.finalize_payload, meta.finalize_payload);
+  assert.equal(next.finalize_confirmed, true);
+  assert.equal(next.finalize_pending, false);
+  assert.equal(next.server_finalize_state, "complete");
+});
+
+test("permanent 4xx stops the matching retry and flags the operator", () => {
+  assert.equal(permanentUploadBlock(409, "sequence_conflict"), "sequence_conflict");
+  assert.equal(permanentUploadBlock(409, "sequence_past_final"), "sequence_past_final");
+  assert.equal(permanentUploadBlock(400, "checksum_mismatch"), "checksum");
+  assert.equal(permanentUploadBlock(401, "revoked_session_token"), "unauthorized");
+  assert.equal(permanentUploadBlock(422, null), "invalid_finalize");
+  assert.equal(permanentUploadBlock(503, null), null);
+
+  const meta = persistStop(emptyMeta("S1", 0), 1_000);
+  const blocked = notePermanentFailure(meta, "sequence_conflict");
+  assert.equal(blocked.needs_operator, true);
+  assert.equal(blocked.upload_block, "sequence_conflict");
+  assert.equal(blocked.finalize_pending, true);
+  assert.equal(blocked.next_sequence, meta.next_sequence);
+  assert.deepEqual(blocked.finalize_payload, meta.finalize_payload);
+
+  const expired = notePermanentFailure(meta, "unauthorized");
+  assert.equal(expired.finalize_pending, false);
+  assert.equal(closeBanner(blocked, 1).kind, "needs_operator");
 });

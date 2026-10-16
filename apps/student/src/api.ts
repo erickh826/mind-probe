@@ -1,16 +1,9 @@
 import type { ClipManifestEntry, Role } from "@mind-probe/shared";
 import { currentAccessToken, rememberAccessToken } from "@mind-probe/shared";
+import { ApiError } from "./apiError";
 import { apiUrl } from "./config";
 
-export class ApiError extends Error {
-  readonly status: number;
-
-  constructor(status: number, message: string) {
-    super(message);
-    this.name = "ApiError";
-    this.status = status;
-  }
-}
+export { ApiError };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -36,13 +29,27 @@ async function request(path: string, init?: RequestInit): Promise<unknown> {
 
   const body: unknown = await response.json().catch(() => null);
   if (!response.ok) {
-    const detail =
-      isRecord(body) && typeof body.detail === "string"
-        ? body.detail
-        : `HTTP ${response.status}`;
-    throw new ApiError(response.status, detail);
+    const parsed = errorDetail(body, response.status);
+    throw new ApiError(response.status, parsed.message, parsed.code);
   }
   return body;
+}
+
+function errorDetail(body: unknown, status: number): { message: string; code: string | null } {
+  if (!isRecord(body)) {
+    return { message: `HTTP ${status}`, code: null };
+  }
+  const detail = body.detail;
+  if (typeof detail === "string") {
+    return { message: detail, code: detail };
+  }
+  if (isRecord(detail)) {
+    const code = typeof detail.error === "string" ? detail.error : null;
+    const message =
+      typeof detail.message === "string" ? detail.message : code ?? `HTTP ${status}`;
+    return { message, code };
+  }
+  return { message: `HTTP ${status}`, code: null };
 }
 
 export interface JoinResult {

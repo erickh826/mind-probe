@@ -11,7 +11,7 @@ import {
   emptyMeta,
   shouldDiscardMeta,
   type RecordingMeta,
-} from "./uploadQueue";
+} from "./uploadQueue.ts";
 
 const DB_NAME = "mindprobe-recording";
 const DB_VERSION = 1;
@@ -27,6 +27,8 @@ export interface PersistedChunk {
   blob: Blob;
   attempts: number;
   next_attempt_at: number;
+  /** Set when the server rejected this slice permanently (409/400/401). */
+  terminal?: boolean;
 }
 
 function fail(reject: (reason: unknown) => void, error: DOMException | null): void {
@@ -72,6 +74,38 @@ export function writeMeta(db: IDBDatabase, meta: RecordingMeta): Promise<void> {
   });
 }
 
+/**
+ * Read the latest meta and write the mutation in one readwrite transaction.
+ *
+ * `mutate` runs inside the get's success handler and must not await. That is
+ * what keeps a status response from putting back a `next_sequence` that a
+ * chunk stored while the request was in flight.
+ */
+export function updateMeta(
+  db: IDBDatabase,
+  sessionId: string,
+  mutate: (current: RecordingMeta) => RecordingMeta,
+): Promise<RecordingMeta | null> {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(META_STORE, "readwrite");
+    let next: RecordingMeta | null = null;
+    tx.oncomplete = () => resolve(next);
+    tx.onerror = () => fail(reject, tx.error);
+    tx.onabort = () => fail(reject, tx.error);
+    const store = tx.objectStore(META_STORE);
+    const getReq = store.get(sessionId);
+    getReq.onerror = () => fail(reject, getReq.error);
+    getReq.onsuccess = () => {
+      const existing = getReq.result as RecordingMeta | undefined;
+      if (!existing) {
+        return;
+      }
+      next = mutate(existing);
+      store.put(next);
+    };
+  });
+}
+
 export function storeChunkAndBumpSequence(
   db: IDBDatabase,
   sessionId: string,
@@ -103,6 +137,7 @@ export function storeChunkAndBumpSequence(
         blob,
         attempts: 0,
         next_attempt_at: 0,
+        terminal: false,
       };
       chunkStore.put(row);
       metaStore.put(built.meta);

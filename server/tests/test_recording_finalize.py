@@ -14,7 +14,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -318,7 +318,8 @@ def test_gaps_stay_finalizing_then_the_grace_check_marks_them_incomplete(
     assert tail.json()["recording_state"] == "finalizing"
     assert tail.json()["missing_sequences"] == [2]
 
-    # total_chunks disagrees with the declared range: still not complete.
+    # total_chunks must equal final_sequence + 1. A mismatch is rejected and
+    # does not replace the declaration already stored.
     mismatch = _finalize(
         client,
         session_id,
@@ -327,9 +328,13 @@ def test_gaps_stay_finalizing_then_the_grace_check_marks_them_incomplete(
         total_chunks=9,
         total_duration_ms=4000,
     )
-    assert mismatch.status_code == 200, mismatch.text
-    assert mismatch.json()["finalize_state"] == "pending"
-    assert mismatch.json()["recording_state"] == "finalizing"
+    assert mismatch.status_code == 422, mismatch.text
+    db.expire_all()
+    held = models.get_recording(db, session_id)
+    assert held is not None
+    assert held.final_sequence == 2
+    assert held.total_chunks == 3
+    assert held.recording_state == "finalizing"
 
     # Repeated upload of sequence 0 does not count as a second chunk.
     duplicate = _upload(client, session_id, token, 0, EBML_HEADER)
@@ -377,6 +382,20 @@ def test_gaps_stay_finalizing_then_the_grace_check_marks_them_incomplete(
     )
     assert refused.status_code == 409
     assert not recording.merged_path(session_id).exists()
+
+    # Filling the gap after the grace mark must not silently become complete.
+    assert _upload(client, session_id, token, 2, b"-filled").status_code == 200
+    db.expire_all()
+    rec = models.get_recording(db, session_id)
+    assert rec is not None
+    assert rec.recording_state == "incomplete"
+    assert rec.incomplete_reason == "missing_chunks"
+    replay = _finalize(
+        client, session_id, token, final_sequence=2, total_chunks=3, total_duration_ms=4000
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["recording_state"] == "incomplete"
+    assert replay.json()["finalize_state"] == "incomplete"
 
 
 def test_recorder_lost_and_operator_incomplete_never_become_complete(
@@ -496,3 +515,133 @@ def test_finalize_during_grace_accepts_a_late_chunk(client, db, chunk_root):
     )
     assert retried.status_code == 200
     assert retried.json()["finalize_state"] == "complete"
+
+
+def test_finalize_rejects_a_final_sequence_below_stored_chunks(client, db, chunk_root):
+    session_id, tokens = _open_session(client)
+    token = tokens["student"]
+    assert _upload(client, session_id, token, 0, EBML_HEADER).status_code == 200
+    assert _upload(client, session_id, token, 1, b"-one").status_code == 200
+    assert _upload(client, session_id, token, 2, b"-two").status_code == 200
+
+    response = _finalize(
+        client, session_id, token, final_sequence=1, total_chunks=2, total_duration_ms=3000
+    )
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["error"] == "final_sequence_below_stored"
+    assert detail["stored_above"] == [2]
+    db.expire_all()
+    rec = models.get_recording(db, session_id)
+    assert rec is not None
+    assert rec.final_sequence is None
+    assert rec.recording_state == "recording"
+
+
+def test_zero_chunk_session_is_incomplete_after_grace_and_visible_to_the_teacher(
+    client, db, chunk_root
+):
+    session_id, tokens = _open_session(client)
+    assert client.post(f"/sessions/{session_id}/end", headers=OPERATOR).status_code == 200
+    db.expire_all()
+    opened = models.get_recording(db, session_id)
+    assert opened is not None
+    assert opened.recording_state == "finalizing"
+
+    before = client.get(
+        f"/sessions/{session_id}/recording/status",
+        headers=_bearer(tokens["teacher"]),
+    )
+    assert before.status_code == 200, before.text
+    assert before.json()["chunk_count"] == 0
+    assert before.json()["recording_state"] == "finalizing"
+
+    changed = recording_integrity.apply_upload_grace_deadlines(
+        db, now=auth.utcnow() + timedelta(hours=1)
+    )
+    assert session_id in changed
+    db.expire_all()
+    rec = models.get_recording(db, session_id)
+    assert rec is not None
+    assert rec.recording_state == "incomplete"
+    assert rec.incomplete_reason == "grace_expired"
+    audits = db.scalars(
+        select(models.AuditLog).where(
+            models.AuditLog.session_id == session_id,
+            models.AuditLog.action == recording_integrity.AUDIT_RECORDING_INCOMPLETE,
+        )
+    ).all()
+    assert audits
+    assert audits[-1].details["reason"] == "grace_expired"
+
+    after = client.get(
+        f"/sessions/{session_id}/recording/status",
+        headers=_bearer(tokens["teacher"]),
+    )
+    assert after.status_code == 200, after.text
+    body = after.json()
+    assert body["chunk_count"] == 0
+    assert body["recording_state"] == "incomplete"
+    assert body["incomplete_reason"] == "grace_expired"
+
+
+def test_grace_creates_incomplete_when_the_recording_row_is_missing(db):
+    session_id = f"S-{uuid4().hex[:8]}"
+    models.create_session(db, session_id, "CASE001")
+    models.end_session(db, session_id)
+    assert models.get_recording(db, session_id) is None
+    changed = recording_integrity.apply_upload_grace_deadlines(
+        db, now=auth.utcnow() + timedelta(hours=1)
+    )
+    assert session_id in changed
+    db.expire_all()
+    rec = models.get_recording(db, session_id)
+    assert rec is not None
+    assert rec.recording_state == "incomplete"
+    assert rec.finalize_state == "incomplete"
+    assert rec.incomplete_reason == "grace_expired"
+
+
+def test_grace_claim_does_not_overwrite_an_incomplete_reason(db):
+    session_id = f"S-{uuid4().hex[:8]}"
+    models.create_session(db, session_id, "CASE001")
+    models.end_session(db, session_id)
+    rec = models.ensure_recording(db, session_id)
+    assert rec is not None
+    rec.recording_state = "incomplete"
+    rec.finalize_state = "incomplete"
+    rec.incomplete_reason = "grace_expired"
+    rec.needs_operator = False
+    db.commit()
+
+    claimed = recording_integrity.claim_open_recording(
+        db,
+        session_id,
+        {
+            "recording_state": "complete",
+            "finalize_state": "complete",
+            "incomplete_reason": None,
+            "missing_sequences": [],
+        },
+    )
+    assert claimed is False
+    db.expire_all()
+    rec = models.get_recording(db, session_id)
+    assert rec is not None
+    assert rec.recording_state == "incomplete"
+    assert rec.incomplete_reason == "grace_expired"
+
+    # needs_operator latches even while the state still says finalizing.
+    rec.recording_state = "finalizing"
+    rec.needs_operator = True
+    rec.incomplete_reason = "recorder_lost"
+    db.commit()
+    changed = recording_integrity.apply_upload_grace_deadlines(
+        db, now=auth.utcnow() + timedelta(hours=1)
+    )
+    assert session_id not in changed
+    db.expire_all()
+    rec = models.get_recording(db, session_id)
+    assert rec is not None
+    assert rec.incomplete_reason == "recorder_lost"
+    assert rec.needs_operator is True

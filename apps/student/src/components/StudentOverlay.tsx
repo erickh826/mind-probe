@@ -1,5 +1,6 @@
 import type { StudentRecorder } from "../useMediaRecorder";
 import type { StudentSocket } from "../useStudentSocket";
+import { permanentBlockMessage } from "../uploadQueue";
 
 interface StudentOverlayProps {
   socket: StudentSocket;
@@ -86,6 +87,11 @@ export function StudentOverlay({
           {banner.kind === "incomplete" ? (
             <span style={{ color: "#ff8a8a", fontWeight: 700, marginTop: "4px", display: "block" }}>
               錄影不完整，已通知管理員
+            </span>
+          ) : null}
+          {banner.kind === "needs_operator" ? (
+            <span style={{ color: "#ff8a8a", fontWeight: 700, marginTop: "4px", display: "block" }}>
+              {permanentBlockMessage(banner.block)}
             </span>
           ) : null}
           {recorder.storageWarning ? (

@@ -19,6 +19,7 @@ from datetime import timedelta
 from typing import Any
 
 from fastapi import HTTPException
+from sqlalchemy import update
 from sqlalchemy.orm import Session as DBSession
 
 from . import auth, models
@@ -156,7 +157,9 @@ def refresh_completeness(
         if commit:
             db.commit()
         return rec
-    if is_protected_incomplete(rec):
+    # §7.1: incomplete is operator-only. A late chunk may shrink
+    # missing_sequences, but it must not silently become complete.
+    if rec.recording_state == "incomplete" or is_protected_incomplete(rec):
         _sync_missing(session_id, rec)
         _touch(rec)
         if commit:
@@ -179,10 +182,11 @@ def refresh_completeness(
 def note_session_ended(db: DBSession, session_id: str) -> None:
     """``/end`` moves an in-progress take to ``finalizing`` (ADR-0005 §7.1).
 
-    Does not finalize on the student's behalf and does not delete media.
-    Caller owns the transaction.
+    A session that never received a chunk still gets a row, so the grace check
+    can mark it incomplete and the teacher status can see it. Does not finalize
+    on the student's behalf and does not delete media. Caller owns the transaction.
     """
-    rec = models.get_recording(db, session_id)
+    rec = models.ensure_recording(db, session_id)
     if rec is None:
         return
     if rec.recording_state == "recording":
@@ -348,6 +352,20 @@ def apply_finalize(
     if rec.recording_state in {"deleting", "deleted"}:
         raise HTTPException(status_code=409, detail="recording_deleted")
 
+    stored_above = sorted(
+        sequence for sequence in _received(session_id) if sequence > final_sequence
+    )
+    if stored_above:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "final_sequence_below_stored",
+                "message": "final_sequence is below chunks already stored",
+                "final_sequence": final_sequence,
+                "stored_above": stored_above,
+            },
+        )
+
     matches = _payload_matches(
         rec,
         final_sequence=final_sequence,
@@ -372,6 +390,24 @@ def apply_finalize(
         rec.recording_state = "incomplete"
         rec.finalize_state = "incomplete"
         rec.needs_operator = True
+        _sync_missing(session_id, rec)
+        _touch(rec)
+        db.commit()
+        return _finalize_body(rec)
+
+    # grace_expired / missing_chunks stay incomplete. Recording the student's
+    # declaration is fine; flipping back to complete is not (§7.1).
+    if rec.recording_state == "incomplete":
+        if not first_declaration and not matches:
+            _reject_conflict()
+        if first_declaration:
+            _apply_payload(
+                rec,
+                final_sequence=final_sequence,
+                total_chunks=total_chunks,
+                total_duration_ms=total_duration_ms,
+                reason=reason,
+            )
         _sync_missing(session_id, rec)
         _touch(rec)
         db.commit()
@@ -445,7 +481,7 @@ def apply_finalize(
     _sync_missing(session_id, rec)
     if (
         not is_protected_incomplete(rec)
-        and rec.recording_state not in TERMINAL_STATES
+        and rec.recording_state not in TERMINAL_STATES | {"incomplete"}
         and completeness_ok(session_id, rec)
     ):
         _mark_complete(rec)
@@ -563,14 +599,35 @@ def mark_operator_incomplete(
     return rec
 
 
+def claim_open_recording(
+    db: DBSession, session_id: str, values: dict[str, Any]
+) -> bool:
+    """Move a still-open take, or change nothing if it left that state.
+
+    The predicate is ``recording_state IN ('recording', 'finalizing') AND
+    needs_operator = 0``. A concurrent ``recorder_lost`` or operator incomplete
+    update fails the predicate, so this write cannot replace ``incomplete_reason``.
+    """
+    result = db.execute(
+        update(models.Recording)
+        .where(models.Recording.session_id == session_id)
+        .where(models.Recording.recording_state.in_(("recording", "finalizing")))
+        .where(models.Recording.needs_operator.is_(False))
+        .values(**values)
+    )
+    return result.rowcount == 1
+
+
 def apply_upload_grace_deadlines(
     db: DBSession, *, now: Any | None = None
 ) -> list[str]:
     """Close takes whose post-end grace window has elapsed (ADR-0005 §7.3).
 
     Protected incomplete takes are skipped. A finalized take with no gaps
-    becomes ``complete``; anything else becomes ``incomplete``. Raw chunks are
-    left on disk either way. Returns the session ids whose state changed.
+    becomes ``complete``; anything else becomes ``incomplete``. A session that
+    never stored a chunk is created as ``incomplete`` / ``grace_expired``.
+    Raw chunks are left on disk either way. Returns the session ids whose
+    state changed.
     """
     from sqlalchemy import select
 
@@ -591,22 +648,50 @@ def apply_upload_grace_deadlines(
         if moment < ended + grace:
             continue
         rec = models.get_recording(db, session.id)
+        created = False
+        if rec is None:
+            rec = models.ensure_recording(db, session.id)
+            created = rec is not None
         if rec is None or rec.recording_state not in {"recording", "finalizing"}:
             continue
         if is_protected_incomplete(rec):
             continue
-        _sync_missing(session.id, rec)
+        missing = (
+            missing_for_final(_received(session.id), rec.final_sequence)
+            if rec.final_sequence is not None
+            else []
+        )
         if rec.final_sequence is not None and completeness_ok(session.id, rec):
-            _mark_complete(rec)
             outcome = "complete"
+            values: dict[str, Any] = {
+                "recording_state": "complete",
+                "finalize_state": "complete",
+                "incomplete_reason": None,
+                "needs_operator": False,
+                "missing_sequences": [],
+                "updated_at": moment,
+            }
         else:
-            rec.recording_state = "incomplete"
-            rec.finalize_state = "incomplete"
-            rec.incomplete_reason = (
-                "grace_expired" if rec.final_sequence is None else "missing_chunks"
-            )
-            _touch(rec)
-            outcome = rec.incomplete_reason
+            outcome = "grace_expired" if rec.final_sequence is None else "missing_chunks"
+            values = {
+                "recording_state": "incomplete",
+                "finalize_state": "incomplete",
+                "incomplete_reason": outcome,
+                "missing_sequences": missing,
+                "updated_at": moment,
+            }
+        if not claim_open_recording(db, session.id, values):
+            # Lost the race with recorder_lost / operator incomplete, or the
+            # row already left recording|finalizing. Drop a row this pass just
+            # inserted so a failed claim does not leave an empty 'recording'.
+            if created:
+                db.delete(rec)
+                db.flush()
+            else:
+                db.expire(rec)
+            continue
+        db.expire(rec)
+        if outcome != "complete":
             _audit(
                 db,
                 action=AUDIT_RECORDING_INCOMPLETE,
@@ -614,15 +699,15 @@ def apply_upload_grace_deadlines(
                 actor_role="server",
                 token_hash=None,
                 details={
-                    "reason": rec.incomplete_reason,
-                    "missing_sequences": list(rec.missing_sequences or []),
+                    "reason": outcome,
+                    "missing_sequences": missing,
                 },
             )
             logger.warning(
                 "session %s recording incomplete after upload grace: %s missing=%s",
                 session.id,
-                rec.incomplete_reason,
-                list(rec.missing_sequences or []),
+                outcome,
+                missing,
             )
         changed.append(session.id)
         logger.info(
