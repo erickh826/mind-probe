@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ClipManifestEntry } from "@mind-probe/shared";
-import { fetchClipManifest, fetchSession, joinSession } from "./api";
+import {
+  clearJoinedSession,
+  readJoinedSession,
+  rememberJoinedSession,
+} from "@mind-probe/shared";
+import { ApiError, fetchClipManifest, fetchSession, joinSession } from "./api";
 import { mediaUrl } from "./config";
 import { JoinSessionModal } from "./components/JoinSessionModal";
 import { StudentOverlay } from "./components/StudentOverlay";
@@ -36,6 +41,9 @@ export default function App() {
   const [joined, setJoined] = useState<JoinedSession | null>(null);
   const [joinPending, setJoinPending] = useState(false);
   const [joinError, setJoinError] = useState<string | null>(null);
+  const [restorePending, setRestorePending] = useState(
+    () => readJoinedSession()?.role === "student",
+  );
   const [cameraVisible, setCameraVisible] = useState(true);
   const autoRecordingAttemptedRef = useRef(false);
   const previousRecorderStatusRef = useRef<string>("idle");
@@ -83,10 +91,16 @@ export default function App() {
     try {
       const join = await joinSession(sessionId, joinCode, "student-browser");
       if (join.role !== "student") {
+        clearJoinedSession(join.session_id);
         throw new Error(`Join code is for role "${join.role}", not student.`);
       }
       const session = await fetchSession(join.session_id);
       const clips = await fetchClipManifest(session.case_id);
+      rememberJoinedSession({
+        sessionId: session.session_id,
+        role: "student",
+        accessToken: join.access_token,
+      });
       setJoined({
         sessionId: session.session_id,
         caseId: session.case_id,
@@ -101,7 +115,55 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (joined === null || socket.status !== "open" || autoRecordingAttemptedRef.current) {
+    if (!restorePending) {
+      return;
+    }
+    const stored = readJoinedSession();
+    if (stored === null || stored.role !== "student") {
+      setRestorePending(false);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const session = await fetchSession(stored.sessionId);
+        const clips = await fetchClipManifest(session.case_id);
+        if (cancelled) {
+          return;
+        }
+        setJoined({
+          sessionId: session.session_id,
+          caseId: session.case_id,
+          clips,
+          accessToken: stored.accessToken,
+          restoredFromStorage: true,
+        });
+      } catch (cause) {
+        if (cancelled) {
+          return;
+        }
+        if (cause instanceof ApiError && [401, 403, 404].includes(cause.status)) {
+          clearJoinedSession(stored.sessionId);
+          setJoinError("Saved session is no longer valid. Join again.");
+        }
+      } finally {
+        if (!cancelled) {
+          setRestorePending(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [restorePending]);
+
+  useEffect(() => {
+    if (
+      joined === null ||
+      joined.restoredFromStorage ||
+      socket.status !== "open" ||
+      autoRecordingAttemptedRef.current
+    ) {
       return;
     }
     autoRecordingAttemptedRef.current = true;
@@ -122,7 +184,14 @@ export default function App() {
     }
   }, [recorder.status, socket.sendRecordingStarted, socket.sendRecordingStopped]);
 
-  if (joined === null) {
+  if (restorePending || joined === null) {
+    if (restorePending && joined === null) {
+      return (
+        <div className="join-shell">
+          <p className="join-panel">Restoring session…</p>
+        </div>
+      );
+    }
     return (
       <JoinSessionModal pending={joinPending} error={joinError} onJoin={handleJoin} />
     );
@@ -146,6 +215,7 @@ export default function App() {
           void recorder.start();
         }}
         onStopRecording={recorder.stop}
+        allowStartRecording={!joined.restoredFromStorage}
       />
     </div>
   );

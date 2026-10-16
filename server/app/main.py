@@ -273,6 +273,11 @@ def end_session(
     except Exception:
         db.rollback()
         raise
+    # revoke_session_tokens was commit=False, so the listener did not run.
+    # Close after the commit is visible to the per-message recheck.
+    websocket.manager.schedule_close_live_sockets(
+        session_id, code=4401, reason="session_ended"
+    )
     return _session_payload(session)
 
 

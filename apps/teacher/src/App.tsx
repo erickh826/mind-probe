@@ -190,13 +190,19 @@ function App() {
               <span className="count-badge">{audit?.entries.length ?? 0}</span>
             </div>
             <div className="audit-list">
-              {audit?.entries.slice(-5).map((entry) => (
-                <article key={entry.id} className="audit-row">
-                  <strong>{entry.action}</strong>
-                  <span>{entry.actor_role ?? "unknown"}</span>
-                  <time>{entry.created_at ? new Date(entry.created_at).toLocaleString() : "-"}</time>
-                </article>
-              )) ?? <p className="muted">Load a session to inspect audit activity.</p>}
+              {session && audit === null ? (
+                <p className="muted">The audit log is limited to operators.</p>
+              ) : audit && audit.entries.length > 0 ? (
+                audit.entries.slice(-5).map((entry) => (
+                  <article key={entry.id} className="audit-row">
+                    <strong>{entry.action}</strong>
+                    <span>{entry.actor_role ?? "unknown"}</span>
+                    <time>{entry.created_at ? new Date(entry.created_at).toLocaleString() : "-"}</time>
+                  </article>
+                ))
+              ) : (
+                <p className="muted">Load a session to inspect audit activity.</p>
+              )}
             </div>
           </section>
         </aside>

@@ -8,6 +8,8 @@ interface StudentOverlayProps {
   onToggleCamera: () => void;
   onStartRecording: () => void;
   onStopRecording: () => void;
+  /** False after a reload: the student re-uploads, and does not start a new take. */
+  allowStartRecording?: boolean;
 }
 
 function statusLabel(value: string): string {
@@ -21,6 +23,7 @@ export function StudentOverlay({
   onToggleCamera,
   onStartRecording,
   onStopRecording,
+  allowStartRecording = true,
 }: StudentOverlayProps) {
   const paused = socket.session.session_state === "paused";
   const isStoppedOrEnded = recorder.status === "stopped" || socket.session.session_state === "ended";
@@ -79,9 +82,9 @@ export function StudentOverlay({
         <div className="button-row">
           {recorder.status === "recording" ? (
             <button onClick={onStopRecording}>Stop REC</button>
-          ) : (
+          ) : allowStartRecording ? (
             <button onClick={onStartRecording}>Start REC</button>
-          )}
+          ) : null}
           <button onClick={recorder.retryFailed} disabled={recorder.failedCount === 0}>
             Retry
           </button>

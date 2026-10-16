@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { FormEvent } from "react";
+import { clearJoinedSession } from "@mind-probe/shared";
 import { ApiError, fetchSession, joinSession } from "../api";
 
 // Session 加入畫面（ADR-0005）。
@@ -15,6 +16,7 @@ export interface JoinedSession {
 
 interface Props {
   onJoined: (session: JoinedSession) => void;
+  error?: string | null;
 }
 
 /** Stable per-device id bound into the token, so a reload reuses one identity. */
@@ -41,7 +43,7 @@ const inputStyle = {
   boxSizing: "border-box" as const,
 };
 
-export default function SessionJoinModal({ onJoined }: Props) {
+export default function SessionJoinModal({ onJoined, error: externalError = null }: Props) {
   const [sessionId, setSessionId] = useState("");
   const [joinCode, setJoinCode] = useState("");
   const [busy, setBusy] = useState(false);
@@ -62,6 +64,7 @@ export default function SessionJoinModal({ onJoined }: Props) {
       if (result.role !== "wizard") {
         // Fail loudly here rather than letting the socket close with 4401:
         // the join code was issued for a different console.
+        clearJoinedSession(result.session_id);
         setError(`此 Join Code 對應角色為 ${result.role}，不是 wizard`);
         return;
       }
@@ -126,12 +129,12 @@ export default function SessionJoinModal({ onJoined }: Props) {
           />
         </label>
 
-        {error !== null && (
+        {(error ?? externalError) !== null && (
           <p
             role="alert"
             style={{ color: "#ff8080", fontSize: 13, margin: "0 0 12px" }}
           >
-            {error}
+            {error ?? externalError}
           </p>
         )}
 

@@ -82,6 +82,7 @@ from dataclasses import dataclass, field
 from http.cookies import SimpleCookie
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketDisconnected
 from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session as DBSession
@@ -215,6 +216,9 @@ class ConnectionInfo:
     # events can record which offset/version they were normalized against.
     clock_offset_ms: int = 0
     clock_offset_version: int = 1
+    # Digest of the token presented at the upgrade. Security revocation closes
+    # only the sockets that presented that digest; session end closes them all.
+    token_hash: str = ""
 
 
 @dataclass
@@ -319,6 +323,7 @@ class ConnectionManager:
         ws: WebSocket,
         *,
         subprotocol: str | None = None,
+        token_hash: str = "",
     ) -> bool:
         """Accept `ws` for (session_id, role).
 
@@ -359,6 +364,7 @@ class ConnectionManager:
                 connected_at_ms=now,
                 last_heartbeat_ms=now,
                 event_loop=asyncio.get_running_loop(),
+                token_hash=token_hash,
             )
         )
         # The role is back: clear any outstanding disconnect mark last, so a
@@ -453,6 +459,50 @@ class ConnectionManager:
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+
+    def schedule_close_live_sockets(
+        self,
+        session_id: str,
+        *,
+        code: int = 4401,
+        reason: str,
+        token_hash: str | None = None,
+    ) -> None:
+        """Close live sockets for a session on the loop that accepted them.
+
+        ``token_hash`` None closes every role. A digest closes only the
+        sockets that presented that token, so revoking the wizard credential
+        leaves the student connection up. REST handlers run in a worker
+        thread, so they cannot ``create_task`` directly.
+        """
+        by_loop: dict[asyncio.AbstractEventLoop, list[WebSocket]] = {}
+        for conns in self._connections.get(session_id, {}).values():
+            for info in list(conns):
+                if token_hash is None or info.token_hash == token_hash:
+                    by_loop.setdefault(info.event_loop, []).append(info.websocket)
+        for loop, sockets in by_loop.items():
+            self._schedule_on_loop(
+                loop, self._close_sockets(sockets, code=code, reason=reason)
+            )
+
+    async def _close_sockets(
+        self, sockets: list[WebSocket], *, code: int, reason: str
+    ) -> None:
+        for ws in sockets:
+            try:
+                await ws.close(code=code, reason=reason)
+            except (WebSocketDisconnect, WebSocketDisconnected, RuntimeError):
+                pass
+
+    def _schedule_on_loop(self, loop: asyncio.AbstractEventLoop, coro) -> None:
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            self.spawn_background_task(coro)
+        else:
+            loop.call_soon_threadsafe(self.spawn_background_task, coro)
 
 
 manager = ConnectionManager()
@@ -1572,6 +1622,12 @@ async def _handle_message(
         return
 
     await manager.broadcast(session_id, message, exclude=role)
+    if envelope.event_type is EventType.SESSION_ENDED:
+        # The ended event itself was already ACKed and broadcast. Further
+        # frames from this socket, and from every other live role, are refused.
+        manager.schedule_close_live_sockets(
+            session_id, code=4401, reason="session_ended"
+        )
 
 
 @router.websocket("/ws/{session_id}/{role}")
@@ -1585,9 +1641,9 @@ async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
     The upgrade requires an HMAC token carried as the ``bearer.<token>``
     subprotocol (or, only when ``MINDPROBE_AUTH_COOKIE`` is on, the dev
     cookie). The path role is never treated as authoritative by itself
-    (ADR-0001 §8, ADR-0005 §6.6). Revocation and ended-session refusal live
-    here, in the same function that checks the signature, so there is one
-    upgrade path.
+    (ADR-0001 §8, ADR-0005 §6.6). Revocation and ended-session refusal are
+    checked again on every inbound frame, and live sockets are closed when
+    a token is revoked or the session ends.
     """
     if role not in VALID_ROLES:
         await websocket.close(code=4400, reason="invalid_role")
@@ -1604,6 +1660,7 @@ async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
     # A valid token proves the bearer's role and session claim, not that the
     # session it names was ever created, is still live, or that the token
     # has not been revoked. Refuse before any in-memory state is spun up.
+    token_hash = models.hash_token(token)
     try:
         with _db_scope(websocket) as db:
             session = models.get_session(db, session_id)
@@ -1611,9 +1668,7 @@ async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
                 rejection = "session_not_found"
             elif session.status == "ended":
                 rejection = "session_ended"
-            elif models.is_token_hash_revoked(
-                db, session_id, models.hash_token(token)
-            ):
+            elif models.is_token_hash_revoked(db, session_id, token_hash):
                 rejection = "token_revoked"
             else:
                 rejection = None
@@ -1641,6 +1696,7 @@ async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
             role,
             websocket,
             subprotocol=_selected_subprotocol(websocket),
+            token_hash=token_hash,
         )
     except RoleConnectionConflict:
         # ADR-0001 §9: a live connection must not be silently evicted by a
@@ -1666,6 +1722,16 @@ async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
         while True:
             try:
                 raw = await websocket.receive_json()
+                rejection = _live_socket_rejection(
+                    websocket, session_id, token_hash
+                )
+                if rejection is not None:
+                    close_code, close_reason = rejection
+                    try:
+                        await websocket.close(code=close_code, reason=close_reason)
+                    except (WebSocketDisconnect, WebSocketDisconnected, RuntimeError):
+                        pass
+                    raise WebSocketDisconnect(code=close_code, reason=close_reason)
                 await _handle_message(websocket, session_id, role, raw)
             except ValidationError as exc:
                 await websocket.send_json(
@@ -1693,3 +1759,44 @@ async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
                 manager.spawn_background_task(
                     _delayed_disconnect_pause_check(websocket, session_id, role)
                 )
+
+
+def _live_socket_rejection(
+    websocket: WebSocket, session_id: str, token_hash: str
+) -> tuple[int, str] | None:
+    """Refuse a frame once the session has ended or this token was revoked.
+
+    The handshake check is not enough: a socket accepted earlier can still
+    write events after ``POST /end`` or a security revocation unless each
+    message is checked again.
+    """
+    try:
+        with _db_scope(websocket) as db:
+            session = models.get_session(db, session_id)
+            if session is None:
+                return 4404, "session_not_found"
+            if session.status == "ended":
+                return 4401, "session_ended"
+            if models.is_token_hash_revoked(db, session_id, token_hash):
+                return 4401, "token_revoked"
+    except SQLAlchemyError:
+        logger.exception(
+            "failed to recheck authorization for session %s", session_id
+        )
+        return 4401, "session_state_unavailable"
+    return None
+
+
+def _on_tokens_revoked(
+    session_id: str, token_hash: str | None, reason: str
+) -> None:
+    """Close sockets after a revocation commit. Registered below."""
+    manager.schedule_close_live_sockets(
+        session_id,
+        code=4401,
+        reason=reason,
+        token_hash=token_hash,
+    )
+
+
+models.add_revocation_listener(_on_tokens_revoked)

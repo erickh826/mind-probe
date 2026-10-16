@@ -101,10 +101,37 @@ export async function fetchClipManifest(caseId: string, auth: AuthContext): Prom
   return response.clips;
 }
 
-export function fetchAuditLogs(sessionId: string, auth: AuthContext): Promise<AuditResponse> {
-  return fetchJson<AuditResponse>(`/sessions/${encodeURIComponent(sessionId)}/audit`, {
+export async function fetchAuditLogs(
+  sessionId: string,
+  auth: AuthContext,
+): Promise<AuditResponse | null> {
+  // /audit is operator-only. A teacher or observer token is expected to be
+  // refused; that refusal must not fail the rest of the review load.
+  const response = await fetch(apiUrl(`/sessions/${encodeURIComponent(sessionId)}/audit`), {
+    credentials: "omit",
     headers: authHeaders(auth),
   });
+  if (response.status === 401 || response.status === 403) {
+    return null;
+  }
+  if (!response.ok) {
+    let message = `${response.status} ${response.statusText}`;
+    try {
+      const body = (await response.json()) as { detail?: unknown };
+      if (typeof body.detail === "string") {
+        message = body.detail;
+      } else if (body.detail) {
+        message = JSON.stringify(body.detail);
+      }
+    } catch {
+      const text = await response.text();
+      if (text) {
+        message = text;
+      }
+    }
+    throw new Error(message);
+  }
+  return response.json() as Promise<AuditResponse>;
 }
 
 export function fetchRecordingBlob(sessionId: string, auth: AuthContext, signal: AbortSignal): Promise<Blob> {
