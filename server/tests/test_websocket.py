@@ -1704,16 +1704,6 @@ def _age_disconnect_mark(session_id: str, role: str) -> None:
     marks[role] -= DISCONNECT_GRACE_MS + 1_000
 
 
-def _wait_for_session_pause(session_id: str, *, timeout_s: float = 1.0) -> None:
-    """Poll the row until an async disconnect task has had a chance to run."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if _session_row(session_id).status == "paused" and _audit_rows(session_id, models.AUDIT_SESSION_PAUSED):
-            return
-        time.sleep(0.01)
-    assert _session_row(session_id).status == "paused"
-
-
 def _assert_network_failure_pause(session_id: str, lost_role: str) -> None:
     row = _session_row(session_id)
     assert row.status == "paused"
@@ -1826,6 +1816,12 @@ def test_critical_role_disconnect_pauses_only_after_the_grace_window():
 
 
 def test_critical_role_disconnect_pauses_without_later_inbound_traffic(monkeypatch):
+    """The server pauses on its own after the grace window, with no further traffic.
+
+    The database is read only after that pause message arrives. Polling SQLite
+    on this file's shared StaticPool connection while the handler is committing
+    can roll the audit row or the timeline event back.
+    """
     session_id = _fresh_session_id()
     monkeypatch.setattr(websocket_module, "DISCONNECT_GRACE_MS", 10)
 
@@ -1836,7 +1832,6 @@ def test_critical_role_disconnect_pauses_without_later_inbound_traffic(monkeypat
         _make_start_due(session_id)
         student.__exit__(None, None, None)
 
-        _wait_for_session_pause(session_id)
         paused = wizard.receive_json()
         assert paused["event_type"] == "session_paused"
         assert paused["payload"]["reason"] == "network_failure"
