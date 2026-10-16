@@ -82,7 +82,6 @@ from dataclasses import dataclass, field
 from http.cookies import SimpleCookie
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from starlette.websockets import WebSocketDisconnected
 from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session as DBSession
@@ -491,7 +490,9 @@ class ConnectionManager:
         for ws in sockets:
             try:
                 await ws.close(code=code, reason=reason)
-            except (WebSocketDisconnect, WebSocketDisconnected, RuntimeError):
+            except (WebSocketDisconnect, RuntimeError):
+                # Starlette 1.3.1 raises RuntimeError when close() is called
+                # after the socket has already been closed.
                 pass
 
     def _schedule_on_loop(self, loop: asyncio.AbstractEventLoop, coro) -> None:
@@ -1729,7 +1730,7 @@ async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
                     close_code, close_reason = rejection
                     try:
                         await websocket.close(code=close_code, reason=close_reason)
-                    except (WebSocketDisconnect, WebSocketDisconnected, RuntimeError):
+                    except (WebSocketDisconnect, RuntimeError):
                         pass
                     raise WebSocketDisconnect(code=close_code, reason=close_reason)
                 await _handle_message(websocket, session_id, role, raw)
