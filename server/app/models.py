@@ -43,6 +43,7 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     DateTime,
     ForeignKey,
     Integer,
@@ -261,6 +262,53 @@ class RecordingChunk(Base):
     checksum: Mapped[str | None] = mapped_column(String, nullable=True)
     upload_status: Mapped[str] = mapped_column(String, default="received")
     path: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+#: ``recordings.recording_state`` (ADR-0005 §7.1). Later states are stored so
+#: the machine can name them; this batch only transitions through recording,
+#: finalizing, complete, incomplete, and the existing synchronous transcode.
+RECORDING_STATES = (
+    "recording",
+    "finalizing",
+    "complete",
+    "incomplete",
+    "transcoding",
+    "transcoded",
+    "uploaded",
+    "transcode_failed",
+    "deleting",
+    "deleted",
+)
+FINALIZE_STATES = ("none", "pending", "complete", "incomplete")
+#: D8: these incomplete reasons are sticky. A full chunk set must not flip them
+#: back to complete, so nothing auto-transcodes or deletes their raw media.
+PROTECTED_INCOMPLETE_REASONS = frozenset({"recorder_lost", "operator_incomplete"})
+
+
+class Recording(Base):
+    """One MediaRecorder take for a session (ADR-0005 §7).
+
+    Phase 1 is a single take per session. ``next_sequence`` lives in the
+    browser; this row is the server's view of how far that take got.
+    """
+
+    __tablename__ = "recordings"
+
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("sessions.id"), primary_key=True
+    )
+    recording_state: Mapped[str] = mapped_column(String, default="recording")
+    finalize_state: Mapped[str] = mapped_column(String, default="none")
+    final_sequence: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_chunks: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: ``recorder_lost`` when the student declared the take dead, else None.
+    finalize_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    incomplete_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    needs_operator: Mapped[bool] = mapped_column(Boolean, default=False)
+    missing_sequences: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
 class AuditLog(Base):
@@ -723,6 +771,28 @@ def save_recording_chunk_metadata(
     else:
         db.flush()
     return chunk
+
+
+def get_recording(db: DBSession, session_id: str) -> Recording | None:
+    """Return the recording row for a session, or None when ingest never started."""
+    return db.get(Recording, session_id)
+
+
+def ensure_recording(db: DBSession, session_id: str) -> Recording | None:
+    """Create the recording row on first ingest. Unknown sessions stay row-less.
+
+    Chunk bytes are still stored when the session row is missing (ADR-0004 §4);
+    the state machine cannot reference a session that does not exist.
+    """
+    existing = get_recording(db, session_id)
+    if existing is not None:
+        return existing
+    if get_session(db, session_id) is None:
+        return None
+    recording = Recording(session_id=session_id, missing_sequences=[])
+    db.add(recording)
+    db.flush()
+    return recording
 
 
 # ---------------------------------------------------------------------------

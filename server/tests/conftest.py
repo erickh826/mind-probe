@@ -17,6 +17,11 @@ from fastapi.testclient import TestClient
 import os
 
 os.environ.setdefault("MINDPROBE_WS_TOKEN_SECRET", "test-api-secret")
+# Module-level TestClient() starts the app lifespan during collection, before
+# fixtures run. The grace thread shares the suite's SQLite connection, so it
+# has to be off before that import. Tests call apply_upload_grace_deadlines
+# directly.
+os.environ["MINDPROBE_UPLOAD_GRACE_SCHEDULER"] = "false"
 
 OPERATOR_TOKEN = "test-operator-token-0123456789abcdef"
 
@@ -34,6 +39,9 @@ def _auth_env(monkeypatch):
     # The legacy suite authenticates with the role cookie; Bearer-only is
     # covered explicitly in test_auth_matrix.py.
     monkeypatch.setenv("MINDPROBE_AUTH_COOKIE", "true")
+    # The minute grace loop shares SQLite with the suite. Tests call
+    # apply_upload_grace_deadlines directly.
+    monkeypatch.setenv("MINDPROBE_UPLOAD_GRACE_SCHEDULER", "false")
 
 
 @pytest.fixture(autouse=True)

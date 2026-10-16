@@ -40,9 +40,11 @@ from sqlalchemy.pool import StaticPool
 # setdefault so a secret an earlier test module set is never clobbered.
 os.environ.setdefault("MINDPROBE_WS_TOKEN_SECRET", "test-recording-secret")
 
-from app import models, recording
+from app import models, recording, websocket
 from app.main import app
 from app.models import Base
+
+OPERATOR_HEADERS = {"Authorization": "Bearer test-operator-token-0123456789abcdef"}
 
 #: A minimal but genuine WebM/EBML header, so `validate_header_chunk` is
 #: exercised against the magic bytes a real MediaRecorder emits rather than a
@@ -137,12 +139,31 @@ def _new_session(db, case_id: str = "CASE001") -> str:
     return session_id
 
 
+def _student_headers(session_id: str) -> dict[str, str]:
+    token = websocket.create_session_token(session_id, "student")
+    return {"Authorization": f"Bearer {token}"}
+
+
 def _post_chunk(client, session_id: str, sequence: int, data: bytes, **form):
     return client.post(
         f"/recording/{session_id}/chunk",
         data={"sequence": sequence, **form},
         files={"chunk": (f"{sequence:06d}.webm", data, "video/webm")},
+        headers=_student_headers(session_id),
     )
+
+
+def _mark_complete(db, session_id: str, *, final_sequence: int, total_chunks: int) -> None:
+    """Let the existing transcode route run. It now requires a complete take."""
+    rec = models.ensure_recording(db, session_id)
+    assert rec is not None
+    rec.recording_state = "complete"
+    rec.finalize_state = "complete"
+    rec.final_sequence = final_sequence
+    rec.total_chunks = total_chunks
+    rec.total_duration_ms = 0
+    rec.missing_sequences = []
+    db.commit()
 
 
 def _write_chunks(session_id: str, payloads: dict[int, bytes]) -> None:
@@ -348,13 +369,13 @@ def test_upload_rejects_path_like_session_ids_before_writing(client, chunk_root)
 
 
 def test_status_and_process_reject_invalid_session_ids(client, chunk_root):
-    for suffix in ("status", "process"):
-        response = client.request(
-            "GET" if suffix == "status" else "POST",
-            f"/recording/bad%21id/{suffix}",
-        )
-        assert response.status_code == 400
-        assert response.json()["detail"]["error"] == "invalid_session_id"
+    student = _student_headers("bad!id")
+    response = client.get("/recording/bad%21id/status", headers=student)
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"] == "invalid_session_id"
+    response = client.post("/recording/bad%21id/process", headers=OPERATOR_HEADERS)
+    assert response.status_code == 400
+    assert response.json()["detail"]["error"] == "invalid_session_id"
 
 
 # --- Header validation + inventory ------------------------------------------
@@ -589,18 +610,33 @@ def test_status_endpoint_reports_completeness(client, db, chunk_root):
     for sequence, data in ((0, EBML_HEADER), (1, b"-one"), (3, b"-three")):
         assert _post_chunk(client, session_id, sequence, data).status_code == 200
 
-    body = client.get(f"/recording/{session_id}/status").json()
+    body = client.get(
+        f"/recording/{session_id}/status", headers=_student_headers(session_id)
+    ).json()
+    # Student status is the minimal upload view. The full inventory stays on
+    # the library report the teacher route uses.
+    assert set(body) == {
+        "received_sequences",
+        "next_expected_sequence",
+        "final_sequence",
+        "finalize_state",
+        "recording_state",
+    }
+    assert body["received_sequences"] == [0, 1, 3]
+    assert body["next_expected_sequence"] == 2
+    assert body["finalize_state"] == "none"
 
-    assert body["chunk_count"] == 3
-    assert body["metadata_rows"] == 3
-    assert body["first_sequence"] == 0
-    assert body["last_sequence"] == 3
-    assert body["missing_sequences"] == [2]
-    assert body["header_chunk_ok"] is True
-    assert body["total_bytes"] == len(EBML_HEADER) + len(b"-one") + len(b"-three")
-    assert body["raw_webm"]["exists"] is False
-    assert body["mp4"]["exists"] is False
-    assert "chunks" not in body
+    report = recording.get_recording_status(session_id, db)
+    assert report["chunk_count"] == 3
+    assert report["metadata_rows"] == 3
+    assert report["first_sequence"] == 0
+    assert report["last_sequence"] == 3
+    assert report["missing_sequences"] == [2]
+    assert report["header_chunk_ok"] is True
+    assert report["total_bytes"] == len(EBML_HEADER) + len(b"-one") + len(b"-three")
+    assert report["raw_webm"]["exists"] is False
+    assert report["mp4"]["exists"] is False
+    assert "chunks" not in report
 
 
 def test_status_endpoint_can_include_per_chunk_metadata(client, db, chunk_root):
@@ -608,9 +644,7 @@ def test_status_endpoint_can_include_per_chunk_metadata(client, db, chunk_root):
     response = _post_chunk(client, session_id, 0, EBML_HEADER, start_ms=0)
     assert response.status_code == 200, response.text
 
-    body = client.get(
-        f"/recording/{session_id}/status", params={"include_chunks": True}
-    ).json()
+    body = recording.get_recording_status(session_id, db, include_chunks=True)
 
     assert body["chunks"] == [
         {
@@ -627,12 +661,15 @@ def test_status_endpoint_can_include_per_chunk_metadata(client, db, chunk_root):
 def test_status_endpoint_is_safe_for_a_session_with_no_recording(client, db, chunk_root):
     session_id = _new_session(db)
 
-    body = client.get(f"/recording/{session_id}/status").json()
+    body = client.get(
+        f"/recording/{session_id}/status", headers=_student_headers(session_id)
+    ).json()
 
-    assert body["chunk_count"] == 0
-    assert body["first_sequence"] is None
-    assert body["header_chunk_ok"] is False
-    assert body["missing_sequences"] == []
+    assert body["received_sequences"] == []
+    assert body["next_expected_sequence"] == 0
+    assert body["final_sequence"] is None
+    assert body["finalize_state"] == "none"
+    assert body["recording_state"] == "recording"
 
 
 def test_process_endpoint_degrades_to_raw_only_without_ffmpeg(
@@ -648,8 +685,9 @@ def test_process_endpoint_degrades_to_raw_only_without_ffmpeg(
         assert _post_chunk(client, session_id, sequence, data).status_code == 200
 
     monkeypatch.setattr(subprocess, "run", _missing_binary_run)
+    _mark_complete(db, session_id, final_sequence=1, total_chunks=2)
 
-    response = client.post(f"/recording/{session_id}/process")
+    response = client.post(f"/recording/{session_id}/process", headers=OPERATOR_HEADERS)
 
     assert response.status_code == 200, response.text
     body = response.json()
@@ -665,9 +703,12 @@ def test_process_endpoint_degrades_to_raw_only_without_ffmpeg(
 def test_process_endpoint_can_skip_the_transcode(client, db, chunk_root):
     session_id = _new_session(db)
     assert _post_chunk(client, session_id, 0, EBML_HEADER).status_code == 200
+    _mark_complete(db, session_id, final_sequence=0, total_chunks=1)
 
     body = client.post(
-        f"/recording/{session_id}/process", params={"remux": False}
+        f"/recording/{session_id}/process",
+        params={"remux": False},
+        headers=OPERATOR_HEADERS,
     ).json()
 
     assert body["status"] == "raw_only"
@@ -676,19 +717,32 @@ def test_process_endpoint_can_skip_the_transcode(client, db, chunk_root):
     assert not recording.mp4_path(session_id).exists()
 
 
-def test_process_endpoint_404s_with_nothing_uploaded(client, db, chunk_root):
+def test_process_endpoint_409s_until_the_take_is_complete(client, db, chunk_root):
+    """Transcode stays the same route, and it refuses an unfinished take."""
     session_id = _new_session(db)
-    assert client.post(f"/recording/{session_id}/process").status_code == 404
+    response = client.post(f"/recording/{session_id}/process", headers=OPERATOR_HEADERS)
+    assert response.status_code == 409
+    assert response.json()["detail"]["error"] == "recording_not_complete"
+    assert not recording.merged_path(session_id).exists()
 
 
 def test_process_endpoint_409s_without_a_header_chunk(client, db, chunk_root):
     session_id = _new_session(db)
     assert _post_chunk(client, session_id, 1, b"-orphan").status_code == 200
+    rec = models.ensure_recording(db, session_id)
+    assert rec is not None
+    rec.recording_state = "complete"
+    rec.finalize_state = "complete"
+    rec.final_sequence = 1
+    rec.total_chunks = 1
+    db.commit()
 
-    response = client.post(f"/recording/{session_id}/process")
+    response = client.post(f"/recording/{session_id}/process", headers=OPERATOR_HEADERS)
 
     assert response.status_code == 409
-    assert "header chunk" in response.json()["detail"]
+    assert response.json()["detail"]["error"] == "recording_not_complete"
+    assert not recording.merged_path(session_id).exists()
+    assert recording.chunk_path(session_id, 1).is_file()
 
 
 # --- Real FFmpeg end to end (spec §10.1, M4 go/no-go) -----------------------
@@ -730,8 +784,11 @@ def test_real_ffmpeg_pipeline_produces_h264_aac_within_the_duration_tolerance(
     for sequence in (2, 1, 0):
         response = _post_chunk(client, session_id, sequence, slices[sequence])
         assert response.status_code == 200, response.text
+    _mark_complete(db, session_id, final_sequence=2, total_chunks=3)
 
-    body = client.post(f"/recording/{session_id}/process").json()
+    body = client.post(
+        f"/recording/{session_id}/process", headers=OPERATOR_HEADERS
+    ).json()
 
     assert body["status"] == "completed", body.get("remux_error")
     assert body["missing_sequences"] == []
@@ -749,7 +806,7 @@ def test_real_ffmpeg_pipeline_produces_h264_aac_within_the_duration_tolerance(
     assert body["duration_delta_s"] is not None
     assert body["duration_delta_s"] < 1.0
 
-    status = client.get(f"/recording/{session_id}/status").json()
+    status = recording.get_recording_status(session_id, db)
     assert status["raw_webm"]["exists"] is True
     # The raw sources outlive a successful transcode (ADR-0004 §4).
     assert status["chunk_count"] == 3

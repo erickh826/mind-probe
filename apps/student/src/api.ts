@@ -129,17 +129,101 @@ export async function fetchClipManifest(caseId: string): Promise<ClipManifestEnt
   });
 }
 
+export interface ChunkAck {
+  status: string;
+}
+
 export async function uploadRecordingChunk(
   sessionId: string,
   sequence: number,
   chunk: Blob,
-): Promise<void> {
+  meta: { start_ms: number; end_ms: number; checksum: string },
+): Promise<ChunkAck> {
   const form = new FormData();
   form.append("sequence", String(sequence));
+  form.append("start_ms", String(meta.start_ms));
+  form.append("end_ms", String(meta.end_ms));
+  form.append("checksum", meta.checksum);
   form.append("chunk", chunk, `${String(sequence).padStart(6, "0")}.webm`);
 
-  await request(`/recording/${encodeURIComponent(sessionId)}/chunk`, {
+  const body = await request(`/recording/${encodeURIComponent(sessionId)}/chunk`, {
     method: "POST",
     body: form,
   });
+  if (isRecord(body) && typeof body.status === "string") {
+    return { status: body.status };
+  }
+  return { status: "received" };
+}
+
+export interface UploadStatus {
+  received_sequences: number[];
+  next_expected_sequence: number | null;
+  final_sequence: number | null;
+  finalize_state: "none" | "pending" | "complete" | "incomplete";
+  recording_state: string;
+}
+
+function asNumberList(value: unknown): number[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((item): item is number => typeof item === "number" && Number.isFinite(item));
+}
+
+export async function fetchUploadStatus(sessionId: string): Promise<UploadStatus> {
+  const body = await request(`/recording/${encodeURIComponent(sessionId)}/status`);
+  if (!isRecord(body)) {
+    throw new ApiError(500, "Upload status response has an unexpected shape.");
+  }
+  const finalize = body.finalize_state;
+  const finalizeState =
+    finalize === "pending" || finalize === "complete" || finalize === "incomplete"
+      ? finalize
+      : "none";
+  return {
+    received_sequences: asNumberList(body.received_sequences),
+    next_expected_sequence:
+      typeof body.next_expected_sequence === "number" ? body.next_expected_sequence : null,
+    final_sequence: typeof body.final_sequence === "number" ? body.final_sequence : null,
+    finalize_state: finalizeState,
+    recording_state: typeof body.recording_state === "string" ? body.recording_state : "recording",
+  };
+}
+
+export interface FinalizeResult {
+  recording_state: string;
+  finalize_state: "none" | "pending" | "complete" | "incomplete";
+  final_sequence: number | null;
+  missing_sequences: number[];
+}
+
+export async function finalizeRecording(
+  sessionId: string,
+  payload: {
+    final_sequence: number;
+    total_chunks: number;
+    total_duration_ms: number;
+    reason?: "recorder_lost";
+  },
+): Promise<FinalizeResult> {
+  const body = await request(`/recording/${encodeURIComponent(sessionId)}/finalize`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!isRecord(body)) {
+    throw new ApiError(500, "Finalize response has an unexpected shape.");
+  }
+  const finalize = body.finalize_state;
+  const finalizeState =
+    finalize === "pending" || finalize === "complete" || finalize === "incomplete"
+      ? finalize
+      : "none";
+  return {
+    recording_state: typeof body.recording_state === "string" ? body.recording_state : "",
+    finalize_state: finalizeState,
+    final_sequence: typeof body.final_sequence === "number" ? body.final_sequence : null,
+    missing_sequences: asNumberList(body.missing_sequences),
+  };
 }

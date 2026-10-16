@@ -1031,6 +1031,7 @@ def test_events_and_recording_chunks_are_backfilled_after_a_brief_reconnect(
             f"/recording/{session_id}/chunk",
             data={"sequence": sequence},
             files={"chunk": (f"{sequence}.webm", b"webm-" + str(sequence).encode(), "video/webm")},
+            headers=headers["student"],
         )
         assert resp.status_code == 200, resp.text
         assert resp.json()["sequence"] == sequence
