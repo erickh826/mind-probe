@@ -1,22 +1,11 @@
 """REST authentication + access auditing for the teacher review surface.
 
-The realtime layer authenticates a WebSocket upgrade with a role-bound HMAC
-cookie (ADR-0001 §8). Teacher review happens over REST instead, against the
-same token, so this module is the request-side counterpart of
-``websocket._verify_session_token()``.
-
-**Why the verification logic is mirrored rather than imported.**
-``websocket._verify_session_token(websocket, session_id, role)`` takes a live
-``WebSocket`` (it reads the cookie off the socket's headers) and returns
-nothing a REST handler can use -- it cannot tell the caller *who* the actor is,
-which ADR-0004 §3's "誰檢視或下載錄影" audit row needs. Widening it would mean
-editing ``websocket.py``, which belongs to another roadmap role
-(``docs/roadmap.md`` §4). So the claims check is re-expressed here, following
-the precedent ``models.py`` already sets for ``PAUSE_REASONS`` /
-``event_dedup_key``: mirror locally, keep the duplication to the smallest
-possible surface (the signing key and the base64 helpers are imported, not
-copied), and pin the equivalence with a test --
-``tests/test_api.py::test_auth_token_rules_match_the_websocket_verifier``.
+``verify_token`` is the single claims check for REST and the WebSocket
+upgrade. ``websocket._verify_session_token`` extracts the credential (Bearer
+subprotocol, or the dev cookie) and calls ``verify_token``; it does not keep
+a second copy of the signature, expiry, session or role rules. The
+equivalence test ``tests/test_api.py::test_auth_token_rules_match_the_websocket_verifier``
+pins that mapping.
 
 **Post-session review and revocation.** ``POST /sessions/{id}/end`` calls
 ``models.revoke_session_tokens()``, which audit-revokes *every* token issued
@@ -116,7 +105,7 @@ class Actor:
 
 
 # ---------------------------------------------------------------------------
-# Token verification (mirrors websocket._verify_session_token, ADR-0001 §8)
+# Token verification shared by REST and the WebSocket upgrade (ADR-0005 §6.2)
 # ---------------------------------------------------------------------------
 
 
@@ -130,10 +119,11 @@ def decode_session_token(
 ) -> dict[str, Any]:
     """Verify a session token's signature and claims, returning the claims.
 
-    Performs exactly the four checks ``websocket._verify_session_token`` does,
-    in the same order: constant-time HMAC comparison, ``exp``, ``session_id``
-    binding, ``role`` binding. The last two are skipped when the corresponding
-    argument is ``None``.
+    Checks, in order: canonical encoding, constant-time HMAC comparison,
+    ``exp``, ``session_id`` binding, ``role`` binding, and optional ``typ``.
+    The session, role and typ checks are skipped when the corresponding
+    argument is ``None``. The WebSocket upgrade calls this rather than
+    keeping a second copy of the rules.
 
     The ``session_id`` binding is load-bearing rather than decorative: without
     it, a teacher token minted for session A would read session B's recording.

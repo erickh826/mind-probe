@@ -35,6 +35,7 @@ from app.websocket import (
     DISCONNECT_GRACE_MS,
     FALLBACK_THRESHOLD,
     HEARTBEAT_STALE_MS,
+    WS_PROTOCOL,
     WS_SESSION_COOKIE,
     compute_offset_median,
     create_session_token,
@@ -403,7 +404,8 @@ def test_role_mismatched_token_is_rejected():
     with pytest.raises(WebSocketDisconnect) as exc_info:
         with _connect(session_id, "wizard", token_role="student"):
             pass
-    assert exc_info.value.code == 4401
+    assert exc_info.value.code == 4403
+    assert exc_info.value.reason == "role_token_mismatch"
 
 
 def test_second_student_connection_is_rejected_while_first_is_live():
@@ -421,6 +423,178 @@ def test_invalid_role_is_rejected_at_handshake():
         with client.websocket_connect(f"/ws/{session_id}/not_a_role"):
             pass
     assert exc_info.value.code == 4400
+
+
+def _subprotocols(token: str) -> list[str]:
+    return [WS_PROTOCOL, f"bearer.{token}"]
+
+
+def _connect_subprotocol(session_id: str, role: str, token: str):
+    return client.websocket_connect(
+        f"/ws/{session_id}/{role}",
+        subprotocols=_subprotocols(token),
+    )
+
+
+def test_subprotocol_auth_echoes_only_mindprobe_v1():
+    session_id = _fresh_session_id()
+    token = create_session_token(session_id, "student")
+    with _connect_subprotocol(session_id, "student", token) as sock:
+        assert sock.accepted_subprotocol == WS_PROTOCOL
+        assert not str(sock.accepted_subprotocol).startswith("bearer.")
+        sock.send_json({"type": "ping", "ping_id": "sub", "client_timestamp_ms": 0})
+        assert sock.receive_json()["ping_id"] == "sub"
+
+
+def test_subprotocol_auth_rejects_missing_token():
+    session_id = _fresh_session_id()
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(
+            f"/ws/{session_id}/student",
+            subprotocols=[WS_PROTOCOL],
+        ):
+            pass
+    assert exc_info.value.code == 4401
+    assert exc_info.value.reason == "missing_session_token"
+
+
+def test_bearer_subprotocol_without_mindprobe_v1_is_rejected():
+    session_id = _fresh_session_id()
+    token = create_session_token(session_id, "student")
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(
+            f"/ws/{session_id}/student",
+            subprotocols=[f"bearer.{token}"],
+        ):
+            pass
+    assert exc_info.value.code == 4401
+    assert exc_info.value.reason == "missing_subprotocol"
+
+
+def test_subprotocol_auth_rejects_wrong_role():
+    session_id = _fresh_session_id()
+    token = create_session_token(session_id, "student")
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with _connect_subprotocol(session_id, "wizard", token):
+            pass
+    assert exc_info.value.code == 4403
+    assert exc_info.value.reason == "role_token_mismatch"
+
+
+def test_subprotocol_auth_rejects_wrong_session():
+    session_id = _fresh_session_id()
+    other_id = _fresh_session_id()
+    token = create_session_token(other_id, "student")
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with _connect_subprotocol(session_id, "student", token):
+            pass
+    assert exc_info.value.code == 4401
+    assert exc_info.value.reason == "session_token_mismatch"
+
+
+def test_subprotocol_auth_rejects_revoked_token():
+    session_id = _fresh_session_id()
+    token = create_session_token(session_id, "wizard")
+    with models.session_scope() as db:
+        models.revoke_token_hash(db, session_id, models.hash_token(token))
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with _connect_subprotocol(session_id, "wizard", token):
+            pass
+    assert exc_info.value.code == 4401
+    assert exc_info.value.reason == "token_revoked"
+
+
+def _note(sequence: int, event_id: str) -> dict:
+    return {
+        "sequence": sequence,
+        "client_timestamp_ms": 0,
+        "event_type": "observer_note",
+        "payload": {"event_id": event_id, "note": event_id},
+    }
+
+
+def _expect_closed(sock, *, reason: str) -> None:
+    """The next frame must not be applied; the socket closes 4401."""
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        sock.send_json(_note(99, "evt-after-close"))
+        sock.receive_json()
+    assert exc_info.value.code == 4401
+    assert exc_info.value.reason == reason
+
+
+def test_security_revocation_drops_events_on_the_live_socket():
+    session_id = _fresh_session_id()
+    wizard_token = create_session_token(session_id, "wizard")
+    student_token = create_session_token(session_id, "student")
+    with (
+        _connect_subprotocol(session_id, "wizard", wizard_token) as wizard,
+        _connect_subprotocol(session_id, "student", student_token) as student,
+    ):
+        with models.session_scope() as db:
+            models.revoke_token_hash(
+                db, session_id, models.hash_token(wizard_token)
+            )
+        _expect_closed(wizard, reason="token_revoked")
+        assert _stored_events(session_id) == []
+
+        student.send_json({"type": "ping", "ping_id": "still-live"})
+        reply = student.receive_json()
+        assert reply["type"] == "pong"
+        assert reply["ping_id"] == "still-live"
+
+
+def test_end_session_drops_events_on_the_live_socket():
+    session_id = _fresh_session_id()
+    with _connect(session_id, "wizard") as wizard:
+        response = client.post(f"/sessions/{session_id}/end")
+        assert response.status_code == 200
+        _expect_closed(wizard, reason="session_ended")
+        assert _stored_events(session_id) == []
+
+
+def test_events_after_accepted_session_ended_are_not_persisted():
+    session_id = _fresh_session_id()
+    with _connect(session_id, "wizard") as wizard:
+        wizard.send_json(
+            {
+                "sequence": 1,
+                "client_timestamp_ms": 0,
+                "event_type": "session_ended",
+                "payload": {"event_id": "evt-end"},
+            }
+        )
+        assert wizard.receive_json()["status"] == "accepted"
+        _expect_closed(wizard, reason="session_ended")
+
+    events = _stored_events(session_id)
+    assert [event.event_type for event in events] == ["session_ended"]
+
+
+def test_cookie_is_ignored_when_cookie_auth_is_disabled(monkeypatch):
+    monkeypatch.setenv("MINDPROBE_AUTH_COOKIE", "false")
+    session_id = _fresh_session_id()
+    token = create_session_token(session_id, "student")
+    headers = {"cookie": f"{WS_SESSION_COOKIE}={token}"}
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(f"/ws/{session_id}/student", headers=headers):
+            pass
+    assert exc_info.value.code == 4401
+    assert exc_info.value.reason == "missing_session_token"
+
+    with _connect_subprotocol(session_id, "student", token) as sock:
+        assert sock.accepted_subprotocol == WS_PROTOCOL
+
+
+def test_query_string_token_is_not_a_credential():
+    session_id = _fresh_session_id()
+    token = create_session_token(session_id, "student")
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(
+            f"/ws/{session_id}/student?access_token={token}"
+        ):
+            pass
+    assert exc_info.value.code == 4401
+    assert exc_info.value.reason == "missing_session_token"
 
 
 def _far_future_ms() -> int:

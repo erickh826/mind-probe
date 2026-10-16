@@ -225,12 +225,11 @@ def fake_websocket(token: str | None) -> SimpleNamespace:
 
 
 def test_auth_token_rules_match_the_websocket_verifier():
-    """`auth.decode_session_token` accepts and rejects exactly what the WS path does.
+    """The WebSocket upgrade reports the same reasons as ``auth.verify_token``.
 
-    `auth.py` re-expresses `websocket._verify_session_token` because that one
-    is bound to a live WebSocket and cannot report *who* the actor is. This is
-    the equivalence pin for that duplication, in the same spirit as
-    `test_persistence.py`'s `PAUSE_REASONS` / `event_dedup_key` assertions.
+    ``websocket._verify_session_token`` extracts the credential and delegates
+    the claims check, so a signature, expiry, session or role failure uses one
+    vocabulary on both transports.
     """
     token = websocket.create_session_token("S-AUTH", "teacher", client_id="c1")
 

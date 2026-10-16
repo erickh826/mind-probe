@@ -32,10 +32,11 @@ locally and pinned by equivalence assertions in
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import secrets
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
@@ -63,6 +64,34 @@ from sqlalchemy.orm import (
 from sqlalchemy.orm import Session as DBSession
 
 from .events import EventEnvelope
+
+logger = logging.getLogger(__name__)
+
+# ``websocket.py`` registers this so a revocation commit can close live
+# sockets. models does not import the realtime module (that would cycle).
+RevocationListener = Callable[[str, str | None, str], None]
+_revocation_listeners: list[RevocationListener] = []
+
+
+def add_revocation_listener(listener: RevocationListener) -> None:
+    """Notify ``listener`` after a revocation is committed.
+
+    The callback is ``(session_id, token_hash, reason)``. ``token_hash`` is
+    None when every issued token for the session was revoked. Listeners are
+    skipped when the caller passes ``commit=False`` and commits later itself.
+    """
+    if listener not in _revocation_listeners:
+        _revocation_listeners.append(listener)
+
+
+def _notify_revocation(session_id: str, token_hash: str | None, reason: str) -> None:
+    for listener in list(_revocation_listeners):
+        try:
+            listener(session_id, token_hash, reason)
+        except Exception:
+            logger.exception(
+                "revocation listener failed for session %s", session_id
+            )
 
 DB_URL = os.environ.get("MINDPROBE_DB_URL", "sqlite:///./sessions/mind-probe.sqlite")
 
@@ -850,8 +879,8 @@ def revoke_session_tokens(
 
     Stateless HMAC tokens cannot be recovered from the database, so revocation
     is represented by appending ``token_revoked`` rows for each previously
-    issued token hash. The WebSocket ASGI guard in ``main.py`` rejects any
-    cookie whose digest appears in this set.
+    issued token hash. The WebSocket upgrade rejects any token whose digest
+    appears in this set, and a committed revocation closes live sockets.
     """
     revoked = revoked_token_hashes(db, session_id)
     entries: list[AuditLog] = []
@@ -872,6 +901,7 @@ def revoke_session_tokens(
         revoked.add(token_hash)
     if commit:
         db.commit()
+        _notify_revocation(session_id, None, "session_ended")
     else:
         db.flush()
     return entries
@@ -911,7 +941,7 @@ def revoke_token_hash(
     commit: bool = True,
 ) -> AuditLog:
     """Revoke a single token digest, e.g. after a leak (ADR-0005 §1)."""
-    return record_audit(
+    entry = record_audit(
         db,
         action=AUDIT_TOKEN_REVOKED,
         actor_role=actor_role,
@@ -920,3 +950,7 @@ def revoke_token_hash(
         details={"reason": reason},
         commit=commit,
     )
+    if commit:
+        # Close reason is the wire code, not the audit detail ("security").
+        _notify_revocation(session_id, token_hash, "token_revoked")
+    return entry

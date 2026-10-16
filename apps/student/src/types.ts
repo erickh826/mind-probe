@@ -76,6 +76,9 @@ export interface JoinedSession {
   sessionId: string;
   caseId: string;
   clips: ClipManifestEntry[];
+  accessToken: string;
+  /** Reload of a live session. Recording must not start again. */
+  restoredFromStorage?: boolean;
 }
 
 export type ConsoleLogLevel = "info" | "warn" | "error";

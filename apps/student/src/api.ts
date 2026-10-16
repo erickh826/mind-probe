@@ -1,4 +1,5 @@
 import type { ClipManifestEntry, Role } from "@mind-probe/shared";
+import { currentAccessToken, rememberAccessToken } from "@mind-probe/shared";
 import { apiUrl } from "./config";
 
 export class ApiError extends Error {
@@ -16,9 +17,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 async function request(path: string, init?: RequestInit): Promise<unknown> {
+  const headers = new Headers(init?.headers);
+  const token = currentAccessToken();
+  if (token && !headers.has("Authorization")) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+
   let response: Response;
   try {
-    response = await fetch(apiUrl(path), { credentials: "include", ...init });
+    response = await fetch(apiUrl(path), {
+      ...init,
+      headers,
+      credentials: "omit",
+    });
   } catch (cause) {
     throw new ApiError(0, `Session Server is unreachable: ${String(cause)}`);
   }
@@ -37,6 +48,8 @@ async function request(path: string, init?: RequestInit): Promise<unknown> {
 export interface JoinResult {
   session_id: string;
   role: Role | string;
+  access_token: string;
+  expires_at: number;
 }
 
 export async function joinSession(
@@ -52,12 +65,16 @@ export async function joinSession(
       ...(clientId ? { client_id: clientId } : {}),
     }),
   });
-  if (!isRecord(body)) {
-    throw new ApiError(500, "Join response has an unexpected shape.");
+  if (!isRecord(body) || typeof body.access_token !== "string" || body.access_token.length === 0) {
+    throw new ApiError(500, "Join response did not include an access token.");
   }
+  const resolvedSessionId = String(body.session_id ?? sessionId);
+  rememberAccessToken(resolvedSessionId, body.access_token);
   return {
-    session_id: String(body.session_id ?? sessionId),
+    session_id: resolvedSessionId,
     role: typeof body.role === "string" ? body.role : "unknown",
+    access_token: body.access_token,
+    expires_at: typeof body.expires_at === "number" ? body.expires_at : 0,
   };
 }
 

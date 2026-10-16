@@ -19,9 +19,7 @@ import logging
 import os
 import secrets
 import time
-from collections.abc import Iterator
-from contextlib import asynccontextmanager, contextmanager
-from http.cookies import SimpleCookie
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Response, status
@@ -29,7 +27,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
-from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session as DBSession
 
 from . import __version__, auth, cases, models, recording, websocket
@@ -77,100 +74,6 @@ def _session_cookie_secure() -> bool:
     return env_name not in {"", "dev", "development", "local", "test"}
 
 
-def _websocket_path_parts(path: str) -> tuple[str, str] | None:
-    parts = path.strip("/").split("/")
-    if len(parts) != 3 or parts[0] != "ws":
-        return None
-    return parts[1], parts[2]
-
-
-def _scope_cookie_value(scope: dict, key: str) -> str | None:
-    cookie = SimpleCookie()
-    for header_name, header_value in scope.get("headers", []):
-        if header_name.lower() == b"cookie":
-            cookie.load(header_value.decode("latin1"))
-    morsel = cookie.get(key)
-    return morsel.value if morsel is not None else None
-
-
-@contextmanager
-def _websocket_guard_db(app_ref: FastAPI) -> Iterator[DBSession]:
-    """Open the DB session the WebSocket guard should use.
-
-    Tests override ``models.get_db`` with an in-memory database. Middleware
-    runs outside FastAPI dependency injection, so it mirrors the override
-    manually when one is present.
-    """
-    override = app_ref.dependency_overrides.get(models.get_db)
-    if override is None:
-        with models.session_scope() as db:
-            yield db
-        return
-
-    dependency = override()
-    db = next(dependency)
-    try:
-        yield db
-    finally:
-        try:
-            next(dependency)
-        except StopIteration:
-            pass
-
-
-def _websocket_rejection_reason(
-    app_ref: FastAPI, scope: dict, session_id: str
-) -> str | None:
-    token = _scope_cookie_value(scope, websocket.WS_SESSION_COOKIE)
-    if token is None:
-        return None
-    token_hash = models.hash_token(token)
-    with _websocket_guard_db(app_ref) as db:
-        session = models.get_session(db, session_id)
-        if session is not None and session.status == "ended":
-            return "session_ended"
-        if models.is_token_hash_revoked(db, session_id, token_hash):
-            return "token_revoked"
-    return None
-
-
-class WebSocketSessionGuard:
-    """Reject revoked or ended-session WebSocket upgrades before routing."""
-
-    def __init__(self, app, *, app_ref: FastAPI) -> None:
-        self.app = app
-        self.app_ref = app_ref
-
-    async def __call__(self, scope, receive, send):
-        if scope.get("type") == "websocket":
-            ws_parts = _websocket_path_parts(scope.get("path", ""))
-            if ws_parts is not None:
-                session_id, _role = ws_parts
-                try:
-                    reason = _websocket_rejection_reason(
-                        self.app_ref, scope, session_id
-                    )
-                except OperationalError:
-                    logger.warning(
-                        "Skipping WebSocket session revocation check because "
-                        "the persistence schema is not initialized."
-                    )
-                    reason = None
-                except SQLAlchemyError:
-                    logger.exception("Failed to check WebSocket session revocation.")
-                    reason = "session_state_unavailable"
-                if reason is not None:
-                    await send(
-                        {
-                            "type": "websocket.close",
-                            "code": 4401,
-                            "reason": reason,
-                        }
-                    )
-                    return
-        await self.app(scope, receive, send)
-
-
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
@@ -194,7 +97,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["Authorization", "Content-Type"],
 )
-app.add_middleware(WebSocketSessionGuard, app_ref=app)
 
 app.include_router(websocket.router)
 app.include_router(recording_router)
@@ -371,6 +273,11 @@ def end_session(
     except Exception:
         db.rollback()
         raise
+    # revoke_session_tokens was commit=False, so the listener did not run.
+    # Close after the commit is visible to the per-message recheck.
+    websocket.manager.schedule_close_live_sockets(
+        session_id, code=4401, reason="session_ended"
+    )
     return _session_payload(session)
 
 
@@ -381,13 +288,13 @@ def join_session(
     response: Response,
     db: DBSession = Depends(get_db),
 ) -> dict:
-    """Exchange a one-time join code for a role-bound session token (ADR-0001 §8).
+    """Exchange a one-time join code for a role-bound session token (ADR-0005 §1).
 
-    The token is signed by ``websocket.create_session_token()`` -- called
-    directly rather than reimplemented -- so the cookie this sets is exactly
-    what ``websocket._verify_session_token()`` expects at upgrade time. It is
-    returned only as an HttpOnly cookie, never in the response body, and only
-    its SHA-256 digest reaches the audit log (ADR-0004 §3). The role is
+    The token is signed by ``websocket.create_session_token()`` and returned in
+    the body as ``access_token`` for ``Authorization: Bearer`` and the
+    WebSocket ``bearer.<token>`` subprotocol. When ``MINDPROBE_AUTH_COOKIE`` is
+    on, the same token is also set as an HttpOnly cookie for same-origin dev.
+    Only its SHA-256 digest reaches the audit log (ADR-0004 §3). The role is
     derived from the stored join code; the client never supplies it.
     """
     session = _load_session_or_404(db, session_id)

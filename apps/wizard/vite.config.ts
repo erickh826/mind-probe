@@ -3,12 +3,10 @@ import react from "@vitejs/plugin-react";
 
 // Each mind-probe frontend is an independent Vite app on its own port.
 //
-// The Wizard console additionally proxies the Session Server, so the dev origin
-// and the API origin are the same. That is not cosmetic: the role-bound
-// session token is an HttpOnly cookie (ADR-0001 §8) and a WebSocket upgrade is
-// not covered by CORS, so a genuinely cross-site `/ws/...` handshake would
-// arrive with no cookie and be closed with 4401. Override the backend with
-// MINDPROBE_SERVER_ORIGIN when it does not run on localhost:8000.
+// The Wizard console proxies the Session Server during `vite dev` so the
+// console can use relative URLs. Production sends Bearer tokens and the
+// WebSocket subprotocol to `VITE_API_BASE_URL` directly. Override the dev
+// backend with MINDPROBE_SERVER_ORIGIN when it does not run on localhost:8000.
 export default defineConfig(({ mode }) => {
   // Env dir is resolved relative to the Vite root, i.e. this package.
   const env = loadEnv(mode, ".", "");

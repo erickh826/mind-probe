@@ -1,5 +1,6 @@
 import { useCallback, useMemo, useState } from "react";
 
+import { rememberAccessToken } from "@mind-probe/shared";
 import { fetchAuditLogs, fetchClipManifest, fetchRecordingStatus, fetchRubric, fetchSession, fetchTimeline, joinSession } from "./api";
 import "./App.css";
 import { DualVideoPlayer } from "./components/DualVideoPlayer";
@@ -9,7 +10,7 @@ import { SessionJoinBar, type SessionLoadRequest } from "./components/SessionJoi
 import type { AuthContext, AuditResponse, ClipManifestEntry, RecordingStatus, RubricData, SessionInfo, TeacherMarker, TimelineResponse } from "./types";
 
 function App() {
-  const [auth, setAuth] = useState<AuthContext>({ mode: "cookie" });
+  const [auth, setAuth] = useState<AuthContext>({ token: "" });
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [timeline, setTimeline] = useState<TimelineResponse | null>(null);
   const [recordingStatus, setRecordingStatus] = useState<RecordingStatus | null>(null);
@@ -48,23 +49,25 @@ function App() {
     setTeacherMarkers([]);
 
     try {
-      const nextAuth: AuthContext =
-        request.authMode === "bearer"
-          ? { mode: "bearer", token: request.credential }
-          : { mode: "cookie" };
-
+      let token = request.authMode === "bearer" ? request.credential : "";
       if (request.authMode === "join_code") {
         const joined = await joinSession(request.sessionId, request.credential, request.clientId);
         if (joined.role !== "teacher" && joined.role !== "observer") {
           throw new Error(`Join code opened role '${joined.role}', not a review role.`);
         }
+        token = joined.access_token;
       }
+      if (!token) {
+        throw new Error("A Bearer token is required to load the review.");
+      }
+      rememberAccessToken(request.sessionId, token);
+      const nextAuth: AuthContext = { token };
 
-      const loadedSession = await fetchSession(request.sessionId);
+      const loadedSession = await fetchSession(request.sessionId, nextAuth);
       const loadedTimeline = await fetchTimeline(request.sessionId, nextAuth);
       const loadedStatus = await fetchRecordingStatus(request.sessionId, nextAuth);
-      const loadedRubric = await fetchRubric(loadedTimeline.case_id || loadedSession.case_id);
-      const loadedClips = await fetchClipManifest(loadedTimeline.case_id || loadedSession.case_id);
+      const loadedRubric = await fetchRubric(loadedTimeline.case_id || loadedSession.case_id, nextAuth);
+      const loadedClips = await fetchClipManifest(loadedTimeline.case_id || loadedSession.case_id, nextAuth);
       const loadedAudit = await fetchAuditLogs(request.sessionId, nextAuth);
 
       setAuth(nextAuth);
@@ -187,13 +190,19 @@ function App() {
               <span className="count-badge">{audit?.entries.length ?? 0}</span>
             </div>
             <div className="audit-list">
-              {audit?.entries.slice(-5).map((entry) => (
-                <article key={entry.id} className="audit-row">
-                  <strong>{entry.action}</strong>
-                  <span>{entry.actor_role ?? "unknown"}</span>
-                  <time>{entry.created_at ? new Date(entry.created_at).toLocaleString() : "-"}</time>
-                </article>
-              )) ?? <p className="muted">Load a session to inspect audit activity.</p>}
+              {session && audit === null ? (
+                <p className="muted">The audit log is limited to operators.</p>
+              ) : audit && audit.entries.length > 0 ? (
+                audit.entries.slice(-5).map((entry) => (
+                  <article key={entry.id} className="audit-row">
+                    <strong>{entry.action}</strong>
+                    <span>{entry.actor_role ?? "unknown"}</span>
+                    <time>{entry.created_at ? new Date(entry.created_at).toLocaleString() : "-"}</time>
+                  </article>
+                ))
+              ) : (
+                <p className="muted">Load a session to inspect audit activity.</p>
+              )}
             </div>
           </section>
         </aside>
