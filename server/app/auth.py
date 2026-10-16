@@ -28,6 +28,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from fastapi import Depends, HTTPException, Request
@@ -41,6 +42,48 @@ logger = logging.getLogger(__name__)
 AUTH_COOKIE_ENV = "MINDPROBE_AUTH_COOKIE"
 OPERATOR_TOKEN_ENV = "MINDPROBE_OPERATOR_TOKEN"
 OPERATOR_ROLE = "operator"
+UPLOAD_GRACE_ENV = "MINDPROBE_UPLOAD_GRACE_SECONDS"
+DEFAULT_UPLOAD_GRACE_SECONDS = 600
+
+
+def utcnow() -> datetime:
+    """Clock for grace-window checks. Tests replace this rather than sleeping."""
+    return datetime.now(timezone.utc)
+
+
+def upload_grace_seconds() -> int:
+    """How long a student may keep uploading after ``/end`` (ADR-0005 §7.3)."""
+    raw = os.environ.get(UPLOAD_GRACE_ENV, str(DEFAULT_UPLOAD_GRACE_SECONDS))
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_UPLOAD_GRACE_SECONDS
+    if value < 0:
+        return DEFAULT_UPLOAD_GRACE_SECONDS
+    return value
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def within_upload_grace(
+    db: DBSession, session_id: str, reason: str | None, role: str
+) -> bool:
+    """True when a student token revoked by ``/end`` is still inside the grace window.
+
+    Only ``revoke_reason=session_ended`` qualifies. A security revocation never
+    does, and the window does not open for any other role (ADR-0005 §7.3).
+    """
+    if reason != models.REVOKE_REASON_SESSION_ENDED or role != "student":
+        return False
+    session = models.get_session(db, session_id)
+    if session is None or session.status != "ended" or session.ended_at is None:
+        return False
+    deadline = _as_utc(session.ended_at) + timedelta(seconds=upload_grace_seconds())
+    return utcnow() < deadline
 
 
 def cookie_auth_enabled() -> bool:
@@ -307,15 +350,23 @@ def require_roles(
     allow_operator: bool = False,
     ended_exempt: bool = False,
     typ: str | None = None,
+    revocation: str | None = None,
 ) -> Callable[..., Actor]:
     """Build a ``/sessions/{session_id}/...`` dependency for the ADR-0005 §5 table.
 
-    ``ended_exempt`` lets a live token revoked by ``/end`` (reason
-    ``session_ended``) keep reading once the session is ended. A token revoked
-    for any other reason is always refused. 403 means a valid token with the
-    wrong role; 401 means the token itself is unusable.
+    ``ended_exempt`` (or ``revocation="ended_exempt"``) lets a live token revoked
+    by ``/end`` (reason ``session_ended``) keep reading once the session is
+    ended. ``revocation="grace_upload"`` is narrower: only a student token, only
+    until ``ended_at + MINDPROBE_UPLOAD_GRACE_SECONDS``, and only on the three
+    upload endpoints that pass this mode. A token revoked for any other reason
+    is always refused. 403 means a valid token with the wrong role; 401 means
+    the token itself is unusable.
     """
     allowed = frozenset(roles)
+    if revocation is None:
+        mode = "ended_exempt" if ended_exempt else "strict"
+    else:
+        mode = revocation
 
     def dependency(
         request: Request,
@@ -336,20 +387,24 @@ def require_roles(
         except TokenInvalid as exc:
             raise HTTPException(status_code=401, detail=exc.reason) from exc
 
+        role = str(claims.get("role") or "")
         token_hash = models.hash_token(token)
         reason = models.token_revocation_reason(db, session_id, token_hash)
         if reason is not None:
             session = models.get_session(db, session_id)
-            exempt = (
-                ended_exempt
-                and reason == models.REVOKE_REASON_SESSION_ENDED
-                and session is not None
-                and session.status == "ended"
-            )
+            if mode == "grace_upload":
+                exempt = within_upload_grace(db, session_id, reason, role)
+            elif mode == "ended_exempt":
+                exempt = (
+                    reason == models.REVOKE_REASON_SESSION_ENDED
+                    and session is not None
+                    and session.status == "ended"
+                )
+            else:
+                exempt = False
             if not exempt:
                 raise HTTPException(status_code=401, detail="revoked_session_token")
 
-        role = str(claims.get("role") or "")
         if role not in allowed:
             raise HTTPException(
                 status_code=403,

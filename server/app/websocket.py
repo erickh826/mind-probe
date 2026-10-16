@@ -454,6 +454,19 @@ class ConnectionManager:
             for c in list(conns):
                 await c.websocket.send_json(message)
 
+    def schedule_broadcast(self, session_id: str, message: dict) -> None:
+        """Broadcast from a sync REST handler onto the loops that own the sockets.
+
+        No-op when nobody is connected. Mirrors :meth:`schedule_close_live_sockets`:
+        the request thread must not ``create_task`` on a loop it does not own.
+        """
+        loops: set[asyncio.AbstractEventLoop] = set()
+        for conns in self._connections.get(session_id, {}).values():
+            for info in conns:
+                loops.add(info.event_loop)
+        for loop in loops:
+            self._schedule_on_loop(loop, self.broadcast(session_id, message))
+
     def spawn_background_task(self, coro) -> None:
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)

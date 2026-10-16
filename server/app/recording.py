@@ -12,12 +12,15 @@ Layout under ``SESSIONS_DIR`` (spec §10.1)::
     sessions/{session_id}/student_raw.webm             concatenated raw stream
     sessions/{session_id}/student.mp4                  final transcode
 
-**Data-retention priority (ADR-0004 §4).** Raw events rank above raw WebM,
-which ranks above the final mp4, which ranks above generated reports. Nothing
-in this module ever deletes a chunk or ``student_raw.webm`` -- not on a
-successful transcode, and least of all on a failed one. The only file removed
-here is an mp4 FFmpeg left behind truncated, because an invalid file at the
-*lowest* priority level is worse than no file at all.
+**Data-retention priority (ADR-0004 §4, ADR-0005 §7.4).** Raw events rank
+above raw WebM, which ranks above the final mp4, which ranks above generated
+reports. Nothing in this module ever deletes a chunk or ``student_raw.webm``
+-- not on a successful transcode, not when a take is ``incomplete``, and least
+of all on a failed one. The only file removed here is an mp4 FFmpeg left
+behind truncated, because an invalid file at the *lowest* priority level is
+worse than no file at all. A take becomes deletable only after it is
+``complete`` and the mp4 has been verified; that cleanup is a later job and
+is not performed here.
 
 **Failure surfaces are split by layer.** The library functions raise
 (:class:`FFmpegUnavailable`, :class:`RemuxFailed`, ...) so a caller can tell a
@@ -42,10 +45,11 @@ import subprocess
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session as DBSession
 
-from . import models
+from . import auth, models, recording_integrity
 from .models import get_db
 
 logger = logging.getLogger(__name__)
@@ -577,6 +581,17 @@ def get_recording_status(
         "raw_webm": _artefact_info(merged_path(session_id)),
         "mp4": _artefact_info(mp4_path(session_id)),
     }
+    if db is not None:
+        rec = models.get_recording(db, session_id)
+        if rec is not None:
+            status["recording_state"] = rec.recording_state
+            status["finalize_state"] = rec.finalize_state
+            status["final_sequence"] = rec.final_sequence
+            status["incomplete_reason"] = rec.incomplete_reason
+            if rec.final_sequence is not None:
+                status["missing_sequences"] = recording_integrity.missing_for_final(
+                    sequences, rec.final_sequence
+                )
 
     if include_chunks:
         # Opt-in: a 30-minute session is ~900 slices, which no caller wants
@@ -673,6 +688,9 @@ async def upload_chunk(
     end_ms: int | None = Form(None),
     checksum: str | None = Form(None),
     chunk: UploadFile = File(...),
+    _actor: auth.Actor = Depends(
+        auth.require_roles("student", revocation="grace_upload")
+    ),
     db: DBSession = Depends(get_db),
 ) -> dict:
     """Receive one MediaRecorder chunk, verify it, and store it (spec §10.1).
@@ -701,6 +719,23 @@ async def upload_chunk(
         validate_session_id(session_id)
     except InvalidSessionId as exc:
         raise _invalid_session_id_response(exc) from exc
+
+    declared = models.get_recording(db, session_id)
+    if declared is not None and declared.recording_state in {"deleting", "deleted"}:
+        raise HTTPException(status_code=409, detail="recording_deleted")
+    if (
+        declared is not None
+        and declared.final_sequence is not None
+        and sequence > declared.final_sequence
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "sequence_past_final",
+                "sequence": sequence,
+                "final_sequence": declared.final_sequence,
+            },
+        )
 
     data = await chunk.read()
     if not data:
@@ -750,6 +785,8 @@ async def upload_chunk(
 
     metadata_persisted = True
     try:
+        if models.get_session(db, session_id) is not None:
+            models.ensure_recording(db, session_id)
         models.save_recording_chunk_metadata(
             db,
             session_id,
@@ -759,7 +796,12 @@ async def upload_chunk(
             start_ms=start_ms,
             end_ms=end_ms,
             path=str(path),
+            commit=False,
         )
+        db.commit()
+        # A late slice can close a gap the finalize declaration was waiting on.
+        # Protected incomplete takes stay incomplete (D8); nothing is deleted.
+        recording_integrity.refresh_completeness(db, session_id)
     except SQLAlchemyError:
         db.rollback()
         metadata_persisted = False
@@ -779,17 +821,76 @@ async def upload_chunk(
     }
 
 
+class FinalizeRequest(BaseModel):
+    """Student declaration of the last sequence in this take (ADR-0005 §7.2)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    final_sequence: int = Field(ge=-1)
+    total_chunks: int = Field(ge=0)
+    total_duration_ms: int = Field(ge=0)
+    reason: str | None = None
+
+    @model_validator(mode="after")
+    def total_chunks_matches_final_sequence(self) -> "FinalizeRequest":
+        if self.total_chunks != self.final_sequence + 1:
+            raise ValueError("total_chunks must equal final_sequence + 1")
+        return self
+
+
 @router.get("/{session_id}/status")
 def recording_status(
     session_id: str,
-    include_chunks: bool = False,
+    _actor: auth.Actor = Depends(
+        auth.require_roles("student", revocation="grace_upload")
+    ),
     db: DBSession = Depends(get_db),
 ) -> dict:
-    """Recording completeness for one session (spec §14 錄影成功保存率)."""
+    """Student upload progress. Five fields, no paths or checksums (ADR-0005 §5).
+
+    Teachers, observers, and operators use ``GET /sessions/{id}/recording/status``.
+    """
     try:
-        return get_recording_status(session_id, db, include_chunks=include_chunks)
+        validate_session_id(session_id)
     except InvalidSessionId as exc:
         raise _invalid_session_id_response(exc) from exc
+    return recording_integrity.student_upload_status(session_id, db)
+
+
+@router.post("/{session_id}/finalize")
+def finalize_recording(
+    session_id: str,
+    body: FinalizeRequest,
+    actor: auth.Actor = Depends(
+        auth.require_roles("student", revocation="grace_upload")
+    ),
+    db: DBSession = Depends(get_db),
+) -> dict:
+    """Idempotent end-of-take declaration (ADR-0005 §7.2, D8, D9).
+
+    The same payload returns 200 and the current ``finalize_state`` plus
+    ``missing_sequences``. ``reason=recorder_lost`` latches ``incomplete`` and
+    is not cleared by a later full chunk set.
+    """
+    if body.reason not in {None, "recorder_lost"}:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_finalize_reason", "reason": body.reason},
+        )
+    try:
+        validate_session_id(session_id)
+    except InvalidSessionId as exc:
+        raise _invalid_session_id_response(exc) from exc
+    return recording_integrity.apply_finalize(
+        db,
+        session_id,
+        final_sequence=body.final_sequence,
+        total_chunks=body.total_chunks,
+        total_duration_ms=body.total_duration_ms,
+        reason=body.reason,
+        actor_role=actor.role,
+        token_hash=actor.token_hash,
+    )
 
 
 @router.post("/{session_id}/process")
@@ -797,6 +898,7 @@ def process_session_recording(
     session_id: str,
     remux: bool = True,
     allow_missing_header: bool = False,
+    _actor: auth.Actor = Depends(auth.require_operator),
     db: DBSession = Depends(get_db),
 ) -> dict:
     """Merge this session's chunks and transcode them for review (spec §10.1).
@@ -804,14 +906,41 @@ def process_session_recording(
     Declared ``def`` rather than ``async def`` on purpose: FastAPI runs sync
     handlers in a threadpool, so a multi-minute FFmpeg call does not stall the
     event loop that the live WebSocket sessions share.
+
+    The trigger is unchanged — this route still runs FFmpeg in the request —
+    but it only runs for a take the completeness check has marked ``complete``.
+    ``incomplete`` / ``recorder_lost`` recordings are refused, and this route
+    never deletes raw chunks. ``allow_missing_header`` does not bypass that
+    gate; partial salvage waits for the operator job-queue batch.
     """
     try:
-        return process_recording(
-            session_id, db, remux=remux, allow_missing_header=allow_missing_header
-        )
+        validate_session_id(session_id)
     except InvalidSessionId as exc:
         raise _invalid_session_id_response(exc) from exc
+    if not recording_integrity.transcode_allowed(session_id, db):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "recording_not_complete",
+                "message": (
+                    "transcode runs only for a complete recording; "
+                    "incomplete takes keep their raw chunks"
+                ),
+            },
+        )
+    recording_integrity.mark_transcode_started(db, session_id)
+    try:
+        result = process_recording(
+            session_id, db, remux=remux, allow_missing_header=allow_missing_header
+        )
     except NoChunksStored as exc:
+        recording_integrity.mark_transcode_result(db, session_id, status="raw_only")
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except MissingHeaderChunk as exc:
+        recording_integrity.mark_transcode_result(db, session_id, status="raw_only")
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    outcome = str(result.get("status") or "raw_only")
+    if result.get("remux_error") == "skipped":
+        outcome = "skipped"
+    recording_integrity.mark_transcode_result(db, session_id, status=outcome)
+    return result

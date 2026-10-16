@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import secrets
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -74,11 +75,40 @@ def _session_cookie_secure() -> bool:
     return env_name not in {"", "dev", "development", "local", "test"}
 
 
+def _upload_grace_loop(stop: threading.Event) -> None:
+    """Re-check ended sessions once a minute (ADR-0005 §7.3). No job table."""
+    while not stop.is_set():
+        try:
+            with models.session_scope() as db:
+                recording.recording_integrity.apply_upload_grace_deadlines(db)
+        except Exception:
+            logger.exception("upload grace check failed")
+        stop.wait(60)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
     _ensure_ws_token_secret()
-    yield
+    # Tests share one SQLite connection across threads. The check itself is
+    # callable without this loop; production leaves the scheduler on.
+    scheduler = os.environ.get("MINDPROBE_UPLOAD_GRACE_SCHEDULER", "true")
+    stop_grace = threading.Event()
+    grace_thread: threading.Thread | None = None
+    if scheduler.strip().lower() not in {"0", "false", "no", "off"}:
+        grace_thread = threading.Thread(
+            target=_upload_grace_loop,
+            args=(stop_grace,),
+            name="upload-grace",
+            daemon=True,
+        )
+        grace_thread.start()
+    try:
+        yield
+    finally:
+        stop_grace.set()
+        if grace_thread is not None:
+            grace_thread.join(timeout=1)
 
 
 app = FastAPI(title="mind-probe Session Server", version=__version__, lifespan=lifespan)
@@ -268,6 +298,7 @@ def end_session(
     _load_session_or_404(db, session_id)
     try:
         session = models.end_session(db, session_id, commit=False)
+        recording.recording_integrity.note_session_ended(db, session_id)
         models.revoke_session_tokens(db, session_id, commit=False)
         db.commit()
     except Exception:

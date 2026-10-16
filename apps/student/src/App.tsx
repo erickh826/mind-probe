@@ -215,7 +215,7 @@ export default function App() {
           void recorder.start();
         }}
         onStopRecording={recorder.stop}
-        allowStartRecording={!joined.restoredFromStorage}
+        allowStartRecording={!joined.restoredFromStorage && recorder.canStart}
       />
     </div>
   );
