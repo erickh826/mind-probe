@@ -139,8 +139,18 @@ export function storeChunkAndBumpSequence(
         next_attempt_at: 0,
         terminal: false,
       };
-      chunkStore.put(row);
-      metaStore.put(built.meta);
+      try {
+        chunkStore.put(row);
+        metaStore.put(built.meta);
+      } catch (cause) {
+        reject(cause);
+        try {
+          tx.abort();
+        } catch {
+          // The transaction is already aborting.
+        }
+        return;
+      }
       tx.oncomplete = () => resolve({ sequence: built.sequence, meta: built.meta });
     };
   });

@@ -9,7 +9,7 @@ grace pass. The real FFmpeg pipeline stays in ``test_recording.py``.
 from __future__ import annotations
 
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -585,20 +585,23 @@ def test_zero_chunk_session_is_incomplete_after_grace_and_visible_to_the_teacher
     assert body["incomplete_reason"] == "grace_expired"
 
 
-def test_grace_creates_incomplete_when_the_recording_row_is_missing(db):
+def _ended_without_recording(db, when):
     session_id = f"S-{uuid4().hex[:8]}"
     models.create_session(db, session_id, "CASE001")
     models.end_session(db, session_id)
     session = models.get_session(db, session_id)
     assert session is not None
-    # A missing row is synthesized only once recording rows exist. Pin the
-    # timestamp so this does not depend on the wall clock.
-    session.ended_at = recording_integrity.UPLOAD_GRACE_SYNTHESIZE_ENDED_AFTER
+    session.ended_at = when
     db.commit()
     assert models.get_recording(db, session_id) is None
+    return session_id, when
+
+
+def test_grace_creates_incomplete_when_synthesis_is_explicitly_fresh(db, monkeypatch):
+    monkeypatch.setenv(recording_integrity.UPLOAD_GRACE_SYNTHESIZE_AFTER_ENV, "fresh")
+    session_id, ended = _ended_without_recording(db, auth.utcnow() - timedelta(days=30))
     changed = recording_integrity.apply_upload_grace_deadlines(
-        db,
-        now=session.ended_at + timedelta(seconds=auth.upload_grace_seconds() + 1),
+        db, now=ended + timedelta(seconds=auth.upload_grace_seconds() + 1)
     )
     assert session_id in changed
     db.expire_all()
@@ -609,31 +612,46 @@ def test_grace_creates_incomplete_when_the_recording_row_is_missing(db):
     assert rec.incomplete_reason == "grace_expired"
 
 
-def test_grace_does_not_rewrite_sessions_ended_before_recording_rows_existed(db):
-    session_id = f"S-{uuid4().hex[:8]}"
-    models.create_session(db, session_id, "CASE001")
-    models.end_session(db, session_id)
-    session = models.get_session(db, session_id)
-    assert session is not None
-    session.ended_at = recording_integrity.UPLOAD_GRACE_SYNTHESIZE_ENDED_AFTER - timedelta(
-        days=1
+def test_grace_synthesis_cutoff_includes_the_cutover_and_ignores_earlier_sessions(
+    db, monkeypatch
+):
+    cutover = datetime(2026, 10, 20, tzinfo=timezone.utc)
+    monkeypatch.setenv(
+        recording_integrity.UPLOAD_GRACE_SYNTHESIZE_AFTER_ENV, "2026-10-20T00:00:00Z"
     )
-    db.commit()
-    assert models.get_recording(db, session_id) is None
+    before_id, before = _ended_without_recording(db, cutover - timedelta(seconds=1))
+    at_id, at = _ended_without_recording(db, cutover)
     changed = recording_integrity.apply_upload_grace_deadlines(
-        db,
-        now=session.ended_at + timedelta(seconds=auth.upload_grace_seconds() + 1),
+        db, now=at + timedelta(seconds=auth.upload_grace_seconds() + 1)
     )
-    assert session_id not in changed
+    assert before_id not in changed
+    assert at_id in changed
     db.expire_all()
-    assert models.get_recording(db, session_id) is None
+    assert models.get_recording(db, before_id) is None
+    created = models.get_recording(db, at_id)
+    assert created is not None and created.incomplete_reason == "grace_expired"
     audits = db.scalars(
         select(models.AuditLog).where(
-            models.AuditLog.session_id == session_id,
+            models.AuditLog.session_id == before_id,
             models.AuditLog.action == recording_integrity.AUDIT_RECORDING_INCOMPLETE,
         )
     ).all()
     assert audits == []
+    # `before` is only used to show the session ended before the cutover.
+    assert before < cutover
+
+
+def test_grace_does_not_synthesize_when_the_cutoff_is_unset_or_invalid(db, monkeypatch):
+    ended = auth.utcnow() - timedelta(days=1)
+    for value in ("", "not-a-date"):
+        monkeypatch.setenv(recording_integrity.UPLOAD_GRACE_SYNTHESIZE_AFTER_ENV, value)
+        session_id, when = _ended_without_recording(db, ended)
+        changed = recording_integrity.apply_upload_grace_deadlines(
+            db, now=when + timedelta(seconds=auth.upload_grace_seconds() + 1)
+        )
+        assert session_id not in changed
+        db.expire_all()
+        assert models.get_recording(db, session_id) is None
 
 
 def test_grace_claim_does_not_overwrite_an_incomplete_reason(db):

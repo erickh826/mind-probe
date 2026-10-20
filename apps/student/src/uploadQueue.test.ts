@@ -154,6 +154,16 @@ test("applyServerStatus does not touch sequence, recorder state, or the payload"
   assert.equal(next.finalize_confirmed, true);
   assert.equal(next.finalize_pending, false);
   assert.equal(next.server_finalize_state, "complete");
+  assert.equal(next.finalize_persisted_at, meta.finalize_persisted_at);
+
+  const stale = applyServerStatus(
+    next,
+    { finalize_state: "pending", recording_state: "finalizing", received_sequences: [] },
+    7_000,
+  );
+  assert.equal(stale.server_finalize_state, "complete");
+  assert.equal(stale.finalize_confirmed, true);
+  assert.equal(stale.finalize_persisted_at, meta.finalize_persisted_at);
 });
 
 test("permanent 4xx stops the matching retry and flags the operator", () => {

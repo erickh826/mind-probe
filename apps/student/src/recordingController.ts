@@ -96,8 +96,14 @@ let active: { sessionId: string; recorder: RecorderLike; stream: MediaStream | n
 /** Set only by a pagehide-triggered stop, so onstop records recorder_lost. */
 let stopAsLost = false;
 let releaseTimer: number | null = null;
-let pumpTimer: number | null = null;
-let pumping = false;
+let pumpTimer: ReturnType<typeof setTimeout> | null = null;
+let pumpGeneration = 0;
+/** Chunk upload, including its follow-up status read. Does not gate finalize. */
+let chunkTask: Promise<void> | null = null;
+/** One finalize POST. A later tick can start one while a chunk request is still pending. */
+let finalizeTask: Promise<void> | null = null;
+/** A slice could not be stored. Stop must not declare a normal complete-capable take. */
+let chunkPersistLost = false;
 let boundSession: string | null = null;
 let meta: RecordingMeta | null = null;
 let pendingCount = 0;
@@ -109,9 +115,11 @@ let canStart = true;
 let retryable = false;
 let status: RecorderStatus = typeof MediaRecorder === "undefined" ? "unavailable" : "idle";
 const listeners = new Set<Listener>();
+const CHUNK_PERSIST_ATTEMPTS = 3;
 const inFlight = new Set<number>();
 let chunkUploaded: ((sequence: number, timestampMs: number) => void) | null = null;
 let persistChain: Promise<void> = Promise.resolve();
+let stopPromise: Promise<void> = Promise.resolve();
 
 function db(): Promise<IDBDatabase> {
   databasePromise ??= openRecordingDb();
@@ -217,18 +225,28 @@ function ensurePump(sessionId: string): void {
   if (pumpTimer !== null) {
     return;
   }
+  // The next tick is scheduled immediately, not when the previous pump's
+  // network calls finish. A chunk upload or status read must not postpone
+  // the finalize deadline.
+  const generation = pumpGeneration;
   const tick = () => {
-    pumpTimer = window.setTimeout(() => {
-      void pump(sessionId).finally(() => {
-        if (boundSession === sessionId) {
-          tick();
-        } else {
-          pumpTimer = null;
-        }
-      });
+    if (generation !== pumpGeneration || boundSession !== sessionId) {
+      return;
+    }
+    pumpTimer = setTimeout(() => {
+      if (generation !== pumpGeneration || boundSession !== sessionId) {
+        return;
+      }
+      void pump(sessionId).catch(notePumpFailure);
+      tick();
     }, 400);
   };
-  void pump(sessionId).finally(tick);
+  void pump(sessionId).catch(notePumpFailure);
+  tick();
+}
+
+function notePumpFailure(cause: unknown): void {
+  errorMessage = `上傳佇列中斷：${cause instanceof Error ? cause.message : String(cause)}`;
 }
 
 async function refreshPending(sessionId: string): Promise<PersistedChunk[]> {
@@ -303,17 +321,21 @@ export async function bindSession(sessionId: string): Promise<void> {
   cancelRelease();
   if (boundSession !== sessionId) {
     if (pumpTimer !== null) {
-      window.clearTimeout(pumpTimer);
+      clearTimeout(pumpTimer);
       pumpTimer = null;
     }
     uploadedCount = 0;
     failedCount = 0;
     pendingCount = 0;
     errorMessage = null;
+    chunkTask = null;
+    finalizeTask = null;
   }
   boundSession = sessionId;
+  // Status reconciliation can sit on a revoked session endpoint or a slow
+  // network. Uploads and finalize use the IndexedDB row and must not wait for it.
+  void reconcile(sessionId, Date.now());
   try {
-    await reconcile(sessionId, Date.now());
     await refreshPending(sessionId);
     ensurePump(sessionId);
   } catch (cause) {
@@ -341,14 +363,47 @@ export async function persistBlob(sessionId: string, blob: Blob): Promise<void> 
   emit();
 }
 
-function attachRecorder(sessionId: string, recorder: MediaRecorder, stream: MediaStream): void {
+async function markDurableChunkLoss(sessionId: string): Promise<void> {
+  const database = await db();
+  const updated = await updateMeta(database, sessionId, (latest) => ({
+    ...persistRecorderLost(latest, Date.now()),
+    needs_operator: true,
+  }));
+  if (updated) {
+    meta = updated;
+  }
+}
+
+/** Keep the blob if IndexedDB accepts a retry. Otherwise the take is lost for good. */
+async function retainChunk(sessionId: string, blob: Blob): Promise<void> {
+  let last: unknown;
+  for (let attempt = 1; attempt <= CHUNK_PERSIST_ATTEMPTS; attempt += 1) {
+    try {
+      await persistBlob(sessionId, blob);
+      return;
+    } catch (cause) {
+      last = cause;
+    }
+  }
+  chunkPersistLost = true;
+  await markDurableChunkLoss(sessionId);
+  throw last instanceof Error ? last : new Error(String(last));
+}
+
+function attachRecorder(sessionId: string, recorder: MediaRecorder, stream: MediaStream | null): void {
   active = { sessionId, recorder, stream };
   persistChain = Promise.resolve();
   recorder.ondataavailable = (event) => {
     const blob = event.data;
+    if (blob.size === 0) {
+      return;
+    }
     persistChain = persistChain
-      .then(() => persistBlob(sessionId, blob))
+      .then(() => retainChunk(sessionId, blob))
       .catch((cause: unknown) => {
+        // The chain stays usable for a later slice, but the take is already
+        // marked lost. A normal stop must not advertise the missing slice.
+        chunkPersistLost = true;
         errorMessage = `無法保存錄影片段：${String(cause)}`;
         emit();
       });
@@ -359,7 +414,7 @@ function attachRecorder(sessionId: string, recorder: MediaRecorder, stream: Medi
     emit();
   };
   recorder.onstop = () => {
-    void handleRecorderStop(sessionId, stream);
+    stopPromise = handleRecorderStop(sessionId, stream);
   };
 }
 
@@ -449,129 +504,168 @@ export async function retryFailed(): Promise<void> {
   await pump(boundSession);
 }
 
+function kickChunk(sessionId: string): Promise<void> {
+  if (chunkTask) {
+    return chunkTask;
+  }
+  chunkTask = uploadNextChunk(sessionId).finally(() => {
+    chunkTask = null;
+  });
+  return chunkTask;
+}
+
+function kickFinalize(sessionId: string): Promise<void> {
+  if (finalizeTask) {
+    return finalizeTask;
+  }
+  finalizeTask = sendFinalizeIfDue(sessionId).finally(() => {
+    finalizeTask = null;
+  });
+  return finalizeTask;
+}
+
 async function pump(sessionId: string): Promise<void> {
-  if (pumping || boundSession !== sessionId) {
+  if (boundSession !== sessionId) {
     return;
   }
-  pumping = true;
+  const database = await db();
+  const current = await readMeta(database, sessionId);
+  if (current && (await purgeExpiredMeta(database, current, Date.now()))) {
+    meta = null;
+    pendingCount = 0;
+    emit();
+    return;
+  }
+  // Start both before awaiting either. A pending upload or status read must
+  // not move the finalize deadline or skip the POST.
+  const uploading = kickChunk(sessionId);
+  const finalizing = kickFinalize(sessionId);
+  await Promise.all([uploading, finalizing]);
+  emit();
+}
+
+async function uploadNextChunk(sessionId: string): Promise<void> {
+  const database = await db();
+  const chunks = await refreshPending(sessionId);
+  const now = Date.now();
+  const next = chunks.find(
+    (chunk) => !chunk.terminal && !inFlight.has(chunk.sequence) && now >= chunk.next_attempt_at,
+  );
+  if (!next) {
+    return;
+  }
+  inFlight.add(next.sequence);
   try {
-    const database = await db();
-    let current = await readMeta(database, sessionId);
-    if (current && (await purgeExpiredMeta(database, current, Date.now()))) {
-      meta = null;
-      pendingCount = 0;
-      return;
-    }
-    const chunks = await refreshPending(sessionId);
-    meta = current;
-    const now = Date.now();
-    const next = chunks.find(
-      (chunk) => !chunk.terminal && !inFlight.has(chunk.sequence) && now >= chunk.next_attempt_at,
-    );
-    if (next) {
-      inFlight.add(next.sequence);
-      try {
-        await transport.uploadRecordingChunk(sessionId, next.sequence, next.blob, {
-          start_ms: next.start_ms,
-          end_ms: next.end_ms,
-          checksum: next.checksum,
-        });
-        await deleteChunk(database, sessionId, next.sequence);
-        uploadedCount += 1;
-        chunkUploaded?.(next.sequence, next.end_ms);
-        try {
-          const serverStatus = await transport.fetchUploadStatus(sessionId);
-          const updated = await updateMeta(database, sessionId, (latest) =>
-            applyServerStatus(latest, serverStatus, Date.now()),
-          );
-          if (updated) {
-            meta = updated;
-          }
-        } catch {
-          // The blob is gone locally. The next finalize or status read will catch up.
-        }
-      } catch (cause) {
-        const block = cause instanceof ApiError ? permanentUploadBlock(cause.status, cause.code) : null;
-        if (block) {
-          await writeChunk(database, {
-            ...next,
-            attempts: next.attempts + 1,
-            terminal: true,
-            next_attempt_at: Number.MAX_SAFE_INTEGER,
-          });
-          const updated = await updateMeta(database, sessionId, (latest) =>
-            notePermanentFailure(latest, block),
-          );
-          if (updated) {
-            meta = updated;
-          }
-          errorMessage = permanentBlockMessage(block);
-        } else {
-          const attempts = next.attempts + 1;
-          await writeChunk(database, {
-            ...next,
-            attempts,
-            next_attempt_at: Date.now() + chunkRetryDelayMs(attempts),
-          });
-          failedCount = (await listChunks(database, sessionId)).filter(
-            (chunk) => chunk.attempts > 0 && !chunk.terminal,
-          ).length;
-          errorMessage =
-            cause instanceof ApiError
-              ? `片段 ${next.sequence} 上傳失敗：${cause.message}`
-              : `片段 ${next.sequence} 上傳失敗：${String(cause)}`;
-        }
-      } finally {
-        inFlight.delete(next.sequence);
+    await transport.uploadRecordingChunk(sessionId, next.sequence, next.blob, {
+      start_ms: next.start_ms,
+      end_ms: next.end_ms,
+      checksum: next.checksum,
+    });
+    await deleteChunk(database, sessionId, next.sequence);
+    uploadedCount += 1;
+    chunkUploaded?.(next.sequence, next.end_ms);
+    try {
+      const serverStatus = await transport.fetchUploadStatus(sessionId);
+      const updated = await updateMeta(database, sessionId, (latest) =>
+        applyServerStatus(latest, serverStatus, Date.now()),
+      );
+      if (updated) {
+        meta = updated;
       }
-    }
-    current = await readMeta(database, sessionId);
-    const pending = await refreshPending(sessionId);
-    meta = current;
-    if (current && current.finalize_payload && finalizeDue(current, pending.length, Date.now())) {
-      const payload = current.finalize_payload;
-      try {
-        const result = await transport.finalizeRecording(sessionId, payload);
-        const stillOpen = result.finalize_state === "pending" || result.finalize_state === "none";
-        const updated = await updateMeta(database, sessionId, (latest) => {
-          // A stop that landed during the POST owns the payload. Do not confirm
-          // a declaration the server has not seen.
-          if (!sameFinalizePayload(latest.finalize_payload, payload)) {
-            return latest;
-          }
-          return applyServerStatus(
-            noteFinalizeAttempt(latest, Date.now(), stillOpen),
-            {
-              finalize_state: result.finalize_state,
-              recording_state: result.recording_state,
-              received_sequences: [],
-            },
-            Date.now(),
-          );
-        });
-        if (updated) {
-          meta = updated;
-        }
-        errorMessage = null;
-      } catch (cause) {
-        const block = cause instanceof ApiError ? permanentUploadBlock(cause.status, cause.code) : null;
-        // Chunk retries must not move finalize_persisted_at. Only the attempt clock moves.
-        const updated = await updateMeta(database, sessionId, (latest) =>
-          block ? notePermanentFailure(latest, block) : noteFinalizeAttempt(latest, Date.now(), true),
-        );
-        if (updated) {
-          meta = updated;
-        }
-        errorMessage = block
-          ? permanentBlockMessage(block)
-          : `結束標記送出失敗：${cause instanceof Error ? cause.message : String(cause)}`;
-      }
+    } catch {
+      // The blob is gone locally. The next finalize or status read will catch up.
     }
   } catch (cause) {
-    errorMessage = `上傳佇列錯誤：${cause instanceof Error ? cause.message : String(cause)}`;
+    const block = cause instanceof ApiError ? permanentUploadBlock(cause.status, cause.code) : null;
+    if (block) {
+      await writeChunk(database, {
+        ...next,
+        attempts: next.attempts + 1,
+        terminal: true,
+        next_attempt_at: Number.MAX_SAFE_INTEGER,
+      });
+      const updated = await updateMeta(database, sessionId, (latest) =>
+        notePermanentFailure(latest, block),
+      );
+      if (updated) {
+        meta = updated;
+      }
+      errorMessage = permanentBlockMessage(block);
+    } else {
+      const attempts = next.attempts + 1;
+      await writeChunk(database, {
+        ...next,
+        attempts,
+        next_attempt_at: Date.now() + chunkRetryDelayMs(attempts),
+      });
+      failedCount = (await listChunks(database, sessionId)).filter(
+        (chunk) => chunk.attempts > 0 && !chunk.terminal,
+      ).length;
+      errorMessage =
+        cause instanceof ApiError
+          ? `片段 ${next.sequence} 上傳失敗：${cause.message}`
+          : `片段 ${next.sequence} 上傳失敗：${String(cause)}`;
+    }
   } finally {
-    pumping = false;
-    emit();
+    inFlight.delete(next.sequence);
+    await refreshPending(sessionId);
+  }
+}
+
+async function sendFinalizeIfDue(sessionId: string): Promise<void> {
+  const database = await db();
+  const current = await readMeta(database, sessionId);
+  const pending = await refreshPending(sessionId);
+  meta = current;
+  if (!current || !current.finalize_payload || !finalizeDue(current, pending.length, Date.now())) {
+    return;
+  }
+  const payload = current.finalize_payload;
+  const persistedAt = current.finalize_persisted_at;
+  try {
+    const result = await transport.finalizeRecording(sessionId, payload);
+    const stillOpen = result.finalize_state === "pending" || result.finalize_state === "none";
+    const updated = await updateMeta(database, sessionId, (latest) => {
+      // A stop that landed during the POST owns the payload. Do not confirm
+      // a declaration the server has not seen, and do not move the deadline.
+      if (!sameFinalizePayload(latest.finalize_payload, payload)) {
+        return latest;
+      }
+      if (persistedAt != null && latest.finalize_persisted_at !== persistedAt) {
+        return latest;
+      }
+      return applyServerStatus(
+        noteFinalizeAttempt(latest, Date.now(), stillOpen),
+        {
+          finalize_state: result.finalize_state,
+          recording_state: result.recording_state,
+          received_sequences: [],
+        },
+        Date.now(),
+      );
+    });
+    if (updated) {
+      meta = updated;
+    }
+    errorMessage = null;
+  } catch (cause) {
+    const block = cause instanceof ApiError ? permanentUploadBlock(cause.status, cause.code) : null;
+    // Chunk retries must not move finalize_persisted_at. Only the attempt clock moves.
+    let updated: RecordingMeta | null = null;
+    try {
+      updated = await updateMeta(database, sessionId, (latest) =>
+        block ? notePermanentFailure(latest, block) : noteFinalizeAttempt(latest, Date.now(), true),
+      );
+    } catch {
+      // The page is closing or the test reset the database under an in-flight POST.
+      updated = null;
+    }
+    if (updated) {
+      meta = updated;
+    }
+    errorMessage = block
+      ? permanentBlockMessage(block)
+      : `結束標記送出失敗：${cause instanceof Error ? cause.message : String(cause)}`;
   }
 }
 
@@ -591,17 +685,21 @@ export async function commitRecorderStop(
   sessionId: string,
   now = Date.now(),
 ): Promise<RecordingMeta | null> {
-  const lost = stopAsLost;
+  const lost = stopAsLost || chunkPersistLost;
   stopAsLost = false;
   const database = await db();
   const updated = await updateMeta(database, sessionId, (latest) => {
     if (latest.recorder_state === "lost") {
+      return chunkPersistLost ? { ...latest, needs_operator: true } : latest;
+    }
+    if (lost) {
+      const marked = persistRecorderLost(latest, now);
+      return chunkPersistLost ? { ...marked, needs_operator: true } : marked;
+    }
+    if (latest.finalize_pending && latest.finalize_persisted_at != null) {
       return latest;
     }
-    if (!lost && latest.finalize_pending && latest.finalize_persisted_at != null) {
-      return latest;
-    }
-    return lost ? persistRecorderLost(latest, now) : persistStop(latest, now);
+    return persistStop(latest, now);
   });
   if (updated) {
     meta = updated;
@@ -646,16 +744,35 @@ export function installActiveRecorderForTests(sessionId: string, recorder: Recor
   boundSession = sessionId;
 }
 
+/** Wire the production ondataavailable / onstop handlers around a fake recorder. */
+export function attachRecorderForTests(sessionId: string, recorder: MediaRecorder): void {
+  attachRecorder(sessionId, recorder, null);
+}
+
+export function recorderStopPromiseForTests(): Promise<void> {
+  return stopPromise;
+}
+
 export async function pumpSession(sessionId: string): Promise<void> {
   boundSession = sessionId;
   await pump(sessionId);
 }
 
-export async function resetRecordingControllerForTests(): Promise<void> {
-  if (pumpTimer !== null && typeof window !== "undefined") {
-    window.clearTimeout(pumpTimer);
+export async function resetRecordingControllerForTests(
+  options?: { keepDatabase?: boolean },
+): Promise<void> {
+  pumpGeneration += 1;
+  boundSession = null;
+  if (pumpTimer !== null) {
+    clearTimeout(pumpTimer);
   }
   pumpTimer = null;
+  const inFlightWork = [chunkTask, finalizeTask];
+  chunkTask = null;
+  finalizeTask = null;
+  chunkPersistLost = false;
+  // Let an in-flight finalize write finish before the database is closed.
+  await Promise.allSettled(inFlightWork);
   const pending = databasePromise;
   databasePromise = null;
   if (pending) {
@@ -665,7 +782,7 @@ export async function resetRecordingControllerForTests(): Promise<void> {
       // The database may already be closed.
     }
   }
-  if (typeof indexedDB !== "undefined") {
+  if (!options?.keepDatabase && typeof indexedDB !== "undefined") {
     await new Promise<void>((resolve) => {
       const request = indexedDB.deleteDatabase("mindprobe-recording");
       request.onsuccess = () => resolve();
@@ -676,8 +793,6 @@ export async function resetRecordingControllerForTests(): Promise<void> {
   transport = defaultTransport;
   active = null;
   stopAsLost = false;
-  pumping = false;
-  boundSession = null;
   meta = null;
   pendingCount = 0;
   uploadedCount = 0;
@@ -689,6 +804,7 @@ export async function resetRecordingControllerForTests(): Promise<void> {
   status = typeof MediaRecorder === "undefined" ? "unavailable" : "idle";
   inFlight.clear();
   persistChain = Promise.resolve();
+  stopPromise = Promise.resolve();
 }
 
 if (typeof window !== "undefined") {

@@ -9,12 +9,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/** A hung upload or status read must not pin the browser past the finalize deadline. */
+export const REQUEST_TIMEOUT_MS = 20_000;
+
 async function request(path: string, init?: RequestInit): Promise<unknown> {
   const headers = new Headers(init?.headers);
   const token = currentAccessToken();
   if (token && !headers.has("Authorization")) {
     headers.set("Authorization", `Bearer ${token}`);
   }
+  const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+  const signal = init?.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;
 
   let response: Response;
   try {
@@ -22,6 +27,7 @@ async function request(path: string, init?: RequestInit): Promise<unknown> {
       ...init,
       headers,
       credentials: "omit",
+      signal,
     });
   } catch (cause) {
     throw new ApiError(0, `Session Server is unreachable: ${String(cause)}`);

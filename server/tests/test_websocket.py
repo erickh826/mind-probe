@@ -1817,6 +1817,30 @@ def test_critical_role_disconnect_pauses_only_after_the_grace_window():
     assert websocket_module.manager.snapshot_for(session_id).session_state == "paused"
 
 
+def _cancel_background_tasks() -> None:
+    """Cancel grace timers still queued on this module's TestClient loop.
+
+    Disconnect schedules ``_delayed_disconnect_pause_check``. Most tests leave
+    that task sleeping out the real 2s window after they have already paused
+    via a later inbound frame. The next test shares the portal. On a loaded
+    Windows run that sleeper wakes during the following test. A grace shorter
+    than the ~15.6ms Windows monotonic tick can also fire in the same tick as
+    the disconnect, see a role that is not lost yet, and never reschedule.
+    This fixture drops those leftover tasks. The no-traffic test uses a 300ms
+    grace and ages the disconnect mark so the check does not depend on the
+    sleep lasting the whole window.
+    """
+    for task in list(websocket_module.manager._background_tasks):
+        task.cancel()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_disconnect_tasks():
+    _cancel_background_tasks()
+    yield
+    _cancel_background_tasks()
+
+
 def _receive_json_within(sock, timeout_s: float):
     """Read one JSON frame, and fail the test if it does not arrive in time.
 
@@ -1880,9 +1904,15 @@ def _wait_for_auto_pause_frame(sock, session_id: str, *, timeout_s: float = 3.0)
 
 
 def test_critical_role_disconnect_pauses_without_later_inbound_traffic(monkeypatch):
-    """The server pauses on its own after the grace window, with no further traffic."""
+    """The server pauses on its own after the grace window, with no further traffic.
+
+    300ms stays above Windows' ~15.6ms monotonic clock, so the timer cannot
+    elapse inside the same tick as the disconnect and give up before the role
+    is lost. Aging the mark after the socket is down means the check does not
+    depend on the sleep lasting the whole window. No frame is sent.
+    """
     session_id = _fresh_session_id()
-    monkeypatch.setattr(websocket_module, "DISCONNECT_GRACE_MS", 10)
+    monkeypatch.setattr(websocket_module, "DISCONNECT_GRACE_MS", 300)
 
     with _connect(session_id, "wizard") as wizard:
         student = _connect(session_id, "student")
@@ -1890,6 +1920,7 @@ def test_critical_role_disconnect_pauses_without_later_inbound_traffic(monkeypat
         _start_session(wizard)
         _make_start_due(session_id)
         student.__exit__(None, None, None)
+        _age_disconnect_mark(session_id, "student")
 
         paused = _wait_for_auto_pause_frame(wizard, session_id)
         assert paused["event_type"] == "session_paused"

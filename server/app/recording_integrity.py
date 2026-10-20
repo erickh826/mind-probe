@@ -14,6 +14,7 @@ cleanup rides the later job queue. This module never unlinks a chunk or
 from __future__ import annotations
 
 import logging
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -27,13 +28,40 @@ from .events import EventEnvelope, EventType, Source
 
 logger = logging.getLogger(__name__)
 
-# Recording rows did not exist before this deploy. The grace pass must not
-# invent an ``incomplete`` / ``grace_expired`` row, or an audit entry, for a
-# session that ended earlier and never had a take. ``/end`` creates a row for
-# sessions it ends, and a missing row whose session ended at or after this
-# instant is still synthesized so a zero-chunk end that did not go through
-# ``/end`` (the websocket ``session_ended`` transition) can close.
-UPLOAD_GRACE_SYNTHESIZE_ENDED_AFTER = datetime(2026, 10, 20, tzinfo=timezone.utc)
+# Explicit deploy/migration switch. Unset is the existing-database default:
+# do not invent a recording row. ``fresh`` synthesizes every missing row and
+# is only valid when the operator asserts the database has no pre-feature
+# sessions. An ISO-8601 instant synthesizes rows only for sessions ended at
+# or after that cutover. See docs/deployment-readiness.md.
+UPLOAD_GRACE_SYNTHESIZE_AFTER_ENV = "MINDPROBE_UPLOAD_GRACE_SYNTHESIZE_AFTER"
+
+
+def grace_synthesize_cutoff() -> datetime | None:
+    """Who may gain a recording row at grace time when none was stored.
+
+    ``None`` means "do not synthesize" (unset, blank, or an unparseable value).
+    A timezone-aware instant is the inclusive cutover. There is no built-in
+    installation date.
+    """
+    raw = os.environ.get(UPLOAD_GRACE_SYNTHESIZE_AFTER_ENV, "").strip()
+    if raw == "":
+        return None
+    if raw.lower() == "fresh":
+        return datetime.min.replace(tzinfo=timezone.utc)
+    text = raw.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not 'fresh' or an ISO-8601 instant; "
+            "grace will not invent recording rows",
+            UPLOAD_GRACE_SYNTHESIZE_AFTER_ENV,
+            raw,
+        )
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 STUDENT_STATUS_KEYS = (
     "received_sequences",
@@ -632,11 +660,10 @@ def apply_upload_grace_deadlines(
     """Close takes whose post-end grace window has elapsed (ADR-0005 §7.3).
 
     Protected incomplete takes are skipped. A finalized take with no gaps
-    becomes ``complete``; anything else becomes ``incomplete``. A session that
-    never stored a chunk and ended at or after
-    ``UPLOAD_GRACE_SYNTHESIZE_ENDED_AFTER`` is created as ``incomplete`` /
-    ``grace_expired``. Older ended sessions with no recording row are left
-    alone so the first pass after deploy does not rewrite history. Raw chunks
+    becomes ``complete``; anything else becomes ``incomplete``. A session with
+    no recording row is left untouched unless
+    ``MINDPROBE_UPLOAD_GRACE_SYNTHESIZE_AFTER`` says to synthesize it (``fresh``
+    or an ended-at cutover). ``/end`` still creates a row itself. Raw chunks
     are left on disk either way. Returns the session ids whose state changed.
     """
     from sqlalchemy import select
@@ -660,7 +687,8 @@ def apply_upload_grace_deadlines(
         rec = models.get_recording(db, session.id)
         created = False
         if rec is None:
-            if ended < UPLOAD_GRACE_SYNTHESIZE_ENDED_AFTER:
+            cutoff = grace_synthesize_cutoff()
+            if cutoff is None or ended < cutoff:
                 continue
             rec = models.ensure_recording(db, session.id)
             created = rec is not None

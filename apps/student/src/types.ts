@@ -79,6 +79,11 @@ export interface JoinedSession {
   accessToken: string;
   /** Reload of a live session. Recording must not start again. */
   restoredFromStorage?: boolean;
+  /**
+   * Session and clip reads are refused (ended live token). Uploads still run
+   * from IndexedDB during the grace window. Do not open the websocket.
+   */
+  uploadOnly?: boolean;
 }
 
 export type ConsoleLogLevel = "info" | "warn" | "error";

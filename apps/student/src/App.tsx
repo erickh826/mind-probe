@@ -5,7 +5,8 @@ import {
   readJoinedSession,
   rememberJoinedSession,
 } from "@mind-probe/shared";
-import { ApiError, fetchClipManifest, fetchSession, joinSession } from "./api";
+import { fetchClipManifest, fetchSession, fetchUploadStatus, joinSession } from "./api";
+import { restoreStudentSession } from "./restoreSession";
 import { mediaUrl } from "./config";
 import { JoinSessionModal } from "./components/JoinSessionModal";
 import { StudentOverlay } from "./components/StudentOverlay";
@@ -48,7 +49,10 @@ export default function App() {
   const autoRecordingAttemptedRef = useRef(false);
   const previousRecorderStatusRef = useRef<string>("idle");
 
-  const socket = useStudentSocket(joined?.sessionId ?? null, joined?.accessToken ?? null);
+  const socket = useStudentSocket(
+    joined?.uploadOnly ? null : (joined?.sessionId ?? null),
+    joined?.uploadOnly ? null : (joined?.accessToken ?? null),
+  );
   const recorder = useMediaRecorder({
     sessionId: joined?.sessionId ?? null,
     onChunkUploaded: socket.sendChunkUploaded,
@@ -125,32 +129,36 @@ export default function App() {
     }
     let cancelled = false;
     void (async () => {
-      try {
-        const session = await fetchSession(stored.sessionId);
-        const clips = await fetchClipManifest(session.case_id);
-        if (cancelled) {
-          return;
-        }
+      const restored = await restoreStudentSession(stored, {
+        fetchSession,
+        fetchClipManifest,
+        fetchUploadStatus,
+        clearJoinedSession,
+      });
+      if (cancelled) {
+        return;
+      }
+      if (restored.kind === "live") {
         setJoined({
-          sessionId: session.session_id,
-          caseId: session.case_id,
-          clips,
-          accessToken: stored.accessToken,
+          sessionId: restored.sessionId,
+          caseId: restored.caseId,
+          clips: restored.clips,
+          accessToken: restored.accessToken,
           restoredFromStorage: true,
         });
-      } catch (cause) {
-        if (cancelled) {
-          return;
-        }
-        if (cause instanceof ApiError && [401, 403, 404].includes(cause.status)) {
-          clearJoinedSession(stored.sessionId);
-          setJoinError("Saved session is no longer valid. Join again.");
-        }
-      } finally {
-        if (!cancelled) {
-          setRestorePending(false);
-        }
+      } else if (restored.kind === "upload-only") {
+        setJoined({
+          sessionId: restored.sessionId,
+          caseId: "",
+          clips: [],
+          accessToken: restored.accessToken,
+          restoredFromStorage: true,
+          uploadOnly: true,
+        });
+      } else if (restored.kind === "rejected") {
+        setJoinError(restored.message);
       }
+      setRestorePending(false);
     })();
     return () => {
       cancelled = true;

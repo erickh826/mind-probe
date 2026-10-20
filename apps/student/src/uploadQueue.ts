@@ -278,15 +278,22 @@ export function applyServerStatus(
   status: ServerUploadStatus,
   now: number,
 ): RecordingMeta {
+  // A status read that started before finalize returned must not walk a
+  // terminal server state back to pending or none.
+  const held = meta.server_finalize_state;
+  const incoming = status.finalize_state;
+  const heldTerminal = held === "complete" || held === "incomplete";
+  const incomingTerminal = incoming === "complete" || incoming === "incomplete";
+  const finalizeState = heldTerminal && !incomingTerminal ? held : incoming;
   const next: RecordingMeta = {
     ...meta,
-    server_finalize_state: status.finalize_state,
+    server_finalize_state: finalizeState,
   };
-  if (status.finalize_state === "complete") {
+  if (finalizeState === "complete") {
     next.finalize_confirmed = true;
     next.finalize_pending = false;
     next.finalize_confirmed_at = meta.finalize_confirmed_at ?? now;
-  } else if (status.finalize_state === "incomplete") {
+  } else if (finalizeState === "incomplete") {
     next.finalize_confirmed = false;
     next.finalize_pending = false;
   }

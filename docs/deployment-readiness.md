@@ -105,6 +105,31 @@ as accepted architecture.
 - Existing M4 Go/No-go requirements remain outstanding unless separately
   demonstrated; passing unit tests alone does not establish pilot readiness.
 
+## Recording grace on an existing database
+
+`MINDPROBE_UPLOAD_GRACE_SYNTHESIZE_AFTER` decides whether the grace pass may
+create a recording row for an ended session that does not have one. `POST
+/sessions/{id}/end` always creates that row itself. A websocket `session_ended`
+does not. The grace pass used to invent `incomplete` / `grace_expired` plus an
+audit for every historical ended session the first time it ran.
+
+This is a deployment choice. The process does not assume an installation date
+and does not assume the database is fresh.
+
+| Value | Meaning |
+| --- | --- |
+| Unset or blank | Existing-database default. Do not invent rows. Sessions that ended before this build keep no recording row and no new audit. |
+| `fresh` | Synthesize a row for every ended session that lacks one. Set this only when the operator has confirmed the database was created with this build and has no earlier sessions. |
+| ISO-8601 instant (`2026-10-20T00:00:00Z`) | Synthesize only when `ended_at` is at or after that cutover. Earlier sessions are left alone. Use the UTC instant this build is deployed, not a date baked into the source. |
+| Anything else | Treated as unset. A warning is logged. No rows are invented. |
+
+Rollout for a database that already has sessions: deploy with the variable
+unset, confirm the grace thread is not rewriting old sessions, then set the
+variable to the cutover instant and restart if post-cutover websocket ends
+must be closed by grace. A brand-new database must set `fresh` explicitly if
+that closure is wanted. Leaving it unset is safe; it is not an implicit
+`fresh`.
+
 ## Decisions Needed
 
 1. Backend destination: a persistent FastAPI host alongside Vercel, or a larger
