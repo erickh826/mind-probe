@@ -219,3 +219,39 @@ test("sequence_conflict is not uploaded again and flags the operator", async () 
   assert.equal(meta?.next_sequence, 1);
   assert.equal(meta?.finalize_pending, false);
 });
+
+test("a permanent finalize 409 is not sent again and flags the operator", async () => {
+  for (const [sessionId, code] of [
+    ["S-fin-conflict", "finalize_conflict"],
+    ["S-fin-deleted", "recording_deleted"],
+  ] as const) {
+    await resetRecordingControllerForTests();
+    await seed(
+      sessionId,
+      persistStop({ ...emptyMeta(sessionId, 0), next_sequence: 1, last_chunk_end_ms: 2_000 }, 0),
+    );
+
+    let calls = 0;
+    setRecordingTransport({
+      uploadRecordingChunk: async () => {
+        throw new Error("the queue is empty");
+      },
+      fetchUploadStatus: async () => {
+        throw new Error("status unused");
+      },
+      finalizeRecording: async () => {
+        calls += 1;
+        throw new ApiError(409, "conflict", code);
+      },
+    });
+
+    await pumpSession(sessionId);
+    await pumpSession(sessionId);
+    assert.equal(calls, 1, code);
+
+    const meta = await load(sessionId);
+    assert.equal(meta?.needs_operator, true);
+    assert.equal(meta?.upload_block, code);
+    assert.equal(meta?.finalize_pending, false);
+  }
+});

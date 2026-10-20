@@ -159,6 +159,8 @@ test("applyServerStatus does not touch sequence, recorder state, or the payload"
 test("permanent 4xx stops the matching retry and flags the operator", () => {
   assert.equal(permanentUploadBlock(409, "sequence_conflict"), "sequence_conflict");
   assert.equal(permanentUploadBlock(409, "sequence_past_final"), "sequence_past_final");
+  assert.equal(permanentUploadBlock(409, "finalize_conflict"), "finalize_conflict");
+  assert.equal(permanentUploadBlock(409, "recording_deleted"), "recording_deleted");
   assert.equal(permanentUploadBlock(400, "checksum_mismatch"), "checksum");
   assert.equal(permanentUploadBlock(401, "revoked_session_token"), "unauthorized");
   assert.equal(permanentUploadBlock(422, null), "invalid_finalize");
@@ -175,4 +177,12 @@ test("permanent 4xx stops the matching retry and flags the operator", () => {
   const expired = notePermanentFailure(meta, "unauthorized");
   assert.equal(expired.finalize_pending, false);
   assert.equal(closeBanner(blocked, 1).kind, "needs_operator");
+
+  for (const block of ["finalize_conflict", "recording_deleted"] as const) {
+    const stopped = notePermanentFailure(meta, block);
+    assert.equal(stopped.needs_operator, true);
+    assert.equal(stopped.finalize_pending, false);
+    assert.equal(stopped.finalize_next_attempt_at, null);
+    assert.equal(closeBanner(stopped, 0).kind, "needs_operator");
+  }
 });

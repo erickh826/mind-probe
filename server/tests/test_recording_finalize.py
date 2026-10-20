@@ -589,9 +589,16 @@ def test_grace_creates_incomplete_when_the_recording_row_is_missing(db):
     session_id = f"S-{uuid4().hex[:8]}"
     models.create_session(db, session_id, "CASE001")
     models.end_session(db, session_id)
+    session = models.get_session(db, session_id)
+    assert session is not None
+    # A missing row is synthesized only once recording rows exist. Pin the
+    # timestamp so this does not depend on the wall clock.
+    session.ended_at = recording_integrity.UPLOAD_GRACE_SYNTHESIZE_ENDED_AFTER
+    db.commit()
     assert models.get_recording(db, session_id) is None
     changed = recording_integrity.apply_upload_grace_deadlines(
-        db, now=auth.utcnow() + timedelta(hours=1)
+        db,
+        now=session.ended_at + timedelta(seconds=auth.upload_grace_seconds() + 1),
     )
     assert session_id in changed
     db.expire_all()
@@ -600,6 +607,33 @@ def test_grace_creates_incomplete_when_the_recording_row_is_missing(db):
     assert rec.recording_state == "incomplete"
     assert rec.finalize_state == "incomplete"
     assert rec.incomplete_reason == "grace_expired"
+
+
+def test_grace_does_not_rewrite_sessions_ended_before_recording_rows_existed(db):
+    session_id = f"S-{uuid4().hex[:8]}"
+    models.create_session(db, session_id, "CASE001")
+    models.end_session(db, session_id)
+    session = models.get_session(db, session_id)
+    assert session is not None
+    session.ended_at = recording_integrity.UPLOAD_GRACE_SYNTHESIZE_ENDED_AFTER - timedelta(
+        days=1
+    )
+    db.commit()
+    assert models.get_recording(db, session_id) is None
+    changed = recording_integrity.apply_upload_grace_deadlines(
+        db,
+        now=session.ended_at + timedelta(seconds=auth.upload_grace_seconds() + 1),
+    )
+    assert session_id not in changed
+    db.expire_all()
+    assert models.get_recording(db, session_id) is None
+    audits = db.scalars(
+        select(models.AuditLog).where(
+            models.AuditLog.session_id == session_id,
+            models.AuditLog.action == recording_integrity.AUDIT_RECORDING_INCOMPLETE,
+        )
+    ).all()
+    assert audits == []
 
 
 def test_grace_claim_does_not_overwrite_an_incomplete_reason(db):

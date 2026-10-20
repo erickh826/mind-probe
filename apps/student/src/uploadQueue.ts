@@ -19,7 +19,9 @@ export type UploadBlock =
   | "checksum"
   | "unauthorized"
   | "final_below_stored"
-  | "invalid_finalize";
+  | "invalid_finalize"
+  | "finalize_conflict"
+  | "recording_deleted";
 
 export interface FinalizePayload {
   final_sequence: number;
@@ -305,6 +307,12 @@ export function permanentUploadBlock(status: number, code: string | null): Uploa
   if (status === 409 && code === "sequence_conflict") {
     return "sequence_conflict";
   }
+  if (status === 409 && code === "finalize_conflict") {
+    return "finalize_conflict";
+  }
+  if (status === 409 && code === "recording_deleted") {
+    return "recording_deleted";
+  }
   if (status === 409) {
     return "sequence_conflict";
   }
@@ -317,9 +325,15 @@ export function permanentUploadBlock(status: number, code: string | null): Uploa
   return null;
 }
 
-/** Auth and finalize-shape failures must not be posted again. A bad chunk must not block the rest. */
+/** Auth and finalize failures must not be posted again. A bad chunk must not block the rest. */
 export function stopsFinalize(block: UploadBlock): boolean {
-  return block === "unauthorized" || block === "final_below_stored" || block === "invalid_finalize";
+  return (
+    block === "unauthorized" ||
+    block === "final_below_stored" ||
+    block === "invalid_finalize" ||
+    block === "finalize_conflict" ||
+    block === "recording_deleted"
+  );
 }
 
 export function notePermanentFailure(meta: RecordingMeta, block: UploadBlock): RecordingMeta {
@@ -346,6 +360,10 @@ export function permanentBlockMessage(block: UploadBlock | null): string {
       return "結束序號小於伺服器已收到的片段，請通知管理員";
     case "invalid_finalize":
       return "結束標記與伺服器的錄影不一致，請通知管理員";
+    case "finalize_conflict":
+      return "結束標記與伺服器已保存的內容衝突，請通知管理員";
+    case "recording_deleted":
+      return "這段錄影已刪除，無法繼續上傳，請通知管理員";
     default:
       return "上傳無法繼續，請通知老師或管理員";
   }

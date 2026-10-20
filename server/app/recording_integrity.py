@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import HTTPException
@@ -26,6 +26,14 @@ from . import auth, models
 from .events import EventEnvelope, EventType, Source
 
 logger = logging.getLogger(__name__)
+
+# Recording rows did not exist before this deploy. The grace pass must not
+# invent an ``incomplete`` / ``grace_expired`` row, or an audit entry, for a
+# session that ended earlier and never had a take. ``/end`` creates a row for
+# sessions it ends, and a missing row whose session ended at or after this
+# instant is still synthesized so a zero-chunk end that did not go through
+# ``/end`` (the websocket ``session_ended`` transition) can close.
+UPLOAD_GRACE_SYNTHESIZE_ENDED_AFTER = datetime(2026, 10, 20, tzinfo=timezone.utc)
 
 STUDENT_STATUS_KEYS = (
     "received_sequences",
@@ -625,9 +633,11 @@ def apply_upload_grace_deadlines(
 
     Protected incomplete takes are skipped. A finalized take with no gaps
     becomes ``complete``; anything else becomes ``incomplete``. A session that
-    never stored a chunk is created as ``incomplete`` / ``grace_expired``.
-    Raw chunks are left on disk either way. Returns the session ids whose
-    state changed.
+    never stored a chunk and ended at or after
+    ``UPLOAD_GRACE_SYNTHESIZE_ENDED_AFTER`` is created as ``incomplete`` /
+    ``grace_expired``. Older ended sessions with no recording row are left
+    alone so the first pass after deploy does not rewrite history. Raw chunks
+    are left on disk either way. Returns the session ids whose state changed.
     """
     from sqlalchemy import select
 
@@ -650,6 +660,8 @@ def apply_upload_grace_deadlines(
         rec = models.get_recording(db, session.id)
         created = False
         if rec is None:
+            if ended < UPLOAD_GRACE_SYNTHESIZE_ENDED_AFTER:
+                continue
             rec = models.ensure_recording(db, session.id)
             created = rec is not None
         if rec is None or rec.recording_state not in {"recording", "finalizing"}:

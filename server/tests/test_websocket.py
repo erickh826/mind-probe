@@ -13,11 +13,13 @@ autouse `db_factory` fixture below, so nothing here touches the real
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
 from uuid import uuid4
 
+import anyio
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
@@ -1815,13 +1817,70 @@ def test_critical_role_disconnect_pauses_only_after_the_grace_window():
     assert websocket_module.manager.snapshot_for(session_id).session_state == "paused"
 
 
-def test_critical_role_disconnect_pauses_without_later_inbound_traffic(monkeypatch):
-    """The server pauses on its own after the grace window, with no further traffic.
+def _receive_json_within(sock, timeout_s: float):
+    """Read one JSON frame, and fail the test if it does not arrive in time.
 
-    The database is read only after that pause message arrives. Polling SQLite
-    on this file's shared StaticPool connection while the handler is committing
-    can roll the audit row or the timeline event back.
+    ``WebSocketTestSession.receive_json`` waits forever. A timeout has to run
+    inside the portal: a thread blocked in ``portal.call`` cannot be joined
+    without wedging every later portal call, including the socket's ``__exit__``.
     """
+
+    async def _recv():
+        with anyio.fail_after(timeout_s):
+            return await sock._send_rx.receive()
+
+    try:
+        message = sock.portal.call(_recv)
+    except TimeoutError as exc:
+        raise AssertionError(f"no websocket frame within {timeout_s:.1f}s") from exc
+    if message["type"] == "websocket.close":
+        raise WebSocketDisconnect(
+            code=message.get("code", 1000), reason=message.get("reason", "")
+        )
+    return json.loads(message["text"])
+
+
+def _wait_for_auto_pause_frame(sock, session_id: str, *, timeout_s: float = 3.0):
+    """Return the pause frame the server sends with no further inbound traffic.
+
+    Disconnect schedules ``_delayed_disconnect_pause_check`` on the socket's
+    loop. That task sleeps out the grace window, pauses, then broadcasts. The
+    product path does not need another client frame: the same check passes on
+    feat/m2 when the test only sleeps, and it passes here once the frame is
+    already buffered.
+
+    Blocking in ``receive_json`` *before* that broadcast hangs on Windows.
+    Starlette delivers the frame through an anyio memory stream on the
+    TestClient portal. On the Windows ProactorEventLoop a receive that is
+    already waiting is not woken when this raw ``asyncio`` task later sends,
+    so the call never returns (observed at 60s and 90s). Sleeping on the test
+    thread leaves the portal free to finish the task, which is why the old
+    poll passed on that machine in a few seconds. This wait therefore watches
+    the in-memory snapshot and the test client's buffer, and only then reads.
+
+    The snapshot flips to ``paused`` after the pause transaction commits.
+    Opening ``models.SessionLocal`` during that commit is unsafe: this file's
+    in-memory database is one StaticPool connection, and a second session on
+    it can roll the audit row or the timeline event back. A second connection
+    would be a different ``:memory:`` database, so it cannot see the row.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        paused = (
+            websocket_module.manager.snapshot_for(session_id).session_state == "paused"
+        )
+        buffered = sock._send_rx.statistics().current_buffer_used > 0
+        if paused and buffered:
+            return _receive_json_within(sock, timeout_s)
+        time.sleep(0.01)
+    raise AssertionError(
+        "server did not auto-pause and deliver session_paused "
+        f"without later inbound traffic within {timeout_s:.1f}s"
+    )
+
+
+def test_critical_role_disconnect_pauses_without_later_inbound_traffic(monkeypatch):
+    """The server pauses on its own after the grace window, with no further traffic."""
     session_id = _fresh_session_id()
     monkeypatch.setattr(websocket_module, "DISCONNECT_GRACE_MS", 10)
 
@@ -1832,7 +1891,7 @@ def test_critical_role_disconnect_pauses_without_later_inbound_traffic(monkeypat
         _make_start_due(session_id)
         student.__exit__(None, None, None)
 
-        paused = wizard.receive_json()
+        paused = _wait_for_auto_pause_frame(wizard, session_id)
         assert paused["event_type"] == "session_paused"
         assert paused["payload"]["reason"] == "network_failure"
         assert paused["payload"]["lost_roles"] == ["student"]
