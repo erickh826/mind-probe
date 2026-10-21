@@ -37,13 +37,19 @@ function refused(cause: unknown): boolean {
   return cause instanceof ApiError && (cause.status === 401 || cause.status === 403 || cause.status === 404);
 }
 
+/** Shown with a Retry button. The saved credential stays put. */
+export const UNAVAILABLE_RESTORE_MESSAGE =
+  "Could not reach the saved session. Check the network and try again.";
+
 /**
  * Decide how to restore `stored`.
  *
  * A live session still loads the case and clips. After `/end`, those two reads
- * return 401 while upload status stays 200 inside the grace window — that is
- * upload-only mode. Grace expiry and a security revocation both make upload
- * status 401, and only then are the saved credentials dropped.
+ * return 401/403/404 while upload status stays 200 inside the grace window —
+ * that is upload-only mode. Any other failure (network, timeout, 5xx) stops
+ * here as `unavailable`: credentials stay, and the console can retry. Grace
+ * expiry and a security revocation both make upload status 401, and only then
+ * are the saved credentials dropped.
  */
 export async function restoreStudentSession(
   stored: StoredJoinedSession,
@@ -60,9 +66,10 @@ export async function restoreStudentSession(
       accessToken: stored.accessToken,
     };
   } catch (cause) {
+    // Only a refused live token is allowed to ask upload status. A network
+    // error or 5xx on a live session must not look like an ended session.
     if (!refused(cause)) {
-      // Fall through to the upload-status probe. A network error there
-      // reports unavailable without clearing the saved credential.
+      return { kind: "unavailable" };
     }
   }
 

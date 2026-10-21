@@ -12,7 +12,11 @@ import {
   setRecordingTransport,
 } from "./recordingController.ts";
 import { openRecordingDb, readMeta, writeMeta } from "./recordingDb.ts";
-import { restoreStudentSession, type RestoreProbes } from "./restoreSession.ts";
+import {
+  restoreStudentSession,
+  UNAVAILABLE_RESTORE_MESSAGE,
+  type RestoreProbes,
+} from "./restoreSession.ts";
 import { emptyMeta, persistStop, type RecordingMeta } from "./uploadQueue.ts";
 
 const stored = {
@@ -169,6 +173,46 @@ test("grace expiry and security revocation both drop the saved credential", asyn
     assert.deepEqual(sink.cleared, [stored.sessionId]);
     assert.equal(sink.clipCalls, 0);
   }
+});
+
+test("a live reload does not become upload-only when the session read fails open", async () => {
+  for (const cause of [new TypeError("network down"), new ApiError(503, "unavailable", null)]) {
+    let statusCalls = 0;
+    const sink = probes({
+      fetchSession: async () => {
+        throw cause;
+      },
+      fetchUploadStatus: async () => {
+        statusCalls += 1;
+        return { finalize_state: "pending", recording_state: "recording", received_sequences: [] };
+      },
+    });
+    const restored = await restoreStudentSession(stored, sink.probes);
+    assert.equal(restored.kind, "unavailable");
+    assert.equal(statusCalls, 0);
+    assert.equal(sink.clipCalls, 0);
+    assert.deepEqual(sink.cleared, []);
+  }
+
+  let statusCalls = 0;
+  const clipsDown = probes({
+    fetchSession: async () => ({ session_id: stored.sessionId, case_id: "CASE001" }),
+    fetchUploadStatus: async () => {
+      statusCalls += 1;
+      return { finalize_state: "pending" };
+    },
+  });
+  clipsDown.probes.fetchClipManifest = async () => {
+    throw new ApiError(503, "unavailable", null);
+  };
+  const restored = await restoreStudentSession(stored, clipsDown.probes);
+  assert.equal(restored.kind, "unavailable");
+  assert.equal(statusCalls, 0);
+  assert.deepEqual(clipsDown.cleared, []);
+  assert.equal(
+    UNAVAILABLE_RESTORE_MESSAGE,
+    "Could not reach the saved session. Check the network and try again.",
+  );
 });
 
 test("a live session still loads clips and does not enter upload-only mode", async () => {

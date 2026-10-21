@@ -6,7 +6,7 @@ import {
   rememberJoinedSession,
 } from "@mind-probe/shared";
 import { fetchClipManifest, fetchSession, fetchUploadStatus, joinSession } from "./api";
-import { restoreStudentSession } from "./restoreSession";
+import { restoreStudentSession, UNAVAILABLE_RESTORE_MESSAGE } from "./restoreSession";
 import { mediaUrl } from "./config";
 import { JoinSessionModal } from "./components/JoinSessionModal";
 import { StudentOverlay } from "./components/StudentOverlay";
@@ -45,6 +45,7 @@ export default function App() {
   const [restorePending, setRestorePending] = useState(
     () => readJoinedSession()?.role === "student",
   );
+  const [restoreError, setRestoreError] = useState<string | null>(null);
   const [cameraVisible, setCameraVisible] = useState(true);
   const autoRecordingAttemptedRef = useRef(false);
   const previousRecorderStatusRef = useRef<string>("idle");
@@ -139,6 +140,7 @@ export default function App() {
         return;
       }
       if (restored.kind === "live") {
+        setRestoreError(null);
         setJoined({
           sessionId: restored.sessionId,
           caseId: restored.caseId,
@@ -147,6 +149,7 @@ export default function App() {
           restoredFromStorage: true,
         });
       } else if (restored.kind === "upload-only") {
+        setRestoreError(null);
         setJoined({
           sessionId: restored.sessionId,
           caseId: "",
@@ -156,7 +159,10 @@ export default function App() {
           uploadOnly: true,
         });
       } else if (restored.kind === "rejected") {
+        setRestoreError(null);
         setJoinError(restored.message);
+      } else {
+        setRestoreError(UNAVAILABLE_RESTORE_MESSAGE);
       }
       setRestorePending(false);
     })();
@@ -197,6 +203,25 @@ export default function App() {
       return (
         <div className="join-shell">
           <p className="join-panel">Restoring session…</p>
+        </div>
+      );
+    }
+    if (restoreError && joined === null) {
+      return (
+        <div className="join-shell">
+          <div className="join-panel">
+            <h1>Session not reachable</h1>
+            <p className="join-error">{restoreError}</p>
+            <button
+              type="button"
+              onClick={() => {
+                setRestoreError(null);
+                setRestorePending(true);
+              }}
+            >
+              Retry
+            </button>
+          </div>
         </div>
       );
     }
