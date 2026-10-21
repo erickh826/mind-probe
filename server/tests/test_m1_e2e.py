@@ -50,8 +50,10 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
+import anyio
 import pytest
 from fastapi.testclient import TestClient
+from starlette.testclient import WebSocketTestSession
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -117,15 +119,71 @@ def e2e_env(monkeypatch):
     engine.dispose()
 
 
+def _cancel_background_tasks() -> None:
+    """Drop grace timers left on the shared connection manager.
+
+    Disconnect schedules ``_delayed_disconnect_pause_check`` for the real 2s
+    window. The next test used to inherit that task, and on Windows the shared
+    TestClient portal then missed the wakeup for a ``receive_json`` that had
+    already started. Cancelling here does not send a client frame.
+    """
+    for task in list(websocket_module.manager._background_tasks):
+        task.cancel()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_realtime_tasks():
+    _cancel_background_tasks()
+    yield
+    _cancel_background_tasks()
+
+
+@pytest.fixture(autouse=True)
+def _bounded_broadcast_receive(monkeypatch):
+    """Do not block in ``receive_json`` before the server has queued the frame.
+
+    Starlette delivers server frames through an anyio memory stream on the
+    TestClient portal. On the Windows ProactorEventLoop a receive that is
+    already waiting is not woken when a later task sends, so ``receive_json``
+    never returns (seen at the multi-role playback receives and at
+    ``role_connection_replaced``). The frame still lands in the buffer while
+    the test thread is outside ``portal.call``. Poll that buffer, then read.
+    Nothing is sent, so a test that asserts no later inbound traffic stays
+    honest. If the frame never arrives the wait fails at 8s instead of hanging.
+    """
+    original = WebSocketTestSession.receive_json
+
+    def receive_json(self, mode: str = "text"):
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            incoming = getattr(self, "_send_rx", None)
+            if incoming is not None and incoming.statistics().current_buffer_used > 0:
+                return original(self, mode)
+            time.sleep(0.01)
+        raise AssertionError("no websocket frame within 8.0s")
+
+    monkeypatch.setattr(WebSocketTestSession, "receive_json", receive_json)
+
+
 @pytest.fixture()
 def client():
-    """TestClient over the app.
+    """TestClient over one portal shared by every socket in the test.
 
     Deliberately *not* entered as a context manager: the lifespan would run
     `init_db()` against the real engine (same reasoning as
     `test_persistence.py`'s client fixture).
+
+    Without a portal of its own, each ``websocket_connect`` starts a separate
+    event loop. ``session_ended`` then posts the close onto the other roles'
+    loops with ``call_soon_threadsafe``. A sibling portal that has already
+    stopped raises ``RuntimeError: Event loop is closed``. One portal matches
+    production, where every socket is accepted on the server loop.
     """
-    return TestClient(app)
+    with anyio.from_thread.start_blocking_portal() as portal:
+        test_client = TestClient(app)
+        test_client.portal = portal
+        yield test_client
+        _cancel_background_tasks()
 
 
 @pytest.fixture()
