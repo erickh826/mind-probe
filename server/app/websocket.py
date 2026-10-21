@@ -472,6 +472,41 @@ class ConnectionManager:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
+    def _forget_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Drop sockets bound to a loop that can no longer run them."""
+        for roles in self._connections.values():
+            for role, conns in list(roles.items()):
+                roles[role] = [info for info in conns if info.event_loop is not loop]
+
+    def _schedule_on_loop(self, loop: asyncio.AbstractEventLoop, coro) -> None:
+        """Run `coro` on `loop`.
+
+        REST handlers and a socket on one TestClient portal both end up here
+        when they need to touch a socket accepted on another loop. A portal
+        that has already shut down leaves its loop closed while the connection
+        is still registered. ``call_soon_threadsafe`` then raises
+        ``RuntimeError: Event loop is closed`` and aborts session end or a
+        broadcast. Those sockets cannot receive anything, so drop them and
+        discard the coroutine instead of failing the caller. A live loop is
+        unchanged.
+        """
+        if loop.is_closed():
+            self._forget_loop(loop)
+            coro.close()
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        try:
+            if running is loop:
+                self.spawn_background_task(coro)
+            else:
+                loop.call_soon_threadsafe(self.spawn_background_task, coro)
+        except RuntimeError:
+            self._forget_loop(loop)
+            coro.close()
+
     def schedule_close_live_sockets(
         self,
         session_id: str,
@@ -507,16 +542,6 @@ class ConnectionManager:
                 # Starlette 1.3.1 raises RuntimeError when close() is called
                 # after the socket has already been closed.
                 pass
-
-    def _schedule_on_loop(self, loop: asyncio.AbstractEventLoop, coro) -> None:
-        try:
-            running = asyncio.get_running_loop()
-        except RuntimeError:
-            running = None
-        if running is loop:
-            self.spawn_background_task(coro)
-        else:
-            loop.call_soon_threadsafe(self.spawn_background_task, coro)
 
 
 manager = ConnectionManager()
@@ -1762,14 +1787,18 @@ async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
         manager.disconnect(session_id, role, websocket)
         if role in SINGLE_CONNECTION_ROLES:
             live_connection = manager.first_live_connection(session_id)
-            if live_connection is not None:
-                live_connection.event_loop.call_soon_threadsafe(
-                    manager.spawn_background_task,
+            if live_connection is not None and not live_connection.event_loop.is_closed():
+                manager._schedule_on_loop(
+                    live_connection.event_loop,
                     _delayed_disconnect_pause_check(
                         live_connection.websocket, session_id, role
                     ),
                 )
             else:
+                if live_connection is not None:
+                    manager._forget_loop(live_connection.event_loop)
+                # This handler is already on a running loop. The grace check
+                # only needs that loop, not the socket that just went away.
                 manager.spawn_background_task(
                     _delayed_disconnect_pause_check(websocket, session_id, role)
                 )

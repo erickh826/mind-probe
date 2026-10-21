@@ -13,6 +13,7 @@ autouse `db_factory` fixture below, so nothing here touches the real
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -1946,3 +1947,34 @@ def test_disconnect_does_not_pause_a_session_that_never_started():
     assert row.status == "created"
     assert row.pause_reason is None
     assert _audit_rows(session_id, models.AUDIT_SESSION_PAUSED) == []
+
+
+def test_schedule_on_a_closed_loop_drops_the_socket_and_does_not_raise():
+    """A socket left on a shut-down portal must not abort the caller.
+
+    ``session_ended`` posts a close onto every role's loop. When that loop
+    belongs to a TestClient portal that has already stopped,
+    ``call_soon_threadsafe`` raises ``RuntimeError: Event loop is closed``.
+    The sockets are undeliverable, so the schedule drops them and returns.
+    """
+    loop = asyncio.new_event_loop()
+    loop.close()
+    session_id = f"S-closed-loop-{uuid4().hex}"
+    manager = websocket_module.manager
+    manager._connections[session_id]["student"].append(
+        websocket_module.ConnectionInfo(
+            websocket=object(),  # type: ignore[arg-type]
+            connected_at_ms=0,
+            last_heartbeat_ms=0,
+            event_loop=loop,
+        )
+    )
+
+    async def _must_not_run() -> None:
+        raise AssertionError("a closed loop must not run the coroutine")
+
+    try:
+        manager._schedule_on_loop(loop, _must_not_run())
+        assert manager._connections[session_id]["student"] == []
+    finally:
+        manager._connections.pop(session_id, None)
