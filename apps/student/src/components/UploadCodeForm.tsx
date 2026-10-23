@@ -1,13 +1,22 @@
 import { FormEvent, useState } from "react";
+import type { UploadRecovery } from "../uploadRecovery";
 
 interface UploadCodeFormProps {
-  sessionId: string;
+  sessions: UploadRecovery[];
   pending: boolean;
   error: string | null;
   onSubmit: (sessionId: string, code: string) => Promise<void>;
+  onJoinAnother: () => void;
 }
 
-export function UploadCodeForm({ sessionId, pending, error, onSubmit }: UploadCodeFormProps) {
+export function UploadCodeForm({
+  sessions,
+  pending,
+  error,
+  onSubmit,
+  onJoinAnother,
+}: UploadCodeFormProps) {
+  const [sessionId, setSessionId] = useState(sessions[sessions.length - 1]?.sessionId ?? "");
   const [code, setCode] = useState("");
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
@@ -25,7 +34,21 @@ export function UploadCodeForm({ sessionId, pending, error, onSubmit }: UploadCo
         </div>
         <label>
           Session ID
-          <input readOnly value={sessionId} />
+          {sessions.length > 1 ? (
+            <select
+              disabled={pending}
+              value={sessionId}
+              onChange={(event) => setSessionId(event.target.value)}
+            >
+              {sessions.map((session) => (
+                <option key={session.sessionId} value={session.sessionId}>
+                  {session.sessionId}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input readOnly value={sessionId} />
+          )}
         </label>
         <label>
           Upload code
@@ -37,8 +60,11 @@ export function UploadCodeForm({ sessionId, pending, error, onSubmit }: UploadCo
           />
         </label>
         {error ? <p className="join-error">{error}</p> : null}
-        <button disabled={pending || code.trim() === ""}>
+        <button disabled={pending || code.trim() === "" || sessionId === ""}>
           {pending ? "Checking code..." : "Continue upload"}
+        </button>
+        <button className="join-secondary" type="button" disabled={pending} onClick={onJoinAnother}>
+          Join another session
         </button>
       </form>
     </div>

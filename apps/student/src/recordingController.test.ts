@@ -599,7 +599,8 @@ test("upload-login reopens only unauthorized chunks and leaves conflict and lost
 
   const now = 8_000;
   const updated = await resumeUnauthorizedUploads(sessionId, now);
-  assert.equal(updated?.upload_block, null);
+  assert.equal(updated?.needs_operator, true);
+  assert.equal(updated?.upload_block, "sequence_conflict");
   assert.equal(updated?.finalize_pending, true);
   assert.equal(updated?.next_sequence, 2);
   assert.equal(updated?.finalize_persisted_at, stopped.finalize_persisted_at);

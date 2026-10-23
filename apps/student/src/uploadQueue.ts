@@ -347,25 +347,30 @@ export function stopsFinalize(block: UploadBlock): boolean {
  * Undo an auth failure after a successful upload-login.
  *
  * Sequences, the finalize payload, and `finalize_persisted_at` stay put.
- * Conflict, validation, deletion, and recorder_lost blocks are left alone.
- * `needs_operator` from a lost take stays set.
+ * `needs_operator` is recomputed from terminal failures that are not auth.
+ * A lost take keeps an operator flag that was already set.
  */
-export function clearUnauthorizedUploadBlock(meta: RecordingMeta, now: number): RecordingMeta {
+export function clearUnauthorizedUploadBlock(
+  meta: RecordingMeta,
+  now: number,
+  remainingTerminal: readonly UploadBlock[] = [],
+): RecordingMeta {
   if (meta.upload_block !== "unauthorized") {
     return meta;
   }
+  const remaining = remainingTerminal.filter((block) => block !== "unauthorized");
   const next: RecordingMeta = {
     ...meta,
-    upload_block: null,
+    upload_block: remaining[0] ?? null,
+    needs_operator:
+      remaining.length > 0 || (meta.recorder_state === "lost" && meta.needs_operator),
   };
-  if (meta.recorder_state !== "lost") {
-    next.needs_operator = false;
-  }
   const stoppedOnlyByAuth =
     meta.finalize_payload != null &&
     !meta.finalize_confirmed &&
     meta.server_finalize_state !== "complete" &&
-    meta.server_finalize_state !== "incomplete";
+    meta.server_finalize_state !== "incomplete" &&
+    !remaining.some((block) => stopsFinalize(block));
   if (stoppedOnlyByAuth) {
     next.finalize_pending = true;
     next.finalize_next_attempt_at = now;
@@ -391,13 +396,23 @@ export function clearUnauthorizedChunk<
   };
 }
 
+/** Chunks an upload code can still send. A conflict terminal is not one of them. */
+export function uploadWorkChunkCount(
+  chunks: readonly { terminal?: boolean; terminal_reason?: string | null }[],
+): number {
+  return chunks.filter((chunk) => !chunk.terminal || chunk.terminal_reason === "unauthorized").length;
+}
+
 /**
- * Show the upload-code form when this profile still has an unfinished take.
- * A pending finalize with an empty chunk list counts. A missing row does not.
+ * Show the upload-code form only when something can still be sent.
+ *
+ * A pending finalize with an empty chunk list counts. A retained
+ * `incomplete` / `recorder_lost` take with nothing left to send does not.
+ * The row itself stays in IndexedDB.
  */
 export function showUploadCodeEntry(
   meta: RecordingMeta | null,
-  storedChunkCount: number,
+  pendingChunkCount: number,
 ): boolean {
   if (meta == null) {
     return false;
@@ -405,10 +420,7 @@ export function showUploadCodeEntry(
   if (meta.finalize_confirmed && meta.server_finalize_state === "complete") {
     return false;
   }
-  if (meta.finalize_pending || storedChunkCount > 0) {
-    return true;
-  }
-  return meta.recorder_state === "stopped" || meta.recorder_state === "lost";
+  return meta.finalize_pending || pendingChunkCount > 0;
 }
 
 export function notePermanentFailure(meta: RecordingMeta, block: UploadBlock): RecordingMeta {

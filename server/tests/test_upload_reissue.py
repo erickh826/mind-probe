@@ -498,6 +498,99 @@ def test_case_d_upload_token_finishes_the_same_take_and_recorder_lost_stays(clie
     assert recording_row.recording_state == "incomplete"
 
 
+ALLOWED_ORIGIN = "https://student.example"
+BLOCKED_ORIGIN = "https://evil.example"
+
+
+def _origin(origin: str, extra: dict[str, str] | None = None) -> dict[str, str]:
+    headers = {"Origin": origin}
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def test_early_auth_errors_carry_cors_for_an_allowed_origin(client, monkeypatch):
+    """A short-circuit 401 must not look like a network failure to the browser."""
+    monkeypatch.setenv("MINDPROBE_CORS_ORIGINS", ALLOWED_ORIGIN)
+    session_id, _tokens, _codes = _open(client)
+    token = _upload_token(client, session_id)
+
+    health = client.get("/health", headers=_origin(ALLOWED_ORIGIN))
+    assert health.status_code == 200
+    assert health.headers.get("access-control-allow-origin") == ALLOWED_ORIGIN
+    assert health.headers.get("access-control-allow-credentials") != "true"
+
+    preflight = client.options(
+        f"/sessions/{session_id}",
+        headers=_origin(
+            ALLOWED_ORIGIN,
+            {
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "authorization,content-type",
+            },
+        ),
+    )
+    assert preflight.status_code == 200
+    assert preflight.headers.get("access-control-allow-origin") == ALLOWED_ORIGIN
+    assert "authorization" in preflight.headers.get("access-control-allow-headers", "").lower()
+
+    denied = client.get(
+        f"/sessions/{session_id}",
+        headers=_origin(ALLOWED_ORIGIN, _bearer(token)),
+    )
+    assert denied.status_code == 401
+    assert denied.json()["detail"] == "token_type_mismatch"
+    assert denied.headers.get("access-control-allow-origin") == ALLOWED_ORIGIN
+
+    missing = client.get(
+        f"/recording/{session_id}/status",
+        headers=_origin(ALLOWED_ORIGIN, {"X-No-Operator": "1"}),
+    )
+    assert missing.status_code == 401
+    assert missing.headers.get("access-control-allow-origin") == ALLOWED_ORIGIN
+
+    garbage = client.get(
+        f"/sessions/{session_id}",
+        headers=_origin(ALLOWED_ORIGIN, _bearer("not-a-token")),
+    )
+    assert garbage.status_code == 401
+    assert garbage.headers.get("access-control-allow-origin") == ALLOWED_ORIGIN
+
+
+def test_disallowed_origin_gets_no_cors_on_success_preflight_or_auth_error(client, monkeypatch):
+    monkeypatch.setenv("MINDPROBE_CORS_ORIGINS", ALLOWED_ORIGIN)
+    session_id, _tokens, _codes = _open(client)
+    token = _upload_token(client, session_id)
+
+    health = client.get("/health", headers=_origin(BLOCKED_ORIGIN))
+    assert health.status_code == 200
+    assert "access-control-allow-origin" not in health.headers
+
+    preflight = client.options(
+        f"/sessions/{session_id}",
+        headers=_origin(
+            BLOCKED_ORIGIN,
+            {"Access-Control-Request-Method": "GET"},
+        ),
+    )
+    assert "access-control-allow-origin" not in preflight.headers
+    assert preflight.headers.get("access-control-allow-credentials") != "true"
+
+    denied = client.get(
+        f"/sessions/{session_id}",
+        headers=_origin(BLOCKED_ORIGIN, _bearer(token)),
+    )
+    assert denied.status_code == 401
+    assert "access-control-allow-origin" not in denied.headers
+
+    missing = client.get(
+        f"/recording/{session_id}/status",
+        headers=_origin(BLOCKED_ORIGIN, {"X-No-Operator": "1"}),
+    )
+    assert missing.status_code == 401
+    assert "access-control-allow-origin" not in missing.headers
+
+
 def test_local_case_media_stays_public_and_rejects_an_upload_token(client, monkeypatch, tmp_path):
     monkeypatch.setattr(cases, "CASES_DIR", tmp_path)
     monkeypatch.setenv("MINDPROBE_ENV", "local")

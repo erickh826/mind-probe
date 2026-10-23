@@ -26,7 +26,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
-from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.cors import CORSMiddleware as StarletteCORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
@@ -115,21 +115,6 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="mind-probe Session Server", version=__version__, lifespan=lifespan)
 
-# CORS whitelist from MINDPROBE_CORS_ORIGINS (comma separated); credentials are
-# never needed now that auth is Bearer (ADR-0005 §1).
-_cors_origins = [
-    origin.strip()
-    for origin in os.environ.get("MINDPROBE_CORS_ORIGINS", "").split(",")
-    if origin.strip()
-]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_cors_origins,
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["Authorization", "Content-Type"],
-)
-
 app.include_router(websocket.router)
 app.include_router(recording_router)
 
@@ -171,6 +156,38 @@ async def upload_token_default_deny(request: Request, call_next):
     if rejected is not None:
         return rejected
     return await call_next(request)
+
+
+def _configured_cors_origins() -> list[str]:
+    """Origins allowed to call the API. Read per request so tests can set the env."""
+    return [
+        origin.strip()
+        for origin in os.environ.get("MINDPROBE_CORS_ORIGINS", "").split(",")
+        if origin.strip()
+    ]
+
+
+class EnvCORSMiddleware(StarletteCORSMiddleware):
+    """CORS allow-list from ``MINDPROBE_CORS_ORIGINS``, checked on each request."""
+
+    def is_allowed_origin(self, origin: str) -> bool:
+        allowed = _configured_cors_origins()
+        if "*" in allowed:
+            return True
+        return origin in allowed
+
+
+# Registered after the upload-token middleware so this layer is outermost.
+# A short-circuit 401 (upload token on any other route, or any earlier auth
+# rejection) must still carry Access-Control-Allow-Origin. Credentials stay
+# off: auth is Bearer (ADR-0005 §1).
+app.add_middleware(
+    EnvCORSMiddleware,
+    allow_origins=_configured_cors_origins(),
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["Authorization", "Content-Type"],
+)
 
 
 @app.get("/health")

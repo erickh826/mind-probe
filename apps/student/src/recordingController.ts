@@ -326,14 +326,19 @@ export async function resumeUnauthorizedUploads(
 ): Promise<RecordingMeta | null> {
   const database = await db();
   const chunks = await listChunks(database, sessionId);
-  for (const chunk of chunks) {
-    const next = clearUnauthorizedChunk(chunk, now);
-    if (next !== chunk) {
-      await writeChunk(database, next);
+  const opened = chunks.map((chunk) => clearUnauthorizedChunk(chunk, now));
+  for (let index = 0; index < chunks.length; index += 1) {
+    if (opened[index] !== chunks[index]) {
+      await writeChunk(database, opened[index]);
     }
   }
+  const remainingTerminal = opened.flatMap((chunk) =>
+    chunk.terminal && chunk.terminal_reason && chunk.terminal_reason !== "unauthorized"
+      ? [chunk.terminal_reason]
+      : [],
+  );
   const updated = await updateMeta(database, sessionId, (latest) =>
-    clearUnauthorizedUploadBlock(latest, now),
+    clearUnauthorizedUploadBlock(latest, now, remainingTerminal),
   );
   if (updated && boundSession === sessionId) {
     meta = updated;

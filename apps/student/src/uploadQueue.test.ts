@@ -10,12 +10,13 @@ import {
   clearUnauthorizedUploadBlock,
   closeBanner,
   emptyMeta,
+  persistRecorderLost,
   showUploadCodeEntry,
+  uploadWorkChunkCount,
   finalizeDue,
   noteFinalizeAttempt,
   notePermanentFailure,
   permanentUploadBlock,
-  persistRecorderLost,
   persistStop,
   planReload,
   sequencesAlreadyReceived,
@@ -209,6 +210,12 @@ test("upload-login clears only an unauthorized block and keeps the finalize cloc
   const cleared = clearUnauthorizedUploadBlock(blocked, 9_000);
   assert.equal(cleared.upload_block, null);
   assert.equal(cleared.needs_operator, false);
+  const stillBlocked = clearUnauthorizedUploadBlock(blocked, 9_000, ["sequence_conflict"]);
+  assert.equal(stillBlocked.needs_operator, true);
+  assert.equal(stillBlocked.upload_block, "sequence_conflict");
+  assert.equal(stillBlocked.next_sequence, blocked.next_sequence);
+  assert.equal(stillBlocked.finalize_persisted_at, blocked.finalize_persisted_at);
+  assert.deepEqual(stillBlocked.finalize_payload, blocked.finalize_payload);
   assert.equal(cleared.finalize_pending, true);
   assert.equal(cleared.next_sequence, 3);
   assert.equal(cleared.finalize_persisted_at, stopped.finalize_persisted_at);
@@ -270,6 +277,23 @@ test("upload code entry is the unfinished take, including finalize with no chunk
   assert.equal(closeBanner(pendingFinalize, 0).kind === "safe", false);
   assert.equal(closeBanner(complete, 0).kind, "safe");
   const lost = persistRecorderLost(emptyMeta("S-lost", 0), 1_000);
+  assert.equal(lost.finalize_pending, true);
   assert.equal(showUploadCodeEntry(lost, 0), true);
   assert.equal(closeBanner(lost, 0).kind, "interrupted");
+  const settled = applyServerStatus(
+    lost,
+    { finalize_state: "incomplete", recording_state: "incomplete", received_sequences: [] },
+    3_000,
+  );
+  assert.equal(settled.finalize_pending, false);
+  assert.equal(settled.recorder_state, "lost");
+  assert.equal(showUploadCodeEntry(settled, 0), false);
+  assert.equal(
+    uploadWorkChunkCount([
+      { terminal: true, terminal_reason: "sequence_conflict" },
+      { terminal: true, terminal_reason: "unauthorized" },
+    ]),
+    1,
+  );
+  assert.equal(showUploadCodeEntry(settled, uploadWorkChunkCount([{ terminal: true, terminal_reason: "sequence_conflict" }])), false);
 });

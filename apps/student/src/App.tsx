@@ -11,7 +11,7 @@ import { mediaUrl } from "./config";
 import { JoinSessionModal } from "./components/JoinSessionModal";
 import { UploadCodeForm } from "./components/UploadCodeForm";
 import { resumeUnauthorizedUploads } from "./recordingController";
-import { findUnfinishedUploadSession, type UploadRecovery } from "./uploadRecovery";
+import { findUnfinishedUploadSessions, type UploadRecovery } from "./uploadRecovery";
 import { StudentOverlay } from "./components/StudentOverlay";
 import { SuspectVideoPlayer } from "./components/SuspectVideoPlayer";
 import { useMediaRecorder } from "./useMediaRecorder";
@@ -49,8 +49,9 @@ export default function App() {
     () => readJoinedSession()?.role === "student",
   );
   const [restoreError, setRestoreError] = useState<string | null>(null);
-  const [recovery, setRecovery] = useState<UploadRecovery | null>(null);
+  const [recoveries, setRecoveries] = useState<UploadRecovery[]>([]);
   const [recoveryChecked, setRecoveryChecked] = useState(false);
+  const [preferJoin, setPreferJoin] = useState(false);
   const [cameraVisible, setCameraVisible] = useState(true);
   const autoRecordingAttemptedRef = useRef(false);
   const previousRecorderStatusRef = useRef<string>("idle");
@@ -208,15 +209,15 @@ export default function App() {
     }
     let cancelled = false;
     setRecoveryChecked(false);
-    void findUnfinishedUploadSession()
+    void findUnfinishedUploadSessions()
       .then((found) => {
         if (!cancelled) {
-          setRecovery(found);
+          setRecoveries(found);
         }
       })
       .catch(() => {
         if (!cancelled) {
-          setRecovery(null);
+          setRecoveries([]);
         }
       })
       .finally(() => {
@@ -290,18 +291,34 @@ export default function App() {
         </div>
       );
     }
-    if (recovery) {
+    if (!preferJoin && recoveries.length > 0) {
       return (
         <UploadCodeForm
-          sessionId={recovery.sessionId}
+          sessions={recoveries}
           pending={joinPending}
           error={joinError}
           onSubmit={handleUploadLogin}
+          onJoinAnother={() => {
+            setJoinError(null);
+            setPreferJoin(true);
+          }}
         />
       );
     }
     return (
-      <JoinSessionModal pending={joinPending} error={joinError} onJoin={handleJoin} />
+      <JoinSessionModal
+        pending={joinPending}
+        error={joinError}
+        onJoin={handleJoin}
+        onResumeUpload={
+          recoveries.length > 0
+            ? () => {
+                setJoinError(null);
+                setPreferJoin(false);
+              }
+            : undefined
+        }
+      />
     );
   }
 
