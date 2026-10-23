@@ -4,9 +4,11 @@ interface JoinSessionModalProps {
   pending: boolean;
   error: string | null;
   onJoin: (sessionId: string, joinCode: string) => Promise<void>;
+  /** Present when IndexedDB still has a take that can be uploaded. Does not delete it. */
+  onResumeUpload?: () => void;
 }
 
-export function JoinSessionModal({ pending, error, onJoin }: JoinSessionModalProps) {
+export function JoinSessionModal({ pending, error, onJoin, onResumeUpload }: JoinSessionModalProps) {
   const [sessionId, setSessionId] = useState("S001");
   const [joinCode, setJoinCode] = useState("");
 
@@ -44,6 +46,11 @@ export function JoinSessionModal({ pending, error, onJoin }: JoinSessionModalPro
         <button disabled={pending || sessionId.trim() === "" || joinCode.trim() === ""}>
           {pending ? "Joining..." : "Join as Student"}
         </button>
+        {onResumeUpload ? (
+          <button className="join-secondary" type="button" disabled={pending} onClick={onResumeUpload}>
+            Resume unfinished upload
+          </button>
+        ) : null}
       </form>
     </div>
   );
