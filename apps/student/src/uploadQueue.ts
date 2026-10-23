@@ -343,6 +343,74 @@ export function stopsFinalize(block: UploadBlock): boolean {
   );
 }
 
+/**
+ * Undo an auth failure after a successful upload-login.
+ *
+ * Sequences, the finalize payload, and `finalize_persisted_at` stay put.
+ * Conflict, validation, deletion, and recorder_lost blocks are left alone.
+ * `needs_operator` from a lost take stays set.
+ */
+export function clearUnauthorizedUploadBlock(meta: RecordingMeta, now: number): RecordingMeta {
+  if (meta.upload_block !== "unauthorized") {
+    return meta;
+  }
+  const next: RecordingMeta = {
+    ...meta,
+    upload_block: null,
+  };
+  if (meta.recorder_state !== "lost") {
+    next.needs_operator = false;
+  }
+  const stoppedOnlyByAuth =
+    meta.finalize_payload != null &&
+    !meta.finalize_confirmed &&
+    meta.server_finalize_state !== "complete" &&
+    meta.server_finalize_state !== "incomplete";
+  if (stoppedOnlyByAuth) {
+    next.finalize_pending = true;
+    next.finalize_next_attempt_at = now;
+  }
+  return next;
+}
+
+export function clearUnauthorizedChunk<
+  T extends {
+    terminal?: boolean;
+    terminal_reason?: UploadBlock | null;
+    next_attempt_at: number;
+  },
+>(chunk: T, now: number): T {
+  if (!chunk.terminal || chunk.terminal_reason !== "unauthorized") {
+    return chunk;
+  }
+  return {
+    ...chunk,
+    terminal: false,
+    terminal_reason: undefined,
+    next_attempt_at: now,
+  };
+}
+
+/**
+ * Show the upload-code form when this profile still has an unfinished take.
+ * A pending finalize with an empty chunk list counts. A missing row does not.
+ */
+export function showUploadCodeEntry(
+  meta: RecordingMeta | null,
+  storedChunkCount: number,
+): boolean {
+  if (meta == null) {
+    return false;
+  }
+  if (meta.finalize_confirmed && meta.server_finalize_state === "complete") {
+    return false;
+  }
+  if (meta.finalize_pending || storedChunkCount > 0) {
+    return true;
+  }
+  return meta.recorder_state === "stopped" || meta.recorder_state === "lost";
+}
+
 export function notePermanentFailure(meta: RecordingMeta, block: UploadBlock): RecordingMeta {
   return {
     ...meta,

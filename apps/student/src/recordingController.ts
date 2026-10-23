@@ -18,6 +18,8 @@ import {
 import {
   applyServerStatus,
   chunkRetryDelayMs,
+  clearUnauthorizedChunk,
+  clearUnauthorizedUploadBlock,
   closeBanner,
   emptyMeta,
   finalizeDue,
@@ -317,6 +319,31 @@ function mergeReload(
   return next;
 }
 
+/** Drop only unauthorized blocks after a successful upload-login. */
+export async function resumeUnauthorizedUploads(
+  sessionId: string,
+  now = Date.now(),
+): Promise<RecordingMeta | null> {
+  const database = await db();
+  const chunks = await listChunks(database, sessionId);
+  for (const chunk of chunks) {
+    const next = clearUnauthorizedChunk(chunk, now);
+    if (next !== chunk) {
+      await writeChunk(database, next);
+    }
+  }
+  const updated = await updateMeta(database, sessionId, (latest) =>
+    clearUnauthorizedUploadBlock(latest, now),
+  );
+  if (updated && boundSession === sessionId) {
+    meta = updated;
+    errorMessage = null;
+    await refreshPending(sessionId);
+    emit();
+  }
+  return updated;
+}
+
 export async function bindSession(sessionId: string): Promise<void> {
   cancelRelease();
   if (boundSession !== sessionId) {
@@ -582,6 +609,7 @@ async function uploadNextChunk(sessionId: string): Promise<void> {
         ...next,
         attempts: next.attempts + 1,
         terminal: true,
+        terminal_reason: block,
         next_attempt_at: Number.MAX_SAFE_INTEGER,
       });
       const updated = await updateMeta(database, sessionId, (latest) =>

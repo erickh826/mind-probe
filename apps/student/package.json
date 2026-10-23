@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "test": "node --experimental-strip-types --test --test-concurrency=1 src/uploadQueue.test.ts src/recordingController.test.ts src/restoreSession.test.ts"
+    "test": "node --experimental-strip-types --test --test-concurrency=1 src/uploadQueue.test.ts src/recordingController.test.ts src/restoreSession.test.ts src/uploadRecovery.test.ts"
   },
   "dependencies": {
     "@mind-probe/shared": "file:../../packages/shared",

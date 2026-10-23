@@ -689,7 +689,11 @@ async def upload_chunk(
     checksum: str | None = Form(None),
     chunk: UploadFile = File(...),
     _actor: auth.Actor = Depends(
-        auth.require_roles("student", revocation="grace_upload")
+        auth.require_roles(
+            "student",
+            revocation="grace_upload",
+            allowed_typs=("live", "upload"),
+        )
     ),
     db: DBSession = Depends(get_db),
 ) -> dict:
@@ -842,7 +846,11 @@ class FinalizeRequest(BaseModel):
 def recording_status(
     session_id: str,
     _actor: auth.Actor = Depends(
-        auth.require_roles("student", revocation="grace_upload")
+        auth.require_roles(
+            "student",
+            revocation="grace_upload",
+            allowed_typs=("live", "upload"),
+        )
     ),
     db: DBSession = Depends(get_db),
 ) -> dict:
@@ -862,7 +870,11 @@ def finalize_recording(
     session_id: str,
     body: FinalizeRequest,
     actor: auth.Actor = Depends(
-        auth.require_roles("student", revocation="grace_upload")
+        auth.require_roles(
+            "student",
+            revocation="grace_upload",
+            allowed_typs=("live", "upload"),
+        )
     ),
     db: DBSession = Depends(get_db),
 ) -> dict:

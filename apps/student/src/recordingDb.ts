@@ -11,6 +11,7 @@ import {
   emptyMeta,
   shouldDiscardMeta,
   type RecordingMeta,
+  type UploadBlock,
 } from "./uploadQueue.ts";
 
 const DB_NAME = "mindprobe-recording";
@@ -29,6 +30,8 @@ export interface PersistedChunk {
   next_attempt_at: number;
   /** Set when the server rejected this slice permanently (409/400/401). */
   terminal?: boolean;
+  /** Why `terminal` was set. Only `unauthorized` is cleared by upload-login. */
+  terminal_reason?: UploadBlock;
 }
 
 function fail(reject: (reason: unknown) => void, error: DOMException | null): void {
@@ -51,6 +54,15 @@ export function openRecordingDb(): Promise<IDBDatabase> {
       }
     };
     request.onsuccess = () => resolve(request.result);
+    request.onerror = () => fail(reject, request.error);
+  });
+}
+
+export function listMeta(db: IDBDatabase): Promise<RecordingMeta[]> {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(META_STORE, "readonly");
+    const request = tx.objectStore(META_STORE).getAll();
+    request.onsuccess = () => resolve((request.result as RecordingMeta[]) ?? []);
     request.onerror = () => fail(reject, request.error);
   });
 }

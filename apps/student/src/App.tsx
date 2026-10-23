@@ -5,10 +5,13 @@ import {
   readJoinedSession,
   rememberJoinedSession,
 } from "@mind-probe/shared";
-import { fetchClipManifest, fetchSession, fetchUploadStatus, joinSession } from "./api";
+import { fetchClipManifest, fetchSession, fetchUploadStatus, joinSession, uploadLogin } from "./api";
 import { restoreStudentSession, UNAVAILABLE_RESTORE_MESSAGE } from "./restoreSession";
 import { mediaUrl } from "./config";
 import { JoinSessionModal } from "./components/JoinSessionModal";
+import { UploadCodeForm } from "./components/UploadCodeForm";
+import { resumeUnauthorizedUploads } from "./recordingController";
+import { findUnfinishedUploadSession, type UploadRecovery } from "./uploadRecovery";
 import { StudentOverlay } from "./components/StudentOverlay";
 import { SuspectVideoPlayer } from "./components/SuspectVideoPlayer";
 import { useMediaRecorder } from "./useMediaRecorder";
@@ -46,6 +49,8 @@ export default function App() {
     () => readJoinedSession()?.role === "student",
   );
   const [restoreError, setRestoreError] = useState<string | null>(null);
+  const [recovery, setRecovery] = useState<UploadRecovery | null>(null);
+  const [recoveryChecked, setRecoveryChecked] = useState(false);
   const [cameraVisible, setCameraVisible] = useState(true);
   const autoRecordingAttemptedRef = useRef(false);
   const previousRecorderStatusRef = useRef<string>("idle");
@@ -119,6 +124,32 @@ export default function App() {
     }
   }, []);
 
+  const handleUploadLogin = useCallback(async (sessionId: string, code: string) => {
+    setJoinPending(true);
+    setJoinError(null);
+    try {
+      const login = await uploadLogin(sessionId, code);
+      await resumeUnauthorizedUploads(sessionId);
+      rememberJoinedSession({
+        sessionId,
+        role: "student",
+        accessToken: login.access_token,
+      });
+      setJoined({
+        sessionId,
+        caseId: "",
+        clips: [],
+        accessToken: login.access_token,
+        restoredFromStorage: true,
+        uploadOnly: true,
+      });
+    } catch (cause) {
+      setJoinError(String(cause instanceof Error ? cause.message : cause));
+    } finally {
+      setJoinPending(false);
+    }
+  }, []);
+
   useEffect(() => {
     if (!restorePending) {
       return;
@@ -172,6 +203,33 @@ export default function App() {
   }, [restorePending]);
 
   useEffect(() => {
+    if (restorePending || joined !== null || readJoinedSession() !== null) {
+      return;
+    }
+    let cancelled = false;
+    setRecoveryChecked(false);
+    void findUnfinishedUploadSession()
+      .then((found) => {
+        if (!cancelled) {
+          setRecovery(found);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setRecovery(null);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setRecoveryChecked(true);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [restorePending, joined]);
+
+  useEffect(() => {
     if (
       joined === null ||
       joined.restoredFromStorage ||
@@ -223,6 +281,23 @@ export default function App() {
             </button>
           </div>
         </div>
+      );
+    }
+    if (!recoveryChecked) {
+      return (
+        <div className="join-shell">
+          <p className="join-panel">Checking local recording…</p>
+        </div>
+      );
+    }
+    if (recovery) {
+      return (
+        <UploadCodeForm
+          sessionId={recovery.sessionId}
+          pending={joinPending}
+          error={joinError}
+          onSubmit={handleUploadLogin}
+        />
       );
     }
     return (

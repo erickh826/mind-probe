@@ -17,15 +17,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session as DBSession
@@ -131,6 +133,45 @@ app.add_middleware(
 app.include_router(websocket.router)
 app.include_router(recording_router)
 
+# typ=upload is accepted only on the three recording routes below. Every other
+# HTTP route, including case JSON and local case media, rejects it. Health
+# stays public. upload-login is the code exchange and does not require a bearer.
+_UPLOAD_TOKEN_ROUTE = re.compile(
+    r"^/recording/(?P<session_id>[^/]+)/(?P<action>chunk|finalize|status)$"
+)
+_UPLOAD_TOKEN_ACTIONS = frozenset({("POST", "chunk"), ("POST", "finalize"), ("GET", "status")})
+_UPLOAD_LOGIN_ROUTE = re.compile(r"^/sessions/[^/]+/upload-login$")
+
+
+def _reject_upload_token_outside_allowlist(request: Request) -> JSONResponse | None:
+    if request.url.path == "/health":
+        return None
+    if request.method.upper() == "POST" and _UPLOAD_LOGIN_ROUTE.match(request.url.path):
+        return None
+    token = auth.extract_token(request)
+    if not token or auth.is_operator_token(token):
+        return None
+    try:
+        claims = auth.decode_session_token(token)
+    except auth.TokenInvalid:
+        return None
+    if claims.get("typ") != "upload":
+        return None
+    match = _UPLOAD_TOKEN_ROUTE.match(request.url.path)
+    if match is None or (request.method.upper(), match.group("action")) not in _UPLOAD_TOKEN_ACTIONS:
+        return JSONResponse(status_code=401, content={"detail": "token_type_mismatch"})
+    if claims.get("session_id") != match.group("session_id"):
+        return JSONResponse(status_code=401, content={"detail": "session_token_mismatch"})
+    return None
+
+
+@app.middleware("http")
+async def upload_token_default_deny(request: Request, call_next):
+    rejected = _reject_upload_token_outside_allowlist(request)
+    if rejected is not None:
+        return rejected
+    return await call_next(request)
+
 
 @app.get("/health")
 def health() -> dict:
@@ -197,6 +238,12 @@ class JoinSessionRequest(BaseModel):
     client_id: str | None = Field(
         default=None, description="Opaque per-device id bound into the token."
     )
+
+
+class UploadLoginRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str = Field(..., min_length=1, description="One-time upload code from the operator.")
 
 
 def _session_payload(session: models.Session) -> dict:
@@ -384,6 +431,173 @@ def join_session(
         "status": "ok",
         "access_token": token,
         "expires_at": int(time.time()) + websocket.WS_TOKEN_TTL_SECONDS,
+    }
+
+
+_UPLOAD_REISSUE_OPEN = frozenset({"created", "starting", "active", "paused"})
+
+
+def _upload_reissue_refusal(db: DBSession, session: models.Session) -> str | None:
+    """Why a new upload code must be refused, or None when it may be issued.
+
+    Reissue is allowed before ``/end`` and during the grace window. It is
+    refused after grace and after a security revocation. Issuing a code does
+    not revoke the original live token.
+    """
+    if models.upload_security_revoked(db, session.id):
+        return "upload_security_revoked"
+    if session.status in _UPLOAD_REISSUE_OPEN:
+        return None
+    if session.status == "ended" and auth.session_upload_grace_open(session):
+        return None
+    if session.status == "ended":
+        return "upload_grace_expired"
+    return "upload_reissue_refused"
+
+
+def _upload_token_exp(session: models.Session, now_s: int) -> int:
+    """15 minutes, capped by the grace deadline once the session has ended."""
+    exp = now_s + auth.UPLOAD_TOKEN_TTL_SECONDS
+    if session.status == "ended":
+        if session.ended_at is None:
+            return now_s
+        grace_end = int(auth._as_utc(session.ended_at).timestamp()) + auth.upload_grace_seconds()
+        exp = min(exp, grace_end)
+    return exp
+
+
+def _upload_reissue_facts(session_id: str, db: DBSession) -> dict:
+    """Operator-facing snapshot. Does not create a recording row."""
+    rec = models.get_recording(db, session_id)
+    chunks = recording.stored_chunks(session_id)
+    seconds_since_last_chunk = None
+    if chunks:
+        latest = max(path.stat().st_mtime for _, path in chunks)
+        seconds_since_last_chunk = max(0, int(auth.utcnow().timestamp() - latest))
+    return {
+        "recording_state": rec.recording_state if rec is not None else None,
+        "stored_sequences": len(chunks),
+        "seconds_since_last_chunk": seconds_since_last_chunk,
+    }
+
+
+def _client_host(request: Request) -> str:
+    if request.client is None or not request.client.host:
+        return "unknown"
+    return request.client.host
+
+
+@app.post("/sessions/{session_id}/upload-reissue")
+def upload_reissue(
+    session_id: str,
+    _actor: auth.Actor = Depends(auth.require_operator),
+    db: DBSession = Depends(get_db),
+) -> dict:
+    """Issue one upload code. The plaintext is returned once and is not logged.
+
+    Operator token only. A later issue withdraws the previous unused code.
+    """
+    session = _load_session_or_404(db, session_id)
+    refusal = _upload_reissue_refusal(db, session)
+    if refusal is not None:
+        raise HTTPException(status_code=409, detail=refusal)
+    if not auth.upload_issue_limiter.allow(
+        session_id,
+        limit=auth.UPLOAD_ISSUE_LIMIT,
+        window_s=auth.UPLOAD_ISSUE_WINDOW_SECONDS,
+        now=auth.upload_rate_now(),
+    ):
+        raise HTTPException(status_code=429, detail="rate_limited")
+    now = auth.utcnow()
+    expires_at = now + timedelta(seconds=models.UPLOAD_CODE_TTL_SECONDS)
+    try:
+        raw_code = models.issue_upload_code(db, session_id, expires_at=expires_at)
+        models.record_audit(
+            db,
+            action=models.AUDIT_UPLOAD_CODE_ISSUED,
+            actor_role="operator",
+            session_id=session_id,
+            token_hash=models.hash_join_code(raw_code),
+            details={"code_hash": models.hash_join_code(raw_code)},
+            commit=False,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    payload = _upload_reissue_facts(session_id, db)
+    payload["upload_code"] = raw_code
+    payload["expires_at"] = expires_at.isoformat()
+    return payload
+
+
+@app.post("/sessions/{session_id}/upload-login")
+def upload_login(
+    session_id: str,
+    body: UploadLoginRequest,
+    request: Request,
+    db: DBSession = Depends(get_db),
+) -> dict:
+    """Exchange a one-time upload code for a short ``typ=upload`` token.
+
+    The token is not a review grant and is not written to a cookie. Redeeming
+    the same code twice yields one success and one 409.
+    """
+    session = _load_session_or_404(db, session_id)
+    if not auth.upload_redeem_limiter.allow(
+        _client_host(request),
+        limit=auth.UPLOAD_REDEEM_LIMIT,
+        window_s=auth.UPLOAD_REDEEM_WINDOW_SECONDS,
+        now=auth.upload_rate_now(),
+    ):
+        raise HTTPException(status_code=429, detail="rate_limited")
+    refusal = _upload_reissue_refusal(db, session)
+    if refusal is not None:
+        raise HTTPException(status_code=409, detail=refusal)
+    now_s = int(time.time())
+    exp = _upload_token_exp(session, now_s)
+    if exp <= now_s:
+        raise HTTPException(status_code=409, detail="upload_grace_expired")
+    try:
+        models.consume_upload_code(db, session_id, body.code, now=auth.utcnow())
+        token = websocket.create_session_token(
+            session_id=session_id,
+            role="student",
+            client_id="upload-recovery",
+            expires_at_s=exp,
+            typ="upload",
+            grant_id=session_id,
+        )
+        models.record_audit(
+            db,
+            action=models.AUDIT_UPLOAD_TOKEN_ISSUED,
+            actor_role="student",
+            session_id=session_id,
+            token=token,
+            details={"typ": "upload", "client_id": "upload-recovery"},
+            commit=False,
+        )
+        db.commit()
+    except models.UploadCodeInvalid:
+        db.rollback()
+        raise HTTPException(status_code=401, detail="upload_code_invalid")
+    except models.UploadCodeExpired:
+        db.rollback()
+        raise HTTPException(status_code=401, detail="upload_code_expired")
+    except models.UploadCodeConsumed:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="upload_code_consumed")
+    except websocket.WebSocketAuthError as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=exc.reason)
+    except Exception:
+        db.rollback()
+        raise
+    return {
+        "access_token": token,
+        "token_type": "upload",
+        "role": "student",
+        "expires_at": exp,
     }
 
 

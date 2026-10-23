@@ -16,10 +16,17 @@ import {
   recorderStopPromiseForTests,
   recordingView,
   resetRecordingControllerForTests,
+  resumeUnauthorizedUploads,
   setRecordingTransport,
 } from "./recordingController.ts";
-import { openRecordingDb, readMeta, writeMeta } from "./recordingDb.ts";
-import { emptyMeta, persistStop, type RecordingMeta } from "./uploadQueue.ts";
+import { listChunks, openRecordingDb, readMeta, writeChunk, writeMeta } from "./recordingDb.ts";
+import {
+  emptyMeta,
+  notePermanentFailure,
+  persistRecorderLost,
+  persistStop,
+  type RecordingMeta,
+} from "./uploadQueue.ts";
 
 afterEach(async () => {
   await resetRecordingControllerForTests();
@@ -550,4 +557,74 @@ test("an IndexedDB failure fail-closes the take across stop and reload", async (
   assert.equal(reloaded?.needs_operator, true);
   assert.equal(reloaded?.finalize_payload?.reason, "recorder_lost");
   assert.equal(recordingView().banner.kind, "interrupted");
+});
+
+test("upload-login reopens only unauthorized chunks and leaves conflict and lost state", async () => {
+  const sessionId = "S-reauth";
+  const stopped = persistStop(
+    { ...emptyMeta(sessionId, 1_000), next_sequence: 2, last_chunk_end_ms: 3000 },
+    4_000,
+  );
+  const blocked = {
+    ...notePermanentFailure(stopped, "unauthorized"),
+    upload_block: "unauthorized" as const,
+  };
+  const database = await openRecordingDb();
+  await writeMeta(database, blocked);
+  await writeChunk(database, {
+    session_id: sessionId,
+    sequence: 0,
+    start_ms: 0,
+    end_ms: 1000,
+    checksum: "conflict",
+    blob: blob("conflict"),
+    attempts: 1,
+    next_attempt_at: Number.MAX_SAFE_INTEGER,
+    terminal: true,
+    terminal_reason: "sequence_conflict",
+  });
+  await writeChunk(database, {
+    session_id: sessionId,
+    sequence: 1,
+    start_ms: 1000,
+    end_ms: 3000,
+    checksum: "auth",
+    blob: blob("auth"),
+    attempts: 1,
+    next_attempt_at: Number.MAX_SAFE_INTEGER,
+    terminal: true,
+    terminal_reason: "unauthorized",
+  });
+  database.close();
+
+  const now = 8_000;
+  const updated = await resumeUnauthorizedUploads(sessionId, now);
+  assert.equal(updated?.upload_block, null);
+  assert.equal(updated?.finalize_pending, true);
+  assert.equal(updated?.next_sequence, 2);
+  assert.equal(updated?.finalize_persisted_at, stopped.finalize_persisted_at);
+  assert.deepEqual(updated?.finalize_payload, stopped.finalize_payload);
+
+  const savedDb = await openRecordingDb();
+  const chunks = await listChunks(savedDb, sessionId);
+  savedDb.close();
+  const conflict = chunks.find((chunk) => chunk.sequence === 0);
+  const unauthorized = chunks.find((chunk) => chunk.sequence === 1);
+  assert.equal(conflict?.terminal, true);
+  assert.equal(conflict?.terminal_reason, "sequence_conflict");
+  assert.equal(unauthorized?.terminal, false);
+  assert.equal(unauthorized?.next_attempt_at, now);
+
+  const lost = notePermanentFailure(
+    persistRecorderLost({ ...emptyMeta("S-lost-db", 0), next_sequence: 1, last_chunk_end_ms: 500 }, 2_000),
+    "unauthorized",
+  );
+  await seed("S-lost-db", lost);
+  const kept = await resumeUnauthorizedUploads("S-lost-db", now);
+  assert.equal(kept?.recorder_state, "lost");
+  assert.equal(kept?.needs_operator, true);
+  assert.equal(kept?.upload_block, null);
+  assert.equal(kept?.finalize_payload?.reason, "recorder_lost");
+  assert.equal(kept?.finalize_persisted_at, lost.finalize_persisted_at);
+  assert.equal(kept?.next_sequence, lost.next_sequence);
 });

@@ -569,6 +569,8 @@ def create_session_token(
     *,
     client_id: str = "temporary-client-id",
     expires_at_s: int | None = None,
+    typ: str | None = None,
+    grant_id: str | None = None,
 ) -> str:
     """Create a short-lived, role-bound HMAC token for Bearer and WebSocket auth.
 
@@ -588,6 +590,11 @@ def create_session_token(
         "iat": now_s,
         "exp": expires_at_s if expires_at_s is not None else now_s + WS_TOKEN_TTL_SECONDS,
     }
+    # Omitted ``typ`` stays live. Upload recovery sets ``typ`` and ``grant_id``.
+    if typ is not None:
+        claims["typ"] = typ
+    if grant_id is not None:
+        claims["grant_id"] = grant_id
     payload = _b64encode(
         json.dumps(claims, separators=(",", ":"), sort_keys=True).encode("utf-8")
     )

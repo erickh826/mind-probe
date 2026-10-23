@@ -6,8 +6,11 @@ import {
   MemoryUploadLog,
   acknowledgeChunk,
   applyServerStatus,
+  clearUnauthorizedChunk,
+  clearUnauthorizedUploadBlock,
   closeBanner,
   emptyMeta,
+  showUploadCodeEntry,
   finalizeDue,
   noteFinalizeAttempt,
   notePermanentFailure,
@@ -195,4 +198,78 @@ test("permanent 4xx stops the matching retry and flags the operator", () => {
     assert.equal(stopped.finalize_next_attempt_at, null);
     assert.equal(closeBanner(stopped, 0).kind, "needs_operator");
   }
+});
+
+test("upload-login clears only an unauthorized block and keeps the finalize clock", () => {
+  const stopped = persistStop(
+    { ...emptyMeta("S-auth", 0), next_sequence: 3, last_chunk_end_ms: 4000 },
+    5_000,
+  );
+  const blocked = notePermanentFailure(stopped, "unauthorized");
+  const cleared = clearUnauthorizedUploadBlock(blocked, 9_000);
+  assert.equal(cleared.upload_block, null);
+  assert.equal(cleared.needs_operator, false);
+  assert.equal(cleared.finalize_pending, true);
+  assert.equal(cleared.next_sequence, 3);
+  assert.equal(cleared.finalize_persisted_at, stopped.finalize_persisted_at);
+  assert.deepEqual(cleared.finalize_payload, stopped.finalize_payload);
+  assert.equal(cleared.recorder_state, "stopped");
+
+  const conflict = notePermanentFailure(stopped, "sequence_conflict");
+  const stillConflict = clearUnauthorizedUploadBlock(conflict, 9_000);
+  assert.equal(stillConflict, conflict);
+  assert.equal(stillConflict.upload_block, "sequence_conflict");
+  assert.equal(stillConflict.needs_operator, true);
+
+  const lost = notePermanentFailure(
+    persistRecorderLost({ ...emptyMeta("S-lost", 0), next_sequence: 2, last_chunk_end_ms: 1000 }, 2_000),
+    "unauthorized",
+  );
+  const clearedLost = clearUnauthorizedUploadBlock(lost, 9_000);
+  assert.equal(clearedLost.recorder_state, "lost");
+  assert.equal(clearedLost.needs_operator, true);
+  assert.equal(clearedLost.upload_block, null);
+  assert.equal(clearedLost.finalize_payload?.reason, "recorder_lost");
+  assert.equal(clearedLost.finalize_persisted_at, lost.finalize_persisted_at);
+  assert.equal(clearedLost.next_sequence, lost.next_sequence);
+  assert.notEqual(closeBanner(clearedLost, 0).kind, "safe");
+});
+
+test("unauthorized chunks retry and other terminal chunks stay put", () => {
+  const unauthorized = {
+    terminal: true,
+    terminal_reason: "unauthorized" as const,
+    next_attempt_at: Number.MAX_SAFE_INTEGER,
+    sequence: 1,
+  };
+  const opened = clearUnauthorizedChunk(unauthorized, 50);
+  assert.equal(opened.terminal, false);
+  assert.equal(opened.next_attempt_at, 50);
+  assert.equal(opened.sequence, 1);
+
+  const conflict = {
+    terminal: true,
+    terminal_reason: "sequence_conflict" as const,
+    next_attempt_at: Number.MAX_SAFE_INTEGER,
+    sequence: 0,
+  };
+  assert.equal(clearUnauthorizedChunk(conflict, 50), conflict);
+});
+
+test("upload code entry is the unfinished take, including finalize with no chunks", () => {
+  assert.equal(showUploadCodeEntry(null, 0), false);
+  const pendingFinalize = persistStop(emptyMeta("S-fin", 0), 1_000);
+  assert.equal(pendingFinalize.finalize_pending, true);
+  assert.equal(showUploadCodeEntry(pendingFinalize, 0), true);
+  const complete = applyServerStatus(
+    pendingFinalize,
+    { finalize_state: "complete", recording_state: "complete", received_sequences: [] },
+    2_000,
+  );
+  assert.equal(showUploadCodeEntry(complete, 0), false);
+  assert.equal(closeBanner(pendingFinalize, 0).kind === "safe", false);
+  assert.equal(closeBanner(complete, 0).kind, "safe");
+  const lost = persistRecorderLost(emptyMeta("S-lost", 0), 1_000);
+  assert.equal(showUploadCodeEntry(lost, 0), true);
+  assert.equal(closeBanner(lost, 0).kind, "interrupted");
 });

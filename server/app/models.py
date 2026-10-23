@@ -149,6 +149,11 @@ AUDIT_TOKEN_ISSUED = "token_issued"
 AUDIT_TOKEN_REVOKED = "token_revoked"
 AUDIT_SESSION_PAUSED = "session_paused"
 AUDIT_CONNECTION_TAKEOVER = "connection_takeover"
+AUDIT_UPLOAD_CODE_ISSUED = "upload_code_issued"
+AUDIT_UPLOAD_TOKEN_ISSUED = "upload_token_issued"
+
+#: Plaintext upload codes live for ten minutes. Only the SHA-256 digest is stored.
+UPLOAD_CODE_TTL_SECONDS = 10 * 60
 
 
 class Base(DeclarativeBase):
@@ -205,6 +210,48 @@ class JoinCode(Base):
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     session: Mapped[Session] = relationship(back_populates="join_codes")
+
+
+class UploadGrant(Base):
+    """Session-level upload credential state.
+
+    One row per session. ``security_revoked_at`` is set in the same transaction
+    as a security revocation and is checked when an upload code is issued,
+    redeemed, or used. ``POST /sessions/{id}/end`` does not set it, so grace
+    uploads keep working.
+    """
+
+    __tablename__ = "upload_grants"
+
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id"), primary_key=True)
+    security_revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class UploadCode(Base):
+    """One-time upload code. The raw code is returned once and never stored."""
+
+    __tablename__ = "upload_codes"
+    __table_args__ = (UniqueConstraint("code_hash", name="uq_upload_codes_code_hash"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id"), index=True)
+    code_hash: Mapped[str] = mapped_column(String, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class UploadCodeInvalid(Exception):
+    """The code does not exist for this session."""
+
+
+class UploadCodeExpired(Exception):
+    """The code's ten-minute lifetime has elapsed. It is left unconsumed."""
+
+
+class UploadCodeConsumed(Exception):
+    """The code was already redeemed or withdrawn by a later reissue."""
 
 
 class Event(Base):
@@ -517,6 +564,112 @@ def consume_join_code(
     else:
         db.flush()
     return join_code
+
+
+def upload_security_revoked(db: DBSession, session_id: str) -> bool:
+    """True when this session's upload grant was closed for security."""
+    grant = db.get(UploadGrant, session_id)
+    return grant is not None and grant.security_revoked_at is not None
+
+
+def ensure_upload_grant(db: DBSession, session_id: str) -> UploadGrant:
+    """Return the session's upload grant, creating it if this is the first code."""
+    _require_session(db, session_id)
+    grant = db.get(UploadGrant, session_id)
+    if grant is None:
+        grant = UploadGrant(session_id=session_id)
+        db.add(grant)
+        db.flush()
+    return grant
+
+
+def mark_upload_grant_security_revoked(
+    db: DBSession, session_id: str, *, commit: bool = False
+) -> UploadGrant | None:
+    """Latch ``security_revoked_at`` for a security revocation of this session.
+
+    No row is written when the session itself is already gone. ``/end`` does
+    not call this.
+    """
+    if get_session(db, session_id) is None:
+        return None
+    grant = db.get(UploadGrant, session_id)
+    if grant is None:
+        grant = UploadGrant(session_id=session_id, security_revoked_at=_utcnow())
+        db.add(grant)
+    elif grant.security_revoked_at is None:
+        grant.security_revoked_at = _utcnow()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
+    return grant
+
+
+def issue_upload_code(db: DBSession, session_id: str, *, expires_at: datetime) -> str:
+    """Mint one upload code and withdraw every older unused code for the session.
+
+    The raw code is returned to the caller. The database stores only its hash.
+    The caller commits.
+    """
+    ensure_upload_grant(db, session_id)
+    withdrawn_at = _utcnow()
+    db.execute(
+        update(UploadCode)
+        .where(UploadCode.session_id == session_id)
+        .where(UploadCode.consumed_at.is_(None))
+        .values(consumed_at=withdrawn_at)
+    )
+    raw_code = secrets.token_urlsafe(24)
+    db.add(
+        UploadCode(
+            session_id=session_id,
+            code_hash=hash_join_code(raw_code),
+            expires_at=expires_at,
+        )
+    )
+    db.flush()
+    return raw_code
+
+
+def consume_upload_code(db: DBSession, session_id: str, code: str, *, now: datetime) -> UploadCode:
+    """Redeem one code for this session. A second concurrent redeem loses.
+
+    Lookup is scoped to ``session_id``, so a code for another session is
+    ``UploadCodeInvalid`` and is not consumed. An expired code is not consumed.
+    """
+    code_hash = hash_join_code(code)
+    upload_code = db.scalars(
+        select(UploadCode)
+        .where(UploadCode.session_id == session_id)
+        .where(UploadCode.code_hash == code_hash)
+        .limit(1)
+    ).first()
+    if upload_code is None:
+        raise UploadCodeInvalid("invalid upload code")
+    expires_at = upload_code.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    else:
+        expires_at = expires_at.astimezone(timezone.utc)
+    current = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    if current >= expires_at:
+        raise UploadCodeExpired("upload code expired")
+    if upload_code.consumed_at is not None:
+        raise UploadCodeConsumed("upload code already consumed")
+    consumed_at = _utcnow()
+    result = db.execute(
+        update(UploadCode)
+        .where(UploadCode.id == upload_code.id)
+        .where(UploadCode.consumed_at.is_(None))
+        .values(consumed_at=consumed_at)
+    )
+    if result.rowcount != 1:
+        db.rollback()
+        raise UploadCodeConsumed("upload code already consumed")
+    upload_code.consumed_at = consumed_at
+    db.flush()
+    return upload_code
 
 
 def start_session(
@@ -1010,7 +1163,13 @@ def revoke_token_hash(
     actor_role: str = "server",
     commit: bool = True,
 ) -> AuditLog:
-    """Revoke a single token digest, e.g. after a leak (ADR-0005 §1)."""
+    """Revoke a single token digest, e.g. after a leak (ADR-0005 §1).
+
+    A security reason also latches ``upload_grants.security_revoked_at`` in
+    this same transaction, so a later upload code or token cannot bypass it.
+    """
+    if reason == REVOKE_REASON_SECURITY:
+        mark_upload_grant_security_revoked(db, session_id, commit=False)
     entry = record_audit(
         db,
         action=AUDIT_TOKEN_REVOKED,
@@ -1018,9 +1177,10 @@ def revoke_token_hash(
         session_id=session_id,
         token_hash=token_hash,
         details={"reason": reason},
-        commit=commit,
+        commit=False,
     )
     if commit:
+        db.commit()
         # Close reason is the wire code, not the audit detail ("security").
         _notify_revocation(session_id, token_hash, "token_revoked")
     return entry
