@@ -113,11 +113,13 @@ let uploadedCount = 0;
 let failedCount = 0;
 let errorMessage: string | null = null;
 /**
- * Why `errorMessage` is set. A later chunk ACK may clear only the transient
- * failure for that same sequence. Conflict, storage, recorder, lost, and
- * finalize failures stay until their own path replaces them.
+ * Why `errorMessage` is set. Transient chunk failures are remembered per
+ * sequence. Confirming the one on screen leaves any other transient failure
+ * visible. A held failure (conflict, storage, recorder, lost, finalize) is
+ * not cleared by a chunk status read.
  */
 let shownError: { kind: "chunk"; sequence: number } | { kind: "held" } | null = null;
+const transientChunkErrors = new Map<number, string>();
 let warning: string | null = null;
 let canStart = true;
 let retryable = false;
@@ -254,6 +256,7 @@ function ensurePump(sessionId: string): void {
 }
 
 function rememberChunkFailure(sequence: number, message: string): void {
+  transientChunkErrors.set(sequence, message);
   errorMessage = message;
   shownError = { kind: "chunk", sequence };
 }
@@ -266,13 +269,41 @@ function rememberHeldFailure(message: string): void {
 function forgetError(): void {
   errorMessage = null;
   shownError = null;
+  transientChunkErrors.clear();
 }
 
-/** Drop a transient chunk message after that same slice is confirmed stored. */
-function forgetRecoveredChunkFailure(sequence: number): void {
-  if (shownError?.kind === "chunk" && shownError.sequence === sequence) {
-    forgetError();
+/**
+ * After a status read, drop transient messages whose slice is confirmed and
+ * no longer queued. If another transient failure is still queued, show that
+ * one. A missing listing does not clear, even when the local failed count is 0.
+ */
+function syncTransientChunkError(received: readonly number[], localChunks: readonly PersistedChunk[]): void {
+  if (shownError == null || shownError.kind !== "chunk") {
+    return;
   }
+  const queued = new Set(localChunks.map((chunk) => chunk.sequence));
+  for (const sequence of [...transientChunkErrors.keys()]) {
+    if (!queued.has(sequence) && received.includes(sequence)) {
+      transientChunkErrors.delete(sequence);
+    }
+  }
+  if (transientChunkErrors.has(shownError.sequence)) {
+    return;
+  }
+  const waiting = localChunks.filter((chunk) => chunk.attempts > 0 && !chunk.terminal);
+  if (waiting.length > 0) {
+    const next = waiting.find((chunk) => transientChunkErrors.has(chunk.sequence)) ?? waiting[0];
+    const stored = transientChunkErrors.get(next.sequence);
+    const message = stored ?? `尚有 ${waiting.length} 段等待重試`;
+    if (stored == null) {
+      transientChunkErrors.set(next.sequence, message);
+    }
+    errorMessage = message;
+    shownError = { kind: "chunk", sequence: next.sequence };
+    return;
+  }
+  errorMessage = null;
+  shownError = null;
 }
 
 function notePumpFailure(cause: unknown): void {
@@ -624,10 +655,10 @@ async function uploadNextChunk(sessionId: string): Promise<void> {
     await deleteChunk(database, sessionId, next.sequence);
     uploadedCount += 1;
     chunkUploaded?.(next.sequence, next.end_ms);
-    let serverConfirmed = false;
+    let received: number[] | null = null;
     try {
       const serverStatus = await transport.fetchUploadStatus(sessionId);
-      serverConfirmed = serverStatus.received_sequences.includes(next.sequence);
+      received = serverStatus.received_sequences;
       const updated = await updateMeta(database, sessionId, (latest) =>
         applyServerStatus(latest, serverStatus, Date.now()),
       );
@@ -637,8 +668,8 @@ async function uploadNextChunk(sessionId: string): Promise<void> {
     } catch {
       // The blob is gone locally. The next finalize or status read will catch up.
     }
-    if (serverConfirmed) {
-      forgetRecoveredChunkFailure(next.sequence);
+    if (received) {
+      syncTransientChunkError(received, await listChunks(database, sessionId));
     }
   } catch (cause) {
     const block = cause instanceof ApiError ? permanentUploadBlock(cause.status, cause.code) : null;

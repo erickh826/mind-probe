@@ -984,3 +984,128 @@ test("a successful upload does not clear a finalize error", async () => {
   assert.deepEqual(after?.finalize_payload, during?.finalize_payload);
   assert.equal(after?.recorder_state, "stopped");
 });
+
+test("a confirmed chunk keeps another transient failure visible", async () => {
+  await resetRecordingControllerForTests();
+  const sessionId = "S-r4a";
+  await seed(sessionId, { ...emptyMeta(sessionId, 1_000), next_sequence: 2, last_chunk_end_ms: 2_000 });
+  await seedChunk(sessionId, 0, "first");
+  await seedChunk(sessionId, 1, "second");
+  const acked = new Set<number>();
+  const attempts = new Map<number, number>();
+  let finalized = false;
+  setRecordingTransport({
+    uploadRecordingChunk: async (_sessionId, sequence) => {
+      const seen = (attempts.get(sequence) ?? 0) + 1;
+      attempts.set(sequence, seen);
+      if (seen === 1) {
+        throw new TypeError("Failed to fetch");
+      }
+      acked.add(sequence);
+      return { status: "received" };
+    },
+    fetchUploadStatus: async () => liveStatus([...acked]),
+    finalizeRecording: async () => {
+      finalized = true;
+      throw new Error("finalize must not run");
+    },
+  });
+
+  await pumpSession(sessionId);
+  assert.equal(recordingView().error, "片段 0 上傳失敗：TypeError: Failed to fetch");
+  await pumpSession(sessionId);
+  assert.equal(recordingView().error, "片段 1 上傳失敗：TypeError: Failed to fetch");
+
+  const database = await openRecordingDb();
+  const parked = await listChunks(database, sessionId);
+  const chunk0 = parked.find((chunk) => chunk.sequence === 0);
+  const chunk1 = parked.find((chunk) => chunk.sequence === 1);
+  if (!chunk0 || !chunk1) {
+    throw new Error("both failed slices should still be queued");
+  }
+  await writeChunk(database, { ...chunk1, next_attempt_at: 0 });
+  await writeChunk(database, { ...chunk0, next_attempt_at: Date.now() + 60_000 });
+  database.close();
+
+  await pumpSession(sessionId);
+  const during = recordingView();
+  assert.equal(during.uploadedCount, 1);
+  assert.equal(during.failedCount, 1);
+  assert.equal(during.pendingCount, 1);
+  assert.equal(during.error, "片段 0 上傳失敗：TypeError: Failed to fetch");
+  assert.equal(finalized, false);
+  const mid = await load(sessionId);
+  assert.equal(mid?.next_sequence, 2);
+  assert.equal(mid?.finalize_payload, null);
+  assert.equal(mid?.finalize_persisted_at, null);
+  assert.equal(mid?.recorder_state, "recording");
+
+  await releaseChunk(sessionId, 0);
+  await pumpSession(sessionId);
+  const after = recordingView();
+  assert.equal(after.uploadedCount, 2);
+  assert.equal(after.failedCount, 0);
+  assert.equal(after.pendingCount, 0);
+  assert.equal(after.error, null);
+  assert.equal(finalized, false);
+  const meta = await load(sessionId);
+  assert.equal(meta?.next_sequence, 2);
+  assert.equal(meta?.finalize_payload, null);
+  assert.equal(meta?.finalize_persisted_at, null);
+});
+
+test("a later status listing an acked slice clears that transient failure", async () => {
+  await resetRecordingControllerForTests();
+  const sessionId = "S-r4b";
+  await seed(sessionId, { ...emptyMeta(sessionId, 1_000), next_sequence: 2, last_chunk_end_ms: 2_000 });
+  await seedChunk(sessionId, 0, "first");
+  await seedChunk(sessionId, 1, "second", Date.now() + 60_000);
+  let uploads = 0;
+  let statusReads = 0;
+  let finalized = false;
+  setRecordingTransport({
+    uploadRecordingChunk: async () => {
+      uploads += 1;
+      if (uploads === 1) {
+        throw new TypeError("Failed to fetch");
+      }
+      return { status: "received" };
+    },
+    fetchUploadStatus: async () => {
+      statusReads += 1;
+      if (statusReads === 1) {
+        throw new TypeError("Failed to fetch");
+      }
+      return liveStatus([0, 1]);
+    },
+    finalizeRecording: async () => {
+      finalized = true;
+      throw new Error("finalize must not run");
+    },
+  });
+
+  await pumpSession(sessionId);
+  assert.equal(recordingView().error, "片段 0 上傳失敗：TypeError: Failed to fetch");
+  await releaseChunk(sessionId, 0);
+  await pumpSession(sessionId);
+  assert.equal(recordingView().uploadedCount, 1);
+  assert.equal(recordingView().error, "片段 0 上傳失敗：TypeError: Failed to fetch");
+  const mid = await load(sessionId);
+  assert.equal(mid?.next_sequence, 2);
+  assert.equal(mid?.finalize_payload, null);
+  assert.equal(mid?.finalize_persisted_at, null);
+
+  await releaseChunk(sessionId, 1);
+  await pumpSession(sessionId);
+  const after = recordingView();
+  assert.equal(after.uploadedCount, 2);
+  assert.equal(after.failedCount, 0);
+  assert.equal(after.pendingCount, 0);
+  assert.equal(after.error, null);
+  assert.equal(finalized, false);
+  const meta = await load(sessionId);
+  assert.equal(meta?.next_sequence, 2);
+  assert.equal(meta?.finalize_payload, null);
+  assert.equal(meta?.finalize_persisted_at, null);
+  assert.equal(meta?.recorder_state, "recording");
+});
