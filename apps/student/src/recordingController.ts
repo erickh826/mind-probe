@@ -112,6 +112,12 @@ let pendingCount = 0;
 let uploadedCount = 0;
 let failedCount = 0;
 let errorMessage: string | null = null;
+/**
+ * Why `errorMessage` is set. A later chunk ACK may clear only the transient
+ * failure for that same sequence. Conflict, storage, recorder, lost, and
+ * finalize failures stay until their own path replaces them.
+ */
+let shownError: { kind: "chunk"; sequence: number } | { kind: "held" } | null = null;
 let warning: string | null = null;
 let canStart = true;
 let retryable = false;
@@ -247,8 +253,30 @@ function ensurePump(sessionId: string): void {
   tick();
 }
 
+function rememberChunkFailure(sequence: number, message: string): void {
+  errorMessage = message;
+  shownError = { kind: "chunk", sequence };
+}
+
+function rememberHeldFailure(message: string): void {
+  errorMessage = message;
+  shownError = { kind: "held" };
+}
+
+function forgetError(): void {
+  errorMessage = null;
+  shownError = null;
+}
+
+/** Drop a transient chunk message after that same slice is confirmed stored. */
+function forgetRecoveredChunkFailure(sequence: number): void {
+  if (shownError?.kind === "chunk" && shownError.sequence === sequence) {
+    forgetError();
+  }
+}
+
 function notePumpFailure(cause: unknown): void {
-  errorMessage = `上傳佇列中斷：${cause instanceof Error ? cause.message : String(cause)}`;
+  rememberHeldFailure(`上傳佇列中斷：${cause instanceof Error ? cause.message : String(cause)}`);
 }
 
 async function refreshPending(sessionId: string): Promise<PersistedChunk[]> {
@@ -290,7 +318,7 @@ async function reconcile(sessionId: string, now: number): Promise<void> {
     );
     current = updated ?? current;
   } catch (cause) {
-    errorMessage = `無法讀取上傳狀態：${cause instanceof Error ? cause.message : String(cause)}`;
+    rememberHeldFailure(`無法讀取上傳狀態：${cause instanceof Error ? cause.message : String(cause)}`);
     const updated = await updateMeta(database, sessionId, (latest) =>
       mergeReload(latest, null, now, recorderStillHere),
     );
@@ -342,7 +370,7 @@ export async function resumeUnauthorizedUploads(
   );
   if (updated && boundSession === sessionId) {
     meta = updated;
-    errorMessage = null;
+    forgetError();
     await refreshPending(sessionId);
     emit();
   }
@@ -359,7 +387,7 @@ export async function bindSession(sessionId: string): Promise<void> {
     uploadedCount = 0;
     failedCount = 0;
     pendingCount = 0;
-    errorMessage = null;
+    forgetError();
     chunkTask = null;
     finalizeTask = null;
   }
@@ -371,7 +399,7 @@ export async function bindSession(sessionId: string): Promise<void> {
     await refreshPending(sessionId);
     ensurePump(sessionId);
   } catch (cause) {
-    errorMessage = `錄影佇列無法開啟：${cause instanceof Error ? cause.message : String(cause)}`;
+    rememberHeldFailure(`錄影佇列無法開啟：${cause instanceof Error ? cause.message : String(cause)}`);
     status = "error";
   }
   emit();
@@ -436,12 +464,12 @@ function attachRecorder(sessionId: string, recorder: MediaRecorder, stream: Medi
         // The chain stays usable for a later slice, but the take is already
         // marked lost. A normal stop must not advertise the missing slice.
         chunkPersistLost = true;
-        errorMessage = `無法保存錄影片段：${String(cause)}`;
+        rememberHeldFailure(`無法保存錄影片段：${String(cause)}`);
         emit();
       });
   };
   recorder.onerror = () => {
-    errorMessage = "MediaRecorder error.";
+    rememberHeldFailure("MediaRecorder error.");
     status = "error";
     emit();
   };
@@ -469,12 +497,12 @@ export async function startRecording(sessionId: string): Promise<void> {
   }
   if (typeof MediaRecorder === "undefined" || !navigator.mediaDevices?.getUserMedia) {
     status = "unavailable";
-    errorMessage = "MediaRecorder is not available in this browser.";
+    rememberHeldFailure("MediaRecorder is not available in this browser.");
     emit();
     return;
   }
   status = "requesting";
-  errorMessage = null;
+  forgetError();
   retryable = false;
   emit();
   let stream: MediaStream | null = null;
@@ -501,7 +529,7 @@ export async function startRecording(sessionId: string): Promise<void> {
   } catch (cause) {
     stream?.getTracks().forEach((track) => track.stop());
     const described = describeMediaError(cause);
-    errorMessage = described.message;
+    rememberHeldFailure(described.message);
     retryable = described.retryable;
     status = "error";
   }
@@ -596,8 +624,10 @@ async function uploadNextChunk(sessionId: string): Promise<void> {
     await deleteChunk(database, sessionId, next.sequence);
     uploadedCount += 1;
     chunkUploaded?.(next.sequence, next.end_ms);
+    let serverConfirmed = false;
     try {
       const serverStatus = await transport.fetchUploadStatus(sessionId);
+      serverConfirmed = serverStatus.received_sequences.includes(next.sequence);
       const updated = await updateMeta(database, sessionId, (latest) =>
         applyServerStatus(latest, serverStatus, Date.now()),
       );
@@ -606,6 +636,9 @@ async function uploadNextChunk(sessionId: string): Promise<void> {
       }
     } catch {
       // The blob is gone locally. The next finalize or status read will catch up.
+    }
+    if (serverConfirmed) {
+      forgetRecoveredChunkFailure(next.sequence);
     }
   } catch (cause) {
     const block = cause instanceof ApiError ? permanentUploadBlock(cause.status, cause.code) : null;
@@ -623,7 +656,7 @@ async function uploadNextChunk(sessionId: string): Promise<void> {
       if (updated) {
         meta = updated;
       }
-      errorMessage = permanentBlockMessage(block);
+      rememberHeldFailure(permanentBlockMessage(block));
     } else {
       const attempts = next.attempts + 1;
       await writeChunk(database, {
@@ -634,10 +667,12 @@ async function uploadNextChunk(sessionId: string): Promise<void> {
       failedCount = (await listChunks(database, sessionId)).filter(
         (chunk) => chunk.attempts > 0 && !chunk.terminal,
       ).length;
-      errorMessage =
+      rememberChunkFailure(
+        next.sequence,
         cause instanceof ApiError
           ? `片段 ${next.sequence} 上傳失敗：${cause.message}`
-          : `片段 ${next.sequence} 上傳失敗：${String(cause)}`;
+          : `片段 ${next.sequence} 上傳失敗：${String(cause)}`,
+      );
     }
   } finally {
     inFlight.delete(next.sequence);
@@ -680,7 +715,7 @@ async function sendFinalizeIfDue(sessionId: string): Promise<void> {
     if (updated) {
       meta = updated;
     }
-    errorMessage = null;
+    forgetError();
   } catch (cause) {
     const block = cause instanceof ApiError ? permanentUploadBlock(cause.status, cause.code) : null;
     // Chunk retries must not move finalize_persisted_at. Only the attempt clock moves.
@@ -696,9 +731,11 @@ async function sendFinalizeIfDue(sessionId: string): Promise<void> {
     if (updated) {
       meta = updated;
     }
-    errorMessage = block
-      ? permanentBlockMessage(block)
-      : `結束標記送出失敗：${cause instanceof Error ? cause.message : String(cause)}`;
+    rememberHeldFailure(
+      block
+        ? permanentBlockMessage(block)
+        : `結束標記送出失敗：${cause instanceof Error ? cause.message : String(cause)}`,
+    );
   }
 }
 
@@ -761,7 +798,7 @@ export function handleRecorderStop(sessionId: string, stream: MediaStream | null
     .then(() => commitRecorderStop(sessionId))
     .then(() => undefined)
     .catch((cause: unknown) => {
-      errorMessage = `無法保存結束標記：${String(cause)}`;
+      rememberHeldFailure(`無法保存結束標記：${String(cause)}`);
     })
     .finally(() => {
       emit();
@@ -830,7 +867,7 @@ export async function resetRecordingControllerForTests(
   pendingCount = 0;
   uploadedCount = 0;
   failedCount = 0;
-  errorMessage = null;
+  forgetError();
   warning = null;
   canStart = true;
   retryable = false;

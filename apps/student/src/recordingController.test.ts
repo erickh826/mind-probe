@@ -23,9 +23,11 @@ import { listChunks, openRecordingDb, readMeta, writeChunk, writeMeta } from "./
 import {
   emptyMeta,
   notePermanentFailure,
+  permanentBlockMessage,
   persistRecorderLost,
   persistStop,
   type RecordingMeta,
+  type ServerUploadStatus,
 } from "./uploadQueue.ts";
 
 afterEach(async () => {
@@ -55,6 +57,51 @@ async function seed(sessionId: string, meta: RecordingMeta): Promise<void> {
   } finally {
     database.close();
   }
+}
+
+async function seedChunk(
+  sessionId: string,
+  sequence: number,
+  text: string,
+  nextAttemptAt = 0,
+): Promise<void> {
+  const database = await openRecordingDb();
+  try {
+    await writeChunk(database, {
+      session_id: sessionId,
+      sequence,
+      start_ms: sequence * 1_000,
+      end_ms: sequence * 1_000 + 1_000,
+      checksum: `sum-${text}`,
+      blob: blob(text),
+      attempts: 0,
+      next_attempt_at: nextAttemptAt,
+    });
+  } finally {
+    database.close();
+  }
+}
+
+async function releaseChunk(sessionId: string, sequence: number): Promise<void> {
+  const database = await openRecordingDb();
+  try {
+    const chunks = await listChunks(database, sessionId);
+    const chunk = chunks.find((item) => item.sequence === sequence);
+    if (!chunk) {
+      throw new Error(`missing chunk ${sequence}`);
+    }
+    await writeChunk(database, { ...chunk, next_attempt_at: 0 });
+  } finally {
+    database.close();
+  }
+}
+
+function liveStatus(received: number[], finalize: ServerUploadStatus["finalize_state"] = "none"): ServerUploadStatus {
+  return {
+    received_sequences: received,
+    finalize_state: finalize,
+    recording_state: "recording",
+  };
 }
 
 async function load(sessionId: string): Promise<RecordingMeta | null> {
@@ -628,4 +675,312 @@ test("upload-login reopens only unauthorized chunks and leaves conflict and lost
   assert.equal(kept?.finalize_payload?.reason, "recorder_lost");
   assert.equal(kept?.finalize_persisted_at, lost.finalize_persisted_at);
   assert.equal(kept?.next_sequence, lost.next_sequence);
+});
+
+test("a recovered chunk upload clears that transient failure while recording continues", async () => {
+  await resetRecordingControllerForTests();
+  const sessionId = "S-retry-clear";
+  await seed(sessionId, { ...emptyMeta(sessionId, 1_000), next_sequence: 1, last_chunk_end_ms: 1_000 });
+  await seedChunk(sessionId, 0, "slice");
+
+  const uploadedSequences: number[] = [];
+  let finalized = false;
+  setRecordingTransport({
+    uploadRecordingChunk: async (_sessionId, sequence) => {
+      uploadedSequences.push(sequence);
+      if (uploadedSequences.length === 1) {
+        throw new TypeError("Failed to fetch");
+      }
+      return { status: "received" };
+    },
+    fetchUploadStatus: async () => liveStatus([0]),
+    finalizeRecording: async () => {
+      finalized = true;
+      throw new Error("finalize must not run");
+    },
+  });
+
+  await pumpSession(sessionId);
+  assert.equal(recordingView().error, "片段 0 上傳失敗：TypeError: Failed to fetch");
+  assert.equal(recordingView().uploadedCount, 0);
+  assert.equal(recordingView().failedCount, 1);
+  assert.equal(recordingView().pendingCount, 1);
+
+  await releaseChunk(sessionId, 0);
+  await pumpSession(sessionId);
+
+  const view = recordingView();
+  assert.deepEqual(uploadedSequences, [0, 0]);
+  assert.equal(view.uploadedCount, 1);
+  assert.equal(view.failedCount, 0);
+  assert.equal(view.pendingCount, 0);
+  assert.equal(view.error, null);
+  assert.equal(view.status === "stopped" || view.status === "stopping", false);
+  assert.equal(finalized, false);
+
+  const meta = await load(sessionId);
+  assert.equal(meta?.recorder_state, "recording");
+  assert.equal(meta?.next_sequence, 1);
+  assert.equal(meta?.finalize_payload, null);
+  assert.equal(meta?.finalize_persisted_at, null);
+  assert.equal(meta?.finalize_pending, false);
+  const database = await openRecordingDb();
+  const remaining = await listChunks(database, sessionId);
+  database.close();
+  assert.equal(remaining.length, 0);
+});
+
+test("a retry the server has not confirmed keeps the transient failure", async () => {
+  await resetRecordingControllerForTests();
+  const sessionId = "S-unconfirmed";
+  await seed(sessionId, { ...emptyMeta(sessionId, 1_000), next_sequence: 1, last_chunk_end_ms: 1_000 });
+  await seedChunk(sessionId, 0, "slice");
+  let uploads = 0;
+  setRecordingTransport({
+    uploadRecordingChunk: async () => {
+      uploads += 1;
+      if (uploads === 1) {
+        throw new TypeError("Failed to fetch");
+      }
+      return { status: "received" };
+    },
+    fetchUploadStatus: async () => liveStatus([]),
+    finalizeRecording: async () => {
+      throw new Error("finalize must not run");
+    },
+  });
+
+  await pumpSession(sessionId);
+  await releaseChunk(sessionId, 0);
+  await pumpSession(sessionId);
+
+  const view = recordingView();
+  assert.equal(view.uploadedCount, 1);
+  assert.equal(view.failedCount, 0);
+  assert.equal(view.pendingCount, 0);
+  assert.equal(view.error, "片段 0 上傳失敗：TypeError: Failed to fetch");
+  const meta = await load(sessionId);
+  assert.equal(meta?.next_sequence, 1);
+  assert.equal(meta?.finalize_payload, null);
+  assert.equal(meta?.finalize_persisted_at, null);
+});
+
+test("a successful upload does not clear a different chunk's transient failure", async () => {
+  await resetRecordingControllerForTests();
+  const sessionId = "S-other-chunk";
+  await seed(sessionId, { ...emptyMeta(sessionId, 1_000), next_sequence: 2, last_chunk_end_ms: 2_000 });
+  await seedChunk(sessionId, 0, "first");
+  await seedChunk(sessionId, 1, "second");
+  const uploadedSequences: number[] = [];
+  setRecordingTransport({
+    uploadRecordingChunk: async (_sessionId, sequence) => {
+      uploadedSequences.push(sequence);
+      if (sequence === 0) {
+        throw new TypeError("Failed to fetch");
+      }
+      return { status: "received" };
+    },
+    fetchUploadStatus: async () => liveStatus([1]),
+    finalizeRecording: async () => {
+      throw new Error("finalize must not run");
+    },
+  });
+
+  await pumpSession(sessionId);
+  assert.equal(recordingView().error, "片段 0 上傳失敗：TypeError: Failed to fetch");
+  await pumpSession(sessionId);
+
+  const view = recordingView();
+  assert.deepEqual(uploadedSequences, [0, 1]);
+  assert.equal(view.uploadedCount, 1);
+  assert.equal(view.failedCount, 1);
+  assert.equal(view.pendingCount, 1);
+  assert.equal(view.error, "片段 0 上傳失敗：TypeError: Failed to fetch");
+  const meta = await load(sessionId);
+  assert.equal(meta?.next_sequence, 2);
+  assert.equal(meta?.finalize_payload, null);
+  assert.equal(meta?.finalize_persisted_at, null);
+  assert.equal(meta?.recorder_state, "recording");
+});
+
+test("a successful upload does not clear a permanent sequence conflict", async () => {
+  await resetRecordingControllerForTests();
+  const sessionId = "S-keep-conflict";
+  await seed(sessionId, { ...emptyMeta(sessionId, 1_000), next_sequence: 2, last_chunk_end_ms: 2_000 });
+  await seedChunk(sessionId, 0, "conflict");
+  await seedChunk(sessionId, 1, "later");
+  setRecordingTransport({
+    uploadRecordingChunk: async (_sessionId, sequence) => {
+      if (sequence === 0) {
+        throw new ApiError(409, "conflict", "sequence_conflict");
+      }
+      return { status: "received" };
+    },
+    fetchUploadStatus: async () => liveStatus([1]),
+    finalizeRecording: async () => {
+      throw new Error("finalize must not run");
+    },
+  });
+
+  await pumpSession(sessionId);
+  await pumpSession(sessionId);
+
+  const view = recordingView();
+  assert.equal(view.error, permanentBlockMessage("sequence_conflict"));
+  assert.equal(view.uploadedCount, 1);
+  assert.equal(view.banner.kind, "needs_operator");
+  const meta = await load(sessionId);
+  assert.equal(meta?.needs_operator, true);
+  assert.equal(meta?.upload_block, "sequence_conflict");
+  assert.equal(meta?.next_sequence, 2);
+  assert.equal(meta?.finalize_payload, null);
+  assert.equal(meta?.finalize_persisted_at, null);
+  const database = await openRecordingDb();
+  const chunks = await listChunks(database, sessionId);
+  database.close();
+  const conflict = chunks.find((chunk) => chunk.sequence === 0);
+  assert.equal(conflict?.terminal, true);
+  assert.equal(conflict?.terminal_reason, "sequence_conflict");
+  assert.equal(chunks.some((chunk) => chunk.sequence === 1), false);
+});
+
+test("a successful upload does not clear a storage failure or recorder_lost", async () => {
+  await resetRecordingControllerForTests();
+  const sessionId = "S-keep-storage";
+  await seed(sessionId, emptyMeta(sessionId, 1));
+  await persistBlob(sessionId, blob("kept"));
+
+  const restorePuts = failChunkStorePuts(-1);
+  try {
+    const recorder = {
+      state: "recording",
+      ondataavailable: null as ((event: { data: Blob }) => void) | null,
+      onstop: null as (() => void) | null,
+      onerror: null as (() => void) | null,
+      stop() {
+        this.state = "inactive";
+      },
+    };
+    attachRecorderForTests(sessionId, recorder as unknown as MediaRecorder);
+    recorder.ondataavailable?.({ data: blob("lost") });
+    for (let attempt = 0; attempt < 20 && !recordingView().error; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  } finally {
+    restorePuts();
+  }
+
+  const storageError = recordingView().error ?? "";
+  assert.match(storageError, /^無法保存錄影片段：/);
+  const lost = await load(sessionId);
+  assert.equal(lost?.recorder_state, "lost");
+  assert.equal(lost?.needs_operator, true);
+  assert.equal(lost?.finalize_payload?.reason, "recorder_lost");
+  assert.equal(lost?.next_sequence, 1);
+  await seed(sessionId, { ...lost!, finalize_next_attempt_at: Number.MAX_SAFE_INTEGER });
+
+  let finalized = false;
+  setRecordingTransport({
+    uploadRecordingChunk: async () => ({ status: "received" }),
+    fetchUploadStatus: async () => liveStatus([0], "pending"),
+    finalizeRecording: async () => {
+      finalized = true;
+      throw new Error("finalize must not run");
+    },
+  });
+  await pumpSession(sessionId);
+
+  assert.equal(finalized, false);
+  assert.equal(recordingView().error, storageError);
+  assert.equal(recordingView().banner.kind, "interrupted");
+  assert.equal(recordingView().uploadedCount, 1);
+  const after = await load(sessionId);
+  assert.equal(after?.recorder_state, "lost");
+  assert.equal(after?.needs_operator, true);
+  assert.equal(after?.next_sequence, lost?.next_sequence);
+  assert.equal(after?.finalize_persisted_at, lost?.finalize_persisted_at);
+  assert.deepEqual(after?.finalize_payload, lost?.finalize_payload);
+});
+
+test("a successful upload does not clear a recorder failure", async () => {
+  await resetRecordingControllerForTests();
+  const sessionId = "S-keep-recorder";
+  await seed(sessionId, { ...emptyMeta(sessionId, 1_000), next_sequence: 1, last_chunk_end_ms: 1_000 });
+  await seedChunk(sessionId, 0, "kept");
+  const recorder = {
+    state: "recording",
+    ondataavailable: null as ((event: { data: Blob }) => void) | null,
+    onstop: null as (() => void) | null,
+    onerror: null as (() => void) | null,
+    stop() {
+      this.state = "inactive";
+    },
+  };
+  attachRecorderForTests(sessionId, recorder as unknown as MediaRecorder);
+  recorder.onerror?.();
+  assert.equal(recordingView().error, "MediaRecorder error.");
+
+  setRecordingTransport({
+    uploadRecordingChunk: async () => ({ status: "received" }),
+    fetchUploadStatus: async () => liveStatus([0]),
+    finalizeRecording: async () => {
+      throw new Error("finalize must not run");
+    },
+  });
+  await pumpSession(sessionId);
+
+  assert.equal(recordingView().error, "MediaRecorder error.");
+  assert.equal(recordingView().uploadedCount, 1);
+  assert.equal(recordingView().failedCount, 0);
+  assert.equal(recordingView().pendingCount, 0);
+  const meta = await load(sessionId);
+  assert.equal(meta?.recorder_state, "recording");
+  assert.equal(meta?.next_sequence, 1);
+  assert.equal(meta?.finalize_payload, null);
+  assert.equal(meta?.finalize_persisted_at, null);
+});
+
+test("a successful upload does not clear a finalize error", async () => {
+  await resetRecordingControllerForTests();
+  const sessionId = "S-keep-finalize";
+  const persistedAt = 5_000;
+  await seed(
+    sessionId,
+    persistStop({ ...emptyMeta(sessionId, 0), next_sequence: 1, last_chunk_end_ms: 1_000 }, persistedAt),
+  );
+  await seedChunk(sessionId, 0, "late", Date.now() + 60_000);
+  let finalizeCalls = 0;
+  setRecordingTransport({
+    uploadRecordingChunk: async () => ({ status: "received" }),
+    fetchUploadStatus: async () => liveStatus([0], "pending"),
+    finalizeRecording: async () => {
+      finalizeCalls += 1;
+      throw new Error("still offline");
+    },
+  });
+
+  await pumpSession(sessionId);
+  assert.equal(finalizeCalls, 1);
+  assert.equal(recordingView().error, "結束標記送出失敗：still offline");
+  const during = await load(sessionId);
+  assert.equal(during?.finalize_persisted_at, persistedAt);
+  assert.equal(during?.next_sequence, 1);
+  assert.deepEqual(during?.finalize_payload, {
+    final_sequence: 0,
+    total_chunks: 1,
+    total_duration_ms: 1_000,
+  });
+
+  await releaseChunk(sessionId, 0);
+  await pumpSession(sessionId);
+
+  assert.equal(finalizeCalls, 1);
+  assert.equal(recordingView().error, "結束標記送出失敗：still offline");
+  assert.equal(recordingView().uploadedCount, 1);
+  assert.equal(recordingView().pendingCount, 0);
+  const after = await load(sessionId);
+  assert.equal(after?.finalize_persisted_at, persistedAt);
+  assert.equal(after?.next_sequence, 1);
+  assert.deepEqual(after?.finalize_payload, during?.finalize_payload);
+  assert.equal(after?.recorder_state, "stopped");
 });
