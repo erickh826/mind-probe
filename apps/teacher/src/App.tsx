@@ -1,7 +1,7 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { rememberAccessToken } from "@mind-probe/shared";
-import { fetchAuditLogs, fetchClipManifest, fetchRecordingStatus, fetchRubric, fetchSession, fetchTimeline, joinSession } from "./api";
+import { clearReviewSession, readReviewSession, rememberAccessToken } from "@mind-probe/shared";
+import { fetchAuditLogs, fetchClipManifest, fetchRecordingStatus, fetchRubric, fetchSession, fetchTimeline, joinSession, reviewLogin } from "./api";
 import "./App.css";
 import { DualVideoPlayer } from "./components/DualVideoPlayer";
 import { InteractiveTimeline } from "./components/InteractiveTimeline";
@@ -37,6 +37,36 @@ function App() {
     ];
   }, [timeline]);
 
+  const applyLoaded = useCallback(async (sessionId: string, token: string) => {
+    const nextAuth: AuthContext = { token };
+    const loadedSession = await fetchSession(sessionId, nextAuth);
+    const loadedTimeline = await fetchTimeline(sessionId, nextAuth);
+    const loadedStatus = await fetchRecordingStatus(sessionId, nextAuth);
+    const loadedRubric = await fetchRubric(loadedTimeline.case_id || loadedSession.case_id, nextAuth);
+    const loadedClips = await fetchClipManifest(loadedTimeline.case_id || loadedSession.case_id, nextAuth);
+    const loadedAudit = await fetchAuditLogs(sessionId, nextAuth);
+    const review = readReviewSession();
+    const accessToken = review && review.sessionId === sessionId ? review.accessToken : token;
+    rememberAccessToken(sessionId, accessToken);
+
+    setAuth({ token: accessToken });
+    setSession(loadedSession);
+    setTimeline(loadedTimeline);
+    setRecordingStatus(loadedStatus);
+    setRubric(loadedRubric);
+    setClips(loadedClips);
+    setAudit(loadedAudit);
+    setCurrentTimeMs(0);
+    setSeekTarget({ tMs: 0, nonce: Date.now() });
+    const storedMarkers = localStorage.getItem(`mind-probe:teacher-markers:${sessionId}`);
+    try {
+      const parsed: unknown = storedMarkers ? JSON.parse(storedMarkers) : [];
+      setTeacherMarkers(Array.isArray(parsed) ? parsed as TeacherMarker[] : []);
+    } catch {
+      setTeacherMarkers([]);
+    }
+  }, []);
+
   const loadSession = useCallback(async (request: SessionLoadRequest) => {
     setIsLoading(true);
     setLoadError(null);
@@ -49,49 +79,55 @@ function App() {
     setTeacherMarkers([]);
 
     try {
-      let token = request.authMode === "bearer" ? request.credential : "";
+      let token = "";
       if (request.authMode === "join_code") {
+        clearReviewSession();
         const joined = await joinSession(request.sessionId, request.credential, request.clientId);
         if (joined.role !== "teacher" && joined.role !== "observer") {
           throw new Error(`Join code opened role '${joined.role}', not a review role.`);
         }
         token = joined.access_token;
+      } else if (request.authMode === "review_code") {
+        const logged = await reviewLogin(request.sessionId, request.credential, request.clientId);
+        token = logged.access_token;
+      } else {
+        clearReviewSession();
+        token = request.credential;
       }
       if (!token) {
         throw new Error("A Bearer token is required to load the review.");
       }
-      rememberAccessToken(request.sessionId, token);
-      const nextAuth: AuthContext = { token };
-
-      const loadedSession = await fetchSession(request.sessionId, nextAuth);
-      const loadedTimeline = await fetchTimeline(request.sessionId, nextAuth);
-      const loadedStatus = await fetchRecordingStatus(request.sessionId, nextAuth);
-      const loadedRubric = await fetchRubric(loadedTimeline.case_id || loadedSession.case_id, nextAuth);
-      const loadedClips = await fetchClipManifest(loadedTimeline.case_id || loadedSession.case_id, nextAuth);
-      const loadedAudit = await fetchAuditLogs(request.sessionId, nextAuth);
-
-      setAuth(nextAuth);
-      setSession(loadedSession);
-      setTimeline(loadedTimeline);
-      setRecordingStatus(loadedStatus);
-      setRubric(loadedRubric);
-      setClips(loadedClips);
-      setAudit(loadedAudit);
-      setCurrentTimeMs(0);
-      setSeekTarget({ tMs: 0, nonce: Date.now() });
-      const storedMarkers = localStorage.getItem(`mind-probe:teacher-markers:${request.sessionId}`);
-      try {
-        const parsed: unknown = storedMarkers ? JSON.parse(storedMarkers) : [];
-        setTeacherMarkers(Array.isArray(parsed) ? parsed as TeacherMarker[] : []);
-      } catch {
-        setTeacherMarkers([]);
-      }
+      await applyLoaded(request.sessionId, token);
     } catch (error) {
       setLoadError(error instanceof Error ? error.message : "Unable to load review session.");
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [applyLoaded]);
+
+  useEffect(() => {
+    const stored = readReviewSession();
+    if (!stored) {
+      return;
+    }
+    let cancelled = false;
+    setIsLoading(true);
+    setLoadError(null);
+    applyLoaded(stored.sessionId, stored.accessToken)
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setLoadError(error instanceof Error ? error.message : "Unable to load review session.");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setIsLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [applyLoaded]);
 
   const seekTo = useCallback((tMs: number) => {
     setSeekTarget({ tMs: Math.max(0, tMs), nonce: Date.now() });
@@ -191,7 +227,7 @@ function App() {
             </div>
             <div className="audit-list">
               {session && audit === null ? (
-                <p className="muted">The audit log is limited to operators.</p>
+                <p className="muted">Audit is available to a teacher review login or an operator.</p>
               ) : audit && audit.entries.length > 0 ? (
                 audit.entries.slice(-5).map((entry) => (
                   <article key={entry.id} className="audit-row">

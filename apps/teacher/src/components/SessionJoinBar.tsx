@@ -1,8 +1,9 @@
 import { FormEvent, useMemo, useState } from "react";
 
+import { credentialFieldCopy, type SessionAuthMode } from "../sessionAuthMode";
 import type { RecordingStatus, SessionInfo } from "../types";
 
-export type SessionAuthMode = "join_code" | "bearer";
+export type { SessionAuthMode };
 
 export interface SessionLoadRequest {
   sessionId: string;
@@ -78,6 +79,16 @@ export function SessionJoinBar({ isLoading, onLoadSession, recordingStatus, sess
             />
             Bearer token
           </label>
+          <label className={authMode === "review_code" ? "active" : ""}>
+            <input
+              checked={authMode === "review_code"}
+              name="auth-mode"
+              onChange={() => setAuthMode("review_code")}
+              type="radio"
+              value="review_code"
+            />
+            Review code
+          </label>
         </div>
 
         <label className="field compact-field">
@@ -91,12 +102,12 @@ export function SessionJoinBar({ isLoading, onLoadSession, recordingStatus, sess
         </label>
 
         <label className="field token-field">
-          <span>{authMode === "join_code" ? "Teacher code" : "Token"}</span>
+          <span>{credentialFieldCopy(authMode).legend}</span>
           <input
             autoComplete="off"
             onChange={(event) => setCredential(event.target.value)}
-            placeholder={authMode === "join_code" ? "Join code" : "Bearer token"}
-            type={authMode === "join_code" ? "text" : "password"}
+            placeholder={credentialFieldCopy(authMode).placeholder}
+            type={authMode === "bearer" ? "password" : "text"}
             value={credential}
           />
         </label>

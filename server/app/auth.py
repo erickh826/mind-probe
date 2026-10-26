@@ -7,16 +7,13 @@ a second copy of the signature, expiry, session or role rules. The
 equivalence test ``tests/test_api.py::test_auth_token_rules_match_the_websocket_verifier``
 pins that mapping.
 
-**Post-session review and revocation.** ``POST /sessions/{id}/end`` calls
-``models.revoke_session_tokens()``, which audit-revokes *every* token issued
-for the session, the teacher's included, and ``POST /sessions/{id}/join``
-refuses to mint a replacement once ``status == "ended"``. Enforcing revocation
-unconditionally would therefore lock the review endpoints at exactly the moment
-review begins, with no recovery path. :func:`get_current_actor` resolves this
-by exempting ended sessions: a revoked-but-signature-valid, session-bound token
-no longer authorizes anything live, but it still *identifies* the actor well
-enough for the audit row. See the implementation notes for the follow-up this
-defers (a dedicated post-session review token, which needs ``models.py``).
+**Live tokens and ended sessions.** ``POST /sessions/{id}/end`` revokes every
+``token_issued`` digest. Read endpoints marked ended-exempt still accept a
+live token whose only revocation reason is ``session_ended``. That exemption
+does not apply to ``typ=review``. Review access is a separate grant: every
+REST and WebSocket entry checks ``review_grants`` and refuses a missing or
+revoked ``jti`` whether or not the session has ended. ``typ=upload`` stays on
+the upload grant and is rejected wherever it is not listed in ``allowed_typs``.
 """
 
 from __future__ import annotations
@@ -45,6 +42,12 @@ OPERATOR_TOKEN_ENV = "MINDPROBE_OPERATOR_TOKEN"
 OPERATOR_ROLE = "operator"
 UPLOAD_GRACE_ENV = "MINDPROBE_UPLOAD_GRACE_SECONDS"
 DEFAULT_UPLOAD_GRACE_SECONDS = 600
+REVIEW_ACCESS_TTL_ENV = "MINDPROBE_REVIEW_ACCESS_TTL"
+REVIEW_REFRESH_TTL_ENV = "MINDPROBE_REVIEW_REFRESH_TTL"
+DEFAULT_REVIEW_ACCESS_TTL_SECONDS = 1800
+DEFAULT_REVIEW_REFRESH_TTL_SECONDS = 604800
+REVIEW_LOGIN_LIMIT = 5
+REVIEW_LOGIN_WINDOW_SECONDS = 60
 #: Upload recovery tokens are shorter than the two-hour live join token.
 UPLOAD_TOKEN_TTL_SECONDS = 15 * 60
 UPLOAD_ISSUE_LIMIT = 5
@@ -87,11 +90,32 @@ class SlidingWindowLimiter:
 
 upload_issue_limiter = SlidingWindowLimiter()
 upload_redeem_limiter = SlidingWindowLimiter()
+review_login_limiter = SlidingWindowLimiter()
 
 
 def reset_upload_rate_limits() -> None:
     upload_issue_limiter.reset()
     upload_redeem_limiter.reset()
+
+
+def review_rate_now() -> float:
+    """Clock for review-login rate limits. Tests replace this rather than sleeping."""
+    return time.monotonic()
+
+
+def reset_review_rate_limits() -> None:
+    review_login_limiter.reset()
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if value <= 0:
+        return default
+    return value
 
 
 def upload_grace_seconds() -> int:
@@ -104,6 +128,16 @@ def upload_grace_seconds() -> int:
     if value < 0:
         return DEFAULT_UPLOAD_GRACE_SECONDS
     return value
+
+
+def review_access_ttl_seconds() -> int:
+    """Lifetime of a ``typ=review`` access token (ADR-0005 §6.5)."""
+    return _positive_int_env(REVIEW_ACCESS_TTL_ENV, DEFAULT_REVIEW_ACCESS_TTL_SECONDS)
+
+
+def review_refresh_ttl_seconds() -> int:
+    """Lifetime of a review refresh token, renewed on each rotation."""
+    return _positive_int_env(REVIEW_REFRESH_TTL_ENV, DEFAULT_REVIEW_REFRESH_TTL_SECONDS)
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -345,12 +379,40 @@ def require_operator(request: Request) -> Actor:
 # ---------------------------------------------------------------------------
 
 
+_REVIEW_BLOCK_DETAILS = {
+    "revoked": "revoked_session_token",
+    "expired": "expired_session_token",
+    "session": "session_token_mismatch",
+    "role": "role_token_mismatch",
+}
+
+
+def enforce_review_grant(db: DBSession, claims: dict[str, Any], session_id: str) -> None:
+    """Refuse a review access token whose grant is missing, revoked, or mismatched.
+
+    There is no ended-session exemption. Logout, refresh reuse, and operator
+    revoke all show up as ``revoked_at`` on the grant chain.
+    """
+    jti = claims.get("jti")
+    block = models.review_access_block(
+        db,
+        jti if isinstance(jti, str) else None,
+        session_id=session_id,
+        role=str(claims.get("role") or ""),
+    )
+    if block is not None:
+        raise HTTPException(status_code=401, detail=_REVIEW_BLOCK_DETAILS[block])
+
+
 def get_current_actor(
     request: Request,
     session_id: str,
     db: DBSession = Depends(get_db),
 ) -> Actor:
-    """Resolve the verified actor for a ``/sessions/{session_id}/...`` route.
+    """Resolve a live-token actor for a ``/sessions/{session_id}/...`` route.
+
+    Review grants do not pass through here. Routes that accept ``typ=review``
+    use :func:`require_roles` so the grant check cannot be skipped.
 
     ``session_id`` is injected from the path, so the token's session binding is
     always checked against the resource actually being read.
@@ -395,21 +457,23 @@ def get_current_actor(
     )
 
 
-def require_review_actor(actor: Actor = Depends(get_current_actor)) -> Actor:
-    """Restrict a route to the review roles (teacher / observer).
+def require_review_actor(
+    request: Request,
+    session_id: str,
+    db: DBSession = Depends(get_db),
+) -> Actor:
+    """Teacher or observer via a live token or a review grant.
 
-    A 403 rather than a 401: the token is valid, the role simply is not one the
-    review surface is for.
+    Live tokens keep the ended-session read exemption. Review tokens always
+    take the strict grant check inside :func:`require_roles`.
     """
-    if actor.role not in REVIEW_ROLES:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                f"role {actor.role!r} may not read the review surface "
-                f"(allowed: {sorted(REVIEW_ROLES)})"
-            ),
-        )
-    return actor
+    dependency = require_roles(
+        "teacher",
+        "observer",
+        allowed_typs=("live", "review"),
+        ended_exempt=True,
+    )
+    return dependency(request, session_id, db)
 
 
 def require_roles(
@@ -434,8 +498,9 @@ def require_roles(
     upload endpoints that pass this mode. A token revoked for any other reason
     is always refused. ``typ=upload`` also rechecks the grant flag and, once the
     session has ended, the grace window, even when that token has no revocation
-    row and its ``exp`` is still in the future. 403 means a valid token with the
-    wrong role; 401 means the token itself is unusable.
+    row and its ``exp`` is still in the future. ``typ=review`` never uses the
+    ended exemption: the grant must be present and unrevoked. 403 means a valid
+    token with the wrong role; 401 means the token itself is unusable.
     """
     allowed = frozenset(roles)
     if allowed_typs is not None:
@@ -475,7 +540,15 @@ def require_roles(
         role = str(claims.get("role") or "")
         token_hash = models.hash_token(token)
         reason = models.token_revocation_reason(db, session_id, token_hash)
-        if reason is not None:
+        if token_typ == "review":
+            if role not in REVIEW_ROLES:
+                raise HTTPException(status_code=401, detail="token_type_mismatch")
+            # Review grants are strict. A live-token revocation row, if one
+            # were ever written for this digest, is not exempt after /end.
+            if reason is not None:
+                raise HTTPException(status_code=401, detail="revoked_session_token")
+            enforce_review_grant(db, claims, session_id)
+        elif reason is not None:
             session = models.get_session(db, session_id)
             if mode == "grace_upload":
                 exempt = within_upload_grace(db, session_id, reason, role)
@@ -560,12 +633,24 @@ def _resolve_pathless_actor(
     if allow_operator and is_operator_token(token):
         return _operator_actor(token)
     try:
-        claims = decode_session_token(token, typ="live")
+        claims = decode_session_token(token)
     except TokenInvalid as exc:
         raise HTTPException(status_code=401, detail=exc.reason) from exc
     session_id = str(claims.get("session_id") or "")
+    role = str(claims.get("role") or "")
+    token_typ = str(claims.get("typ", "live"))
     token_hash = models.hash_token(token)
-    if models.is_token_hash_revoked(db, session_id, token_hash):
+    if token_typ == "upload":
+        raise HTTPException(status_code=401, detail="token_type_mismatch")
+    if token_typ == "review":
+        if role not in REVIEW_ROLES:
+            raise HTTPException(status_code=401, detail="token_type_mismatch")
+        if models.is_token_hash_revoked(db, session_id, token_hash):
+            raise HTTPException(status_code=401, detail="revoked_session_token")
+        enforce_review_grant(db, claims, session_id)
+    elif token_typ != "live":
+        raise HTTPException(status_code=401, detail="token_type_mismatch")
+    elif models.is_token_hash_revoked(db, session_id, token_hash):
         raise HTTPException(status_code=401, detail="revoked_session_token")
     return Actor(
         session_id=session_id,

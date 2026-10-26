@@ -218,6 +218,9 @@ class ConnectionInfo:
     # Digest of the token presented at the upgrade. Security revocation closes
     # only the sockets that presented that digest; session end closes them all.
     token_hash: str = ""
+    # Set for typ=review so logout and refresh-reuse can close this socket
+    # without revoking the student or wizard connection.
+    review_jti: str | None = None
 
 
 @dataclass
@@ -323,6 +326,7 @@ class ConnectionManager:
         *,
         subprotocol: str | None = None,
         token_hash: str = "",
+        review_jti: str | None = None,
     ) -> bool:
         """Accept `ws` for (session_id, role).
 
@@ -364,6 +368,7 @@ class ConnectionManager:
                 last_heartbeat_ms=now,
                 event_loop=asyncio.get_running_loop(),
                 token_hash=token_hash,
+                review_jti=review_jti,
             )
         )
         # The role is back: clear any outstanding disconnect mark last, so a
@@ -532,6 +537,22 @@ class ConnectionManager:
                 loop, self._close_sockets(sockets, code=code, reason=reason)
             )
 
+    def schedule_close_review_jtis(
+        self, session_id: str, jtis: set[str], *, reason: str
+    ) -> None:
+        """Close review sockets whose access-token ``jti`` was revoked."""
+        if not jtis:
+            return
+        by_loop: dict[asyncio.AbstractEventLoop, list[WebSocket]] = {}
+        for conns in self._connections.get(session_id, {}).values():
+            for info in list(conns):
+                if info.review_jti in jtis:
+                    by_loop.setdefault(info.event_loop, []).append(info.websocket)
+        for loop, sockets in by_loop.items():
+            self._schedule_on_loop(
+                loop, self._close_sockets(sockets, code=4401, reason=reason)
+            )
+
     async def _close_sockets(
         self, sockets: list[WebSocket], *, code: int, reason: str
     ) -> None:
@@ -571,6 +592,7 @@ def create_session_token(
     expires_at_s: int | None = None,
     typ: str | None = None,
     grant_id: str | None = None,
+    jti: str | None = None,
 ) -> str:
     """Create a short-lived, role-bound HMAC token for Bearer and WebSocket auth.
 
@@ -595,6 +617,10 @@ def create_session_token(
         claims["typ"] = typ
     if grant_id is not None:
         claims["grant_id"] = grant_id
+    if jti is not None:
+        if not jti:
+            raise ValueError("invalid jti")
+        claims["jti"] = jti
     payload = _b64encode(
         json.dumps(claims, separators=(",", ":"), sort_keys=True).encode("utf-8")
     )
@@ -666,10 +692,9 @@ def _verify_session_token(websocket: WebSocket, session_id: str, role: str) -> s
 
     Signature, expiry, session binding and role binding go through
     ``auth.verify_token`` so REST and WebSocket cannot drift. Join tokens
-    omit ``typ`` and count as ``live``. A ``review`` token is refused until
-    review grants exist (design §6.5): a signed ``typ=review`` with no grant
-    must not open a socket. ``teacher`` and ``observer`` use the same live
-    token ``/join`` already issues.
+    omit ``typ`` and count as ``live``. ``teacher`` and ``observer`` may also
+    present ``typ=review``; the caller then checks ``review_grants``. A review
+    token with no ``jti``, and every ``typ=upload`` token, is refused here.
 
     Raises :class:`WebSocketAuthError`. The caller maps
     ``role_token_mismatch`` to close code 4403 and every other reason to 4401.
@@ -680,15 +705,32 @@ def _verify_session_token(websocket: WebSocket, session_id: str, role: str) -> s
     if not token:
         raise WebSocketAuthError("missing_session_token")
     try:
-        auth.verify_token(
+        claims = auth.verify_token(
             token,
             session_id=session_id,
             roles={role},
-            typ="live",
         )
     except auth.TokenInvalid as exc:
         raise WebSocketAuthError(exc.reason) from exc
-    return token
+    typ = str(claims.get("typ", "live"))
+    if typ == "live":
+        return token
+    if (
+        typ == "review"
+        and role in {"teacher", "observer"}
+        and isinstance(claims.get("jti"), str)
+        and claims.get("jti")
+    ):
+        return token
+    raise WebSocketAuthError("token_type_mismatch")
+
+
+_WS_REVIEW_BLOCK = {
+    "revoked": "token_revoked",
+    "expired": "expired_session_token",
+    "session": "session_token_mismatch",
+    "role": "role_token_mismatch",
+}
 
 
 def _event_dedup_key(envelope: EventEnvelope) -> str:
@@ -1706,15 +1748,37 @@ async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
     # A valid token proves the bearer's role and session claim, not that the
     # session it names was ever created, is still live, or that the token
     # has not been revoked. Refuse before any in-memory state is spun up.
+    from . import auth
+
+    try:
+        claims = auth.verify_token(token, session_id=session_id, roles={role})
+    except auth.TokenInvalid as exc:
+        await websocket.close(code=4401, reason=exc.reason)
+        return
+    review_jti = claims.get("jti") if claims.get("typ") == "review" else None
+    if review_jti is not None and not isinstance(review_jti, str):
+        review_jti = None
     token_hash = models.hash_token(token)
     try:
         with _db_scope(websocket) as db:
             session = models.get_session(db, session_id)
             if session is None:
                 rejection = "session_not_found"
+            elif review_jti and (
+                block := models.review_access_block(
+                    db, review_jti, session_id=session_id, role=role
+                )
+            ):
+                rejection = _WS_REVIEW_BLOCK[block]
+            elif review_jti and models.is_token_hash_revoked(
+                db, session_id, token_hash
+            ):
+                rejection = "token_revoked"
             elif session.status == "ended":
                 rejection = "session_ended"
-            elif models.is_token_hash_revoked(db, session_id, token_hash):
+            elif review_jti is None and models.is_token_hash_revoked(
+                db, session_id, token_hash
+            ):
                 rejection = "token_revoked"
             else:
                 rejection = None
@@ -1743,6 +1807,7 @@ async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
             websocket,
             subprotocol=_selected_subprotocol(websocket),
             token_hash=token_hash,
+            review_jti=review_jti if isinstance(review_jti, str) else None,
         )
     except RoleConnectionConflict:
         # ADR-0001 §9: a live connection must not be silently evicted by a
@@ -1769,7 +1834,11 @@ async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
             try:
                 raw = await websocket.receive_json()
                 rejection = _live_socket_rejection(
-                    websocket, session_id, token_hash
+                    websocket,
+                    session_id,
+                    token_hash,
+                    review_jti=review_jti if isinstance(review_jti, str) else None,
+                    role=role,
                 )
                 if rejection is not None:
                     close_code, close_reason = rejection
@@ -1812,22 +1881,40 @@ async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
 
 
 def _live_socket_rejection(
-    websocket: WebSocket, session_id: str, token_hash: str
+    websocket: WebSocket,
+    session_id: str,
+    token_hash: str,
+    *,
+    review_jti: str | None = None,
+    role: str = "",
 ) -> tuple[int, str] | None:
     """Refuse a frame once the session has ended or this token was revoked.
 
     The handshake check is not enough: a socket accepted earlier can still
     write events after ``POST /end`` or a security revocation unless each
-    message is checked again.
+    message is checked again. Review grants are rechecked here too, with no
+    ended exemption; an ended session still closes the socket afterwards.
+    Live tokens keep the previous order: ended is reported before a hash
+    revocation so ``POST /end`` still closes with ``session_ended``.
     """
     try:
         with _db_scope(websocket) as db:
             session = models.get_session(db, session_id)
             if session is None:
                 return 4404, "session_not_found"
+            if review_jti:
+                block = models.review_access_block(
+                    db, review_jti, session_id=session_id, role=role
+                )
+                if block is not None:
+                    return 4401, _WS_REVIEW_BLOCK[block]
+                if models.is_token_hash_revoked(db, session_id, token_hash):
+                    return 4401, "token_revoked"
             if session.status == "ended":
                 return 4401, "session_ended"
-            if models.is_token_hash_revoked(db, session_id, token_hash):
+            if review_jti is None and models.is_token_hash_revoked(
+                db, session_id, token_hash
+            ):
                 return 4401, "token_revoked"
     except SQLAlchemyError:
         logger.exception(

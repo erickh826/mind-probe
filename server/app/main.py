@@ -21,6 +21,7 @@ import re
 import secrets
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
@@ -30,6 +31,7 @@ from starlette.middleware.cors import CORSMiddleware as StarletteCORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DBSession
 
 from . import __version__, auth, cases, models, recording, websocket
@@ -263,6 +265,19 @@ class UploadLoginRequest(BaseModel):
     code: str = Field(..., min_length=1, description="One-time upload code from the operator.")
 
 
+class ReviewLoginRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    review_code: str = Field(..., min_length=1, max_length=200)
+    client_id: str | None = Field(default=None, max_length=128)
+
+
+class ReviewRefreshRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    refresh_token: str = Field(..., min_length=1, max_length=500)
+
+
 def _session_payload(session: models.Session) -> dict:
     """Serialize a Session row for the REST API."""
     return {
@@ -316,8 +331,10 @@ def create_session(
         )
     session = models.create_session(db, body.session_id, body.case_id)
     join_codes = models.issue_join_codes(db, body.session_id)
+    review_codes = models.issue_review_codes(db, body.session_id)
     payload = _session_payload(session)
     payload["join_codes"] = join_codes
+    payload["review_codes"] = review_codes
     return payload
 
 
@@ -326,7 +343,12 @@ def get_session(
     session_id: str,
     _actor: auth.Actor = Depends(
         auth.require_roles(
-            "student", "wizard", "teacher", "observer", allow_operator=True
+            "student",
+            "wizard",
+            "teacher",
+            "observer",
+            allow_operator=True,
+            allowed_typs=("live", "review"),
         )
     ),
     db: DBSession = Depends(get_db),
@@ -339,7 +361,12 @@ def get_session_events(
     session_id: str,
     _actor: auth.Actor = Depends(
         auth.require_roles(
-            "wizard", "teacher", "observer", allow_operator=True, ended_exempt=True
+            "wizard",
+            "teacher",
+            "observer",
+            allow_operator=True,
+            ended_exempt=True,
+            allowed_typs=("live", "review"),
         )
     ),
     db: DBSession = Depends(get_db),
@@ -618,6 +645,263 @@ def upload_login(
     }
 
 
+def _review_client_id(client_id: str | None) -> str:
+    cleaned = (client_id or "").strip()
+    return cleaned or "review-client"
+
+
+def _mint_review_grant(
+    db: DBSession,
+    *,
+    session_id: str,
+    role: str,
+    client_id: str,
+    rotated_from: str | None = None,
+) -> dict:
+    """Mint one review access/refresh pair. The caller commits and audits.
+
+    The plaintext refresh token is returned to the caller and is not stored.
+    """
+    now = auth.utcnow()
+    access_exp = int(now.timestamp()) + auth.review_access_ttl_seconds()
+    refresh_exp = now + timedelta(seconds=auth.review_refresh_ttl_seconds())
+    jti = str(uuid.uuid4())
+    raw_refresh = secrets.token_urlsafe(32)
+    access = websocket.create_session_token(
+        session_id=session_id,
+        role=role,
+        client_id=client_id,
+        expires_at_s=access_exp,
+        typ="review",
+        jti=jti,
+    )
+    models.insert_review_grant(
+        db,
+        jti=jti,
+        session_id=session_id,
+        role=role,
+        client_id=client_id,
+        refresh_hash=models.hash_token(raw_refresh),
+        issued_at=now,
+        expires_at=refresh_exp,
+        rotated_from=rotated_from,
+    )
+    return {
+        "role": role,
+        "access_token": access,
+        "refresh_token": raw_refresh,
+        "expires_at": access_exp,
+        "jti": jti,
+    }
+
+
+def _close_review_sockets(session_id: str, jtis: list[str]) -> None:
+    websocket.manager.schedule_close_review_jtis(
+        session_id, set(jtis), reason="token_revoked"
+    )
+
+
+def _reject_reused_refresh(
+    db: DBSession, session_id: str, grant: models.ReviewGrant, *, actor_role: str
+) -> None:
+    jtis = models.revoke_review_chain(db, grant.jti)
+    models.record_audit(
+        db,
+        action=models.AUDIT_REVIEW_REVOKE,
+        actor_role=actor_role,
+        session_id=session_id,
+        token_hash=grant.refresh_hash,
+        details={"reason": "refresh_reuse", "jti": grant.jti, "revoked_jtis": jtis},
+        commit=False,
+    )
+    db.commit()
+    _close_review_sockets(session_id, jtis)
+
+
+@app.post("/sessions/{session_id}/review-codes")
+def regenerate_review_codes(
+    session_id: str,
+    _actor: auth.Actor = Depends(auth.require_operator),
+    db: DBSession = Depends(get_db),
+) -> dict:
+    """Replace the teacher and observer review codes. Plaintext is returned once."""
+    _load_session_or_404(db, session_id)
+    codes = models.issue_review_codes(db, session_id)
+    return {"session_id": session_id, "review_codes": codes}
+
+
+@app.post("/sessions/{session_id}/review-login")
+def review_login(
+    session_id: str,
+    body: ReviewLoginRequest,
+    request: Request,
+    db: DBSession = Depends(get_db),
+) -> dict:
+    """Exchange a reusable review code for a review access token and refresh token.
+
+    Works while the session is in progress and after it has ended. The code is
+    not consumed. Five attempts per client IP per minute.
+    """
+    if not auth.review_login_limiter.allow(
+        _client_host(request),
+        limit=auth.REVIEW_LOGIN_LIMIT,
+        window_s=auth.REVIEW_LOGIN_WINDOW_SECONDS,
+        now=auth.review_rate_now(),
+    ):
+        raise HTTPException(status_code=429, detail="rate_limited")
+    _load_session_or_404(db, session_id)
+    client_id = _review_client_id(body.client_id)
+    try:
+        code_row = models.authenticate_review_code(db, session_id, body.review_code)
+    except models.ReviewCodeInvalid:
+        models.record_audit(
+            db,
+            action=models.AUDIT_REVIEW_LOGIN,
+            actor_role="unknown",
+            session_id=session_id,
+            token_hash=models.hash_token(body.review_code),
+            details={"result": "invalid_review_code"},
+        )
+        raise HTTPException(status_code=401, detail="invalid_review_code")
+    try:
+        minted = _mint_review_grant(
+            db,
+            session_id=session_id,
+            role=code_row.role,
+            client_id=client_id,
+        )
+        models.record_audit(
+            db,
+            action=models.AUDIT_REVIEW_LOGIN,
+            actor_role=code_row.role,
+            session_id=session_id,
+            token=minted["access_token"],
+            details={"result": "ok", "jti": minted["jti"], "client_id": client_id},
+            commit=False,
+        )
+        db.commit()
+    except websocket.WebSocketAuthError as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=exc.reason) from exc
+    except Exception:
+        db.rollback()
+        raise
+    return {
+        "role": minted["role"],
+        "access_token": minted["access_token"],
+        "refresh_token": minted["refresh_token"],
+        "expires_at": minted["expires_at"],
+    }
+
+
+@app.post("/sessions/{session_id}/review-refresh")
+def review_refresh(
+    session_id: str,
+    body: ReviewRefreshRequest,
+    db: DBSession = Depends(get_db),
+) -> dict:
+    """Rotate a review refresh token. Reuse of an old refresh revokes the chain."""
+    _load_session_or_404(db, session_id)
+    presented = models.hash_token(body.refresh_token)
+    grant = models.review_grant_by_refresh_hash(db, presented)
+    if grant is None or grant.session_id != session_id:
+        raise HTTPException(status_code=401, detail="invalid_refresh_token")
+    if grant.revoked_at is not None:
+        raise HTTPException(status_code=401, detail="revoked_session_token")
+    # Reuse wins over expiry: an old refresh that already rotated the chain
+    # still revokes the family, even after that old refresh's own deadline.
+    if models.review_grant_successor(db, grant.jti) is not None:
+        _reject_reused_refresh(db, session_id, grant, actor_role=grant.role)
+        raise HTTPException(status_code=401, detail="refresh_reused")
+    if models.is_review_grant_revoked(db, grant.jti):
+        raise HTTPException(status_code=401, detail="expired_session_token")
+    try:
+        minted = _mint_review_grant(
+            db,
+            session_id=session_id,
+            role=grant.role,
+            client_id=grant.client_id,
+            rotated_from=grant.jti,
+        )
+        models.record_audit(
+            db,
+            action=models.AUDIT_REVIEW_REFRESH,
+            actor_role=grant.role,
+            session_id=session_id,
+            token=minted["access_token"],
+            details={"jti": minted["jti"], "rotated_from": grant.jti},
+            commit=False,
+        )
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raced = models.review_grant_by_refresh_hash(db, presented)
+        if raced is not None and raced.session_id == session_id:
+            _reject_reused_refresh(db, session_id, raced, actor_role=raced.role)
+        raise HTTPException(status_code=401, detail="refresh_reused") from None
+    except websocket.WebSocketAuthError as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=exc.reason) from exc
+    except Exception:
+        db.rollback()
+        raise
+    return {
+        "role": minted["role"],
+        "access_token": minted["access_token"],
+        "refresh_token": minted["refresh_token"],
+        "expires_at": minted["expires_at"],
+    }
+
+
+@app.post("/sessions/{session_id}/review-logout")
+def review_logout(
+    session_id: str,
+    actor: auth.Actor = Depends(
+        auth.require_roles("teacher", "observer", typ="review")
+    ),
+    db: DBSession = Depends(get_db),
+) -> dict:
+    """Revoke the caller's review grant chain. The access token stops working now."""
+    claims = auth.decode_session_token(actor.token, session_id=session_id, typ="review")
+    jti = str(claims.get("jti") or "")
+    jtis = models.revoke_review_chain(db, jti)
+    models.record_audit(
+        db,
+        action=models.AUDIT_REVIEW_LOGOUT,
+        actor_role=actor.role,
+        session_id=session_id,
+        token_hash=actor.token_hash,
+        details={"jti": jti, "revoked_jtis": jtis},
+        commit=False,
+    )
+    db.commit()
+    _close_review_sockets(session_id, jtis)
+    return {"status": "ok"}
+
+
+@app.post("/sessions/{session_id}/review-revoke")
+def review_revoke(
+    session_id: str,
+    actor: auth.Actor = Depends(auth.require_operator),
+    db: DBSession = Depends(get_db),
+) -> dict:
+    """Operator revoke of every review grant for this session. Codes stay valid."""
+    _load_session_or_404(db, session_id)
+    jtis = models.revoke_all_review_grants(db, session_id)
+    models.record_audit(
+        db,
+        action=models.AUDIT_REVIEW_REVOKE,
+        actor_role="operator",
+        session_id=session_id,
+        token_hash=actor.token_hash,
+        details={"reason": "operator", "revoked_jtis": jtis, "revoked_grants": len(jtis)},
+        commit=False,
+    )
+    db.commit()
+    _close_review_sockets(session_id, jtis)
+    return {"status": "ok", "revoked_grants": len(jtis)}
+
+
 # ---------------------------------------------------------------------------
 # Teacher review surface (spec §3.2 D, §10.1, §12; ADR-0004 §3, §4)
 #
@@ -701,7 +985,11 @@ def get_session_recording_status(
     include_chunks: bool = False,
     _actor: auth.Actor = Depends(
         auth.require_roles(
-            "teacher", "observer", allow_operator=True, ended_exempt=True
+            "teacher",
+            "observer",
+            allow_operator=True,
+            ended_exempt=True,
+            allowed_typs=("live", "review"),
         )
     ),
     db: DBSession = Depends(get_db),
@@ -1120,10 +1408,15 @@ def get_session_timeline(
 @app.get("/sessions/{session_id}/audit")
 def get_session_audit(
     session_id: str,
-    _actor: auth.Actor = Depends(auth.require_operator),
+    _actor: auth.Actor = Depends(
+        auth.require_roles("teacher", allow_operator=True, typ="review")
+    ),
     db: DBSession = Depends(get_db),
 ) -> dict:
-    """The session's audit trail (operator-only until review grants exist).
+    """The session's audit trail.
+
+    A teacher review grant or the operator may read it. Observer and live
+    tokens may not. Review grants are checked strictly, including after end.
 
     Ordered by ``id`` rather than ``created_at``: insertion order is the true
     sequence, and two rows written inside the same transaction can share a
