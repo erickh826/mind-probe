@@ -151,6 +151,13 @@ AUDIT_SESSION_PAUSED = "session_paused"
 AUDIT_CONNECTION_TAKEOVER = "connection_takeover"
 AUDIT_UPLOAD_CODE_ISSUED = "upload_code_issued"
 AUDIT_UPLOAD_TOKEN_ISSUED = "upload_token_issued"
+AUDIT_REVIEW_LOGIN = "review_login"
+AUDIT_REVIEW_REFRESH = "review_refresh"
+AUDIT_REVIEW_LOGOUT = "review_logout"
+AUDIT_REVIEW_REVOKE = "review_revoke"
+
+#: Reusable review codes issued to the operator (ADR-0005 §6.5). Not join codes.
+REVIEW_CODE_ROLES = ("teacher", "observer")
 
 #: Plaintext upload codes live for ten minutes. Only the SHA-256 digest is stored.
 UPLOAD_CODE_TTL_SECONDS = 10 * 60
@@ -252,6 +259,50 @@ class UploadCodeExpired(Exception):
 
 class UploadCodeConsumed(Exception):
     """The code was already redeemed or withdrawn by a later reissue."""
+
+
+class ReviewCode(Base):
+    """Reusable teacher/observer review code. The raw code is never stored."""
+
+    __tablename__ = "review_codes"
+    __table_args__ = (
+        UniqueConstraint("session_id", "role", name="uq_review_codes_session_role"),
+        UniqueConstraint("code_hash", name="uq_review_codes_code_hash"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id"), index=True)
+    role: Mapped[str] = mapped_column(String, index=True)
+    code_hash: Mapped[str] = mapped_column(String, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class ReviewCodeInvalid(Exception):
+    """The review code does not match a hash stored for this session."""
+
+
+class ReviewGrant(Base):
+    """One review access/refresh pair (ADR-0005 §6.5).
+
+    ``expires_at`` is the refresh-token deadline. The access token carries its
+    own shorter ``exp``. ``rotated_from`` points at the grant whose refresh
+    token was exchanged for this row. SQLite UNIQUE allows many NULL parents,
+    so each login can start its own chain.
+    """
+
+    __tablename__ = "review_grants"
+
+    jti: Mapped[str] = mapped_column(String, primary_key=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id"), index=True)
+    role: Mapped[str] = mapped_column(String)
+    client_id: Mapped[str] = mapped_column(String)
+    refresh_hash: Mapped[str] = mapped_column(String, unique=True, index=True)
+    issued_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    rotated_from: Mapped[str | None] = mapped_column(
+        ForeignKey("review_grants.jti"), nullable=True, unique=True
+    )
 
 
 class Event(Base):
@@ -1184,3 +1235,191 @@ def revoke_token_hash(
         # Close reason is the wire code, not the audit detail ("security").
         _notify_revocation(session_id, token_hash, "token_revoked")
     return entry
+
+
+# ---------------------------------------------------------------------------
+# Review grants (ADR-0005 §6.5). Separate from upload grants and live tokens.
+# ---------------------------------------------------------------------------
+
+
+def _dt_aware(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def issue_review_codes(db: DBSession, session_id: str, *, commit: bool = True) -> dict[str, str]:
+    """Issue a fresh teacher code and observer code, replacing any previous hashes.
+
+    Raw codes are returned once. Regenerating does not revoke review grants
+    that were already minted from the old codes.
+    """
+    _require_session(db, session_id)
+    issued: dict[str, str] = {}
+    now = _utcnow()
+    for role in REVIEW_CODE_ROLES:
+        raw_code = secrets.token_urlsafe(24)
+        digest = hash_join_code(raw_code)
+        row = db.scalars(
+            select(ReviewCode)
+            .where(ReviewCode.session_id == session_id)
+            .where(ReviewCode.role == role)
+            .limit(1)
+        ).first()
+        if row is None:
+            db.add(
+                ReviewCode(
+                    session_id=session_id,
+                    role=role,
+                    code_hash=digest,
+                    created_at=now,
+                )
+            )
+        else:
+            row.code_hash = digest
+            row.created_at = now
+        issued[role] = raw_code
+    if commit:
+        db.commit()
+    else:
+        db.flush()
+    return issued
+
+
+def authenticate_review_code(db: DBSession, session_id: str, code: str) -> ReviewCode:
+    """Resolve a reusable review code to its role. Does not consume it."""
+    code_hash = hash_join_code(code)
+    row = db.scalars(
+        select(ReviewCode)
+        .where(ReviewCode.session_id == session_id)
+        .where(ReviewCode.code_hash == code_hash)
+        .limit(1)
+    ).first()
+    if row is None:
+        raise ReviewCodeInvalid("invalid review code")
+    return row
+
+
+def insert_review_grant(
+    db: DBSession,
+    *,
+    jti: str,
+    session_id: str,
+    role: str,
+    client_id: str,
+    refresh_hash: str,
+    issued_at: datetime,
+    expires_at: datetime,
+    rotated_from: str | None = None,
+) -> ReviewGrant:
+    """Insert one grant. The caller commits, including the audit row."""
+    grant = ReviewGrant(
+        jti=jti,
+        session_id=session_id,
+        role=role,
+        client_id=client_id,
+        refresh_hash=refresh_hash,
+        issued_at=issued_at,
+        expires_at=expires_at,
+        rotated_from=rotated_from,
+    )
+    db.add(grant)
+    db.flush()
+    return grant
+
+
+def review_grant_by_refresh_hash(db: DBSession, refresh_hash: str) -> ReviewGrant | None:
+    return db.scalars(
+        select(ReviewGrant).where(ReviewGrant.refresh_hash == refresh_hash).limit(1)
+    ).first()
+
+
+def review_grant_successor(db: DBSession, jti: str) -> ReviewGrant | None:
+    return db.scalars(
+        select(ReviewGrant).where(ReviewGrant.rotated_from == jti).limit(1)
+    ).first()
+
+
+def is_review_grant_revoked(db: DBSession, jti: str) -> bool:
+    """True when this jti is missing, revoked, or past its refresh expiry."""
+    grant = db.get(ReviewGrant, jti)
+    if grant is None or grant.revoked_at is not None:
+        return True
+    return _dt_aware(grant.expires_at) <= _utcnow()
+
+
+def review_access_block(
+    db: DBSession, jti: str | None, *, session_id: str, role: str
+) -> str | None:
+    """Why a review access token must be refused, or None when the grant is live.
+
+    Return values: ``revoked``, ``expired``, ``session``, ``role``.
+    """
+    if not jti:
+        return "revoked"
+    grant = db.get(ReviewGrant, jti)
+    if grant is None or grant.revoked_at is not None:
+        return "revoked"
+    if _dt_aware(grant.expires_at) <= _utcnow():
+        return "expired"
+    if grant.session_id != session_id:
+        return "session"
+    if grant.role != role:
+        return "role"
+    return None
+
+
+def revoke_review_chain(db: DBSession, jti: str) -> list[str]:
+    """Revoke ``jti`` and every grant in its rotation chain. Caller commits."""
+    start = db.get(ReviewGrant, jti)
+    if start is None:
+        return []
+    root = start
+    guard: set[str] = set()
+    while root.rotated_from and root.rotated_from not in guard:
+        guard.add(root.jti)
+        parent = db.get(ReviewGrant, root.rotated_from)
+        if parent is None or parent.session_id != start.session_id:
+            break
+        root = parent
+    rows = db.scalars(
+        select(ReviewGrant).where(ReviewGrant.session_id == root.session_id)
+    ).all()
+    children: dict[str, list[ReviewGrant]] = {}
+    for row in rows:
+        if row.rotated_from:
+            children.setdefault(row.rotated_from, []).append(row)
+    ordered: list[ReviewGrant] = []
+    stack = [root]
+    seen: set[str] = set()
+    while stack:
+        node = stack.pop()
+        if node.jti in seen:
+            continue
+        seen.add(node.jti)
+        ordered.append(node)
+        stack.extend(children.get(node.jti, []))
+    now = _utcnow()
+    for node in ordered:
+        if node.revoked_at is None:
+            node.revoked_at = now
+    db.flush()
+    return [node.jti for node in ordered]
+
+
+def revoke_all_review_grants(db: DBSession, session_id: str) -> list[str]:
+    """Revoke every live review grant for a session. Caller commits.
+
+    Does not touch upload grants or live join tokens.
+    """
+    rows = db.scalars(
+        select(ReviewGrant).where(ReviewGrant.session_id == session_id)
+    ).all()
+    now = _utcnow()
+    revoked: list[str] = []
+    for row in rows:
+        if row.revoked_at is None:
+            row.revoked_at = now
+            revoked.append(row.jti)
+    db.flush()
+    return revoked

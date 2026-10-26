@@ -12,11 +12,26 @@ export interface JoinResponse {
   expires_at: number;
 }
 
+/** Plaintext review codes. Returned to the operator once; only hashes are stored. */
+export interface ReviewCodes {
+  teacher: string;
+  observer: string;
+}
+
+export interface ReviewCodesResponse {
+  session_id: string;
+  review_codes: ReviewCodes;
+}
+
 export interface ReviewLoginRequest {
   review_code: string;
   client_id?: string;
 }
 
+/**
+ * Access token expires at `expires_at` (unix seconds).
+ * The refresh token is opaque and lives for `MINDPROBE_REVIEW_REFRESH_TTL`.
+ */
 export interface ReviewTokenResponse {
   role: ReviewRole;
   access_token: string;
@@ -27,6 +42,17 @@ export interface ReviewTokenResponse {
 export interface ReviewRefreshRequest {
   refresh_token: string;
 }
+
+export interface ReviewRevokeResponse {
+  status: "ok";
+  revoked_grants: number;
+}
+
+export type ReviewAuditAction =
+  | "review_login"
+  | "review_refresh"
+  | "review_logout"
+  | "review_revoke";
 
 export type RecordingState =
   | "recording"
