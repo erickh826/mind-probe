@@ -1,4 +1,4 @@
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 
 import { credentialFieldCopy, type SessionAuthMode } from "../sessionAuthMode";
 import type { RecordingStatus, SessionInfo } from "../types";
@@ -13,10 +13,17 @@ export interface SessionLoadRequest {
 }
 
 interface SessionJoinBarProps {
+  authMode: SessionAuthMode;
+  formNonce: number;
+  initialSessionId?: string;
   isLoading: boolean;
+  logoutPending: boolean;
+  onAuthModeChange: (mode: SessionAuthMode) => void;
   onLoadSession: (request: SessionLoadRequest) => void;
+  onLogout: () => void;
   recordingStatus: RecordingStatus | null;
   session: SessionInfo | null;
+  showLogout: boolean;
 }
 
 function defaultClientId(): string {
@@ -29,13 +36,28 @@ function defaultClientId(): string {
   return generated;
 }
 
-export function SessionJoinBar({ isLoading, onLoadSession, recordingStatus, session }: SessionJoinBarProps) {
-  const [sessionId, setSessionId] = useState(session?.session_id ?? "");
+export function SessionJoinBar({
+  authMode,
+  formNonce,
+  initialSessionId = "",
+  isLoading,
+  logoutPending,
+  onAuthModeChange,
+  onLoadSession,
+  onLogout,
+  recordingStatus,
+  session,
+  showLogout,
+}: SessionJoinBarProps) {
+  const [sessionId, setSessionId] = useState(session?.session_id || initialSessionId);
   const [credential, setCredential] = useState("");
-  const [authMode, setAuthMode] = useState<SessionAuthMode>("join_code");
   const clientId = useMemo(defaultClientId, []);
 
-  const canSubmit = sessionId.trim().length > 0 && credential.trim().length > 0 && !isLoading;
+  useEffect(() => {
+    setCredential("");
+  }, [formNonce]);
+
+  const canSubmit = sessionId.trim().length > 0 && credential.trim().length > 0 && !isLoading && !logoutPending;
 
   function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -63,7 +85,7 @@ export function SessionJoinBar({ isLoading, onLoadSession, recordingStatus, sess
             <input
               checked={authMode === "join_code"}
               name="auth-mode"
-              onChange={() => setAuthMode("join_code")}
+              onChange={() => onAuthModeChange("join_code")}
               type="radio"
               value="join_code"
             />
@@ -73,7 +95,7 @@ export function SessionJoinBar({ isLoading, onLoadSession, recordingStatus, sess
             <input
               checked={authMode === "bearer"}
               name="auth-mode"
-              onChange={() => setAuthMode("bearer")}
+              onChange={() => onAuthModeChange("bearer")}
               type="radio"
               value="bearer"
             />
@@ -83,7 +105,7 @@ export function SessionJoinBar({ isLoading, onLoadSession, recordingStatus, sess
             <input
               checked={authMode === "review_code"}
               name="auth-mode"
-              onChange={() => setAuthMode("review_code")}
+              onChange={() => onAuthModeChange("review_code")}
               type="radio"
               value="review_code"
             />
@@ -112,9 +134,21 @@ export function SessionJoinBar({ isLoading, onLoadSession, recordingStatus, sess
           />
         </label>
 
-        <button className="primary-button" disabled={!canSubmit} type="submit">
-          {isLoading ? "Loading" : "Load review"}
-        </button>
+        <div className="join-actions">
+          <button className="primary-button" disabled={!canSubmit} type="submit">
+            {isLoading ? "Loading" : "Load review"}
+          </button>
+          {showLogout ? (
+            <button
+              className="secondary-button"
+              disabled={logoutPending}
+              onClick={onLogout}
+              type="button"
+            >
+              {logoutPending ? "Signing out" : "Log out"}
+            </button>
+          ) : null}
+        </div>
       </form>
 
       <div className="recording-health" aria-label="Recording health">
