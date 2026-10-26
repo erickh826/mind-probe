@@ -42,7 +42,7 @@ from sqlalchemy.pool import StaticPool
 # setdefault so a secret an earlier test module set is never clobbered.
 os.environ.setdefault("MINDPROBE_WS_TOKEN_SECRET", "test-api-secret")
 
-from app import auth, cases, models, recording, websocket
+from app import auth, cases, models, recording, websocket, storage
 from app.events import EventEnvelope, EventType, Source
 from app.main import app
 from app.models import Base
@@ -121,6 +121,8 @@ def sessions_root(monkeypatch):
     root = Path(__file__).resolve().parent / ".tmp_api" / uuid4().hex
     root.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(recording, "SESSIONS_DIR", root)
+    monkeypatch.setenv("MINDPROBE_STORAGE_BACKEND", "local")
+    monkeypatch.setenv("MINDPROBE_LOCAL_STORAGE_DIR", str(root / "objects"))
     yield root
     shutil.rmtree(root, ignore_errors=True)
 
@@ -391,6 +393,7 @@ def test_review_survives_ending_the_session(client, db, sessions_root):
     token = join(client, "S-ENDED", "teacher", created["join_codes"])
     write_chunk(sessions_root, "S-ENDED", 0, EBML_HEADER)
     (sessions_root / "S-ENDED" / "student.mp4").write_bytes(b"mp4-bytes")
+    prepared_take(db, "S-ENDED", published=True)
 
     assert client.post("/sessions/S-ENDED/end").status_code == 200
     assert models.is_token_hash_revoked(db, "S-ENDED", models.hash_token(token))
@@ -536,45 +539,61 @@ def test_recording_status_rejects_an_unsafe_session_id(client, sessions_root):
 # --- GET /sessions/{id}/recording (spec §10.1; ADR-0004 §3, §4) -------------
 
 
-def test_recording_prefers_the_mp4(client, sessions_root):
+def prepared_take(db, session_id, *, published=False):
+    rec = models.ensure_recording(db, session_id)
+    rec.recording_state = "uploaded" if published else "complete"
+    rec.finalize_state, rec.final_sequence, rec.total_chunks = "complete", 0, 1
+    if published:
+        key = storage.recording_key(session_id)
+        path = recording.mp4_path(session_id)
+        storage.get_storage().put_file(key, path, storage.file_sha256(path))
+        rec.recording_key = key
+    db.commit()
+
+
+def test_recording_returns_signed_mp4(client, sessions_root, db):
     created = create_session(client, "S-MP4")
     token = join(client, "S-MP4", "teacher", created["join_codes"])
     (sessions_root / "S-MP4").mkdir(parents=True)
     (sessions_root / "S-MP4" / "student.mp4").write_bytes(b"mp4-bytes")
     (sessions_root / "S-MP4" / "student_raw.webm").write_bytes(b"webm-bytes")
+    prepared_take(db, "S-MP4", published=True)
 
     response = client.get("/sessions/S-MP4/recording", headers=as_cookie(token))
     assert response.status_code == 200
-    assert response.headers["content-type"] == "video/mp4"
-    assert response.content == b"mp4-bytes"
-    assert "S-MP4_student.mp4" in response.headers["content-disposition"]
+    assert response.json()["expires_in"] == 900
+    media = client.get(response.json()["url"])
+    assert media.headers["content-type"] == "video/mp4"
+    assert media.content == b"mp4-bytes"
 
 
-def test_recording_falls_back_to_the_raw_webm(client, sessions_root):
+def test_recording_queues_instead_of_streaming_raw_webm(client, sessions_root, db):
     """ADR-0004 §4: the raw WebM outranks the mp4, so a missing transcode is
     served around rather than reported as an absent recording."""
     created = create_session(client, "S-WEBM")
     token = join(client, "S-WEBM", "teacher", created["join_codes"])
     (sessions_root / "S-WEBM").mkdir(parents=True)
     (sessions_root / "S-WEBM" / "student_raw.webm").write_bytes(b"webm-bytes")
+    prepared_take(db, "S-WEBM")
 
     response = client.get("/sessions/S-WEBM/recording", headers=as_cookie(token))
-    assert response.status_code == 200
-    assert response.headers["content-type"] == "video/webm"
-    assert response.content == b"webm-bytes"
+    assert response.status_code == 202
+    assert response.json()["status"] == "queued"
+    assert (sessions_root / "S-WEBM" / "student_raw.webm").read_bytes() == b"webm-bytes"
 
 
-def test_recording_ignores_a_zero_byte_mp4(client, sessions_root):
+def test_recording_ignores_a_zero_byte_mp4(client, sessions_root, db):
     """An empty mp4 is not a playable artefact; the WebM behind it still is."""
     created = create_session(client, "S-ZERO")
     token = join(client, "S-ZERO", "teacher", created["join_codes"])
     (sessions_root / "S-ZERO").mkdir(parents=True)
     (sessions_root / "S-ZERO" / "student.mp4").write_bytes(b"")
     (sessions_root / "S-ZERO" / "student_raw.webm").write_bytes(b"webm-bytes")
+    prepared_take(db, "S-ZERO")
 
     response = client.get("/sessions/S-ZERO/recording", headers=as_cookie(token))
-    assert response.status_code == 200
-    assert response.headers["content-type"] == "video/webm"
+    assert response.status_code == 202
+    assert response.json()["status"] == "queued"
 
 
 def test_recording_404_when_nothing_has_been_processed(client, sessions_root):
@@ -585,12 +604,13 @@ def test_recording_404_when_nothing_has_been_processed(client, sessions_root):
     assert "S-NONE" in response.json()["detail"]
 
 
-def test_recording_access_is_audited(client, sessions_root):
+def test_recording_access_is_audited(client, sessions_root, db):
     """ADR-0004 §3: 誰檢視或下載錄影."""
     created = create_session(client, "S-AUDITED")
     token = join(client, "S-AUDITED", "teacher", created["join_codes"])
     (sessions_root / "S-AUDITED").mkdir(parents=True)
     (sessions_root / "S-AUDITED" / "student.mp4").write_bytes(b"mp4-bytes")
+    prepared_take(db, "S-AUDITED", published=True)
 
     assert client.get(
         "/sessions/S-AUDITED/recording", headers=as_cookie(token)
@@ -603,7 +623,7 @@ def test_recording_access_is_audited(client, sessions_root):
     assert len(viewed) == 1
     assert viewed[0]["actor_role"] == "teacher"
     assert viewed[0]["details"]["artefact"] == "mp4"
-    assert viewed[0]["details"]["size_bytes"] == len(b"mp4-bytes")
+    assert "url" not in viewed[0]["details"]
     # The digest identifies the actor; the token itself never appears.
     assert viewed[0]["token_hash_prefix"] == models.hash_token(token)[:8]
 

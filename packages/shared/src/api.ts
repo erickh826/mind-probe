@@ -94,3 +94,21 @@ export interface StudentRecordingStatus {
 export interface DeleteRecordingRequest {
   confirm: string;
 }
+
+export interface RecordingJobResponse {
+  session_id: string;
+  status: "queued";
+  job_id: number;
+}
+
+export interface RecordingPlaybackResponse {
+  session_id: string;
+  url: string;
+  expires_in: number;
+  recording_state: RecordingState;
+}
+
+export interface DeleteRecordingResponse {
+  session_id: string;
+  recording_state: "deleting" | "deleted";
+}

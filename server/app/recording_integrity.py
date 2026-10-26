@@ -113,9 +113,11 @@ def next_expected_sequence(
     return upper + 1
 
 
-def _received(session_id: str) -> list[int]:
+def _received(session_id: str, rec: models.Recording | None = None) -> list[int]:
     from . import recording
 
+    if rec and rec.manifest and rec.finalize_state == "complete":
+        return [entry["sequence"] for entry in rec.manifest.get("chunks", [])]
     return [sequence for sequence, _ in recording.stored_chunks(session_id)]
 
 
@@ -144,7 +146,7 @@ def completeness_ok(session_id: str, rec: models.Recording) -> bool:
     """
     if rec.final_sequence is None or rec.total_chunks is None:
         return False
-    received = _received(session_id)
+    received = _received(session_id, rec)
     if rec.total_chunks != rec.final_sequence + 1:
         return False
     if len(set(received)) != rec.total_chunks:
@@ -162,7 +164,7 @@ def _sync_missing(session_id: str, rec: models.Recording) -> list[int]:
     if rec.final_sequence is None:
         missing: list[int] = []
     else:
-        missing = missing_for_final(_received(session_id), rec.final_sequence)
+        missing = missing_for_final(_received(session_id, rec), rec.final_sequence)
     rec.missing_sequences = list(missing)
     return missing
 
@@ -206,6 +208,8 @@ def refresh_completeness(
     missing = _sync_missing(session_id, rec)
     if not missing and completeness_ok(session_id, rec):
         _mark_complete(rec)
+        from .jobs import enqueue
+        enqueue(db, "transcode", session_id)
     else:
         _touch(rec)
     if commit:
@@ -229,6 +233,11 @@ def note_session_ended(db: DBSession, session_id: str) -> None:
         rec.recording_state = "finalizing"
         _touch(rec)
         db.flush()
+    session = models.get_session(db, session_id)
+    if session and session.ended_at:
+        from .jobs import enqueue
+        enqueue(db, "finalize_timeout", session_id,
+                run_after=session.ended_at + timedelta(seconds=auth.upload_grace_seconds()))
 
 
 def _payload_matches(
@@ -521,6 +530,8 @@ def apply_finalize(
         and completeness_ok(session_id, rec)
     ):
         _mark_complete(rec)
+        from .jobs import enqueue
+        enqueue(db, "transcode", session_id)
         if not matches or first_declaration:
             _audit(
                 db,
@@ -562,8 +573,8 @@ def _finalize_body(rec: models.Recording) -> dict[str, Any]:
 
 def student_upload_status(session_id: str, db: DBSession) -> dict[str, Any]:
     """The five fields a student may see. No paths, sizes, or checksums."""
-    received = _received(session_id)
     rec = models.get_recording(db, session_id)
+    received = _received(session_id, rec)
     final_sequence = rec.final_sequence if rec is not None else None
     body = {
         "received_sequences": received,
@@ -583,6 +594,8 @@ def transcode_allowed(session_id: str, db: DBSession) -> bool:
         return False
     if is_protected_incomplete(rec):
         return False
+    if rec.manifest and rec.finalize_state == "complete":
+        return True
     return completeness_ok(session_id, rec)
 
 
@@ -655,7 +668,7 @@ def claim_open_recording(
 
 
 def apply_upload_grace_deadlines(
-    db: DBSession, *, now: Any | None = None
+    db: DBSession, *, now: Any | None = None, session_id: str | None = None
 ) -> list[str]:
     """Close takes whose post-end grace window has elapsed (ADR-0005 §7.3).
 
@@ -673,9 +686,10 @@ def apply_upload_grace_deadlines(
         moment = moment.replace(tzinfo=auth.utcnow().tzinfo)
     grace = timedelta(seconds=auth.upload_grace_seconds())
     changed: list[str] = []
-    sessions = db.scalars(
-        select(models.Session).where(models.Session.status == "ended")
-    ).all()
+    query = select(models.Session).where(models.Session.status == "ended")
+    if session_id is not None:
+        query = query.where(models.Session.id == session_id)
+    sessions = db.scalars(query).all()
     for session in sessions:
         if session.ended_at is None:
             continue
@@ -731,6 +745,9 @@ def apply_upload_grace_deadlines(
                 db.expire(rec)
             continue
         db.expire(rec)
+        if outcome == "complete":
+            from .jobs import enqueue
+            enqueue(db, "transcode", session.id)
         if outcome != "complete":
             _audit(
                 db,

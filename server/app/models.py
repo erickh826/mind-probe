@@ -47,10 +47,12 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    Index,
     String,
     Text,
     UniqueConstraint,
     create_engine,
+    inspect,
     select,
     update,
 )
@@ -408,6 +410,36 @@ class Recording(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
+    recording_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    recording_sha256: Mapped[str | None] = mapped_column(String, nullable=True)
+    manifest: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    deleted_by: Mapped[str | None] = mapped_column(String, nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class Job(Base):
+    """Durable, single-worker jobs; no URLs or credentials in payloads."""
+
+    __tablename__ = "jobs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(String)
+    session_id: Mapped[str] = mapped_column(String, default="")
+    status: Mapped[str] = mapped_column(String, default="queued")
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int | None] = mapped_column(Integer, default=3, nullable=True)
+    run_after: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    locked_by: Mapped[str | None] = mapped_column(String, nullable=True)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    __table_args__ = (
+        Index("uq_active_job", "kind", "session_id", unique=True,
+              sqlite_where=status.in_(("queued", "running"))),
+    )
+
 
 class AuditLog(Base):
     """Security-relevant action log (ADR-0004 §3).
@@ -434,13 +466,23 @@ class AuditLog(Base):
 def init_db() -> None:
     """Create tables. Called on server startup (spec §5).
 
-    ``create_all`` only creates *missing* tables -- it does not alter existing
-    ones. A sqlite file created before ``snapshot_revision`` / ``pause_reason``
-    / ``events.dedup_key`` / ``audit_logs`` existed must be deleted and
-    recreated; there is no migration tool wired up yet.
+    ``create_all`` creates missing tables; this batch additively migrates the
+    five recording-storage/deletion columns on existing SQLite databases.
+    No sessions, original media or audit records are removed by startup.
     """
     os.makedirs("./sessions", exist_ok=True)
     Base.metadata.create_all(bind=engine)
+    # Additive migration: never require deleting an existing research database.
+    if engine.dialect.name == "sqlite":
+        additions = {
+            "recording_key": "TEXT", "recording_sha256": "TEXT", "manifest": "JSON",
+            "deleted_by": "TEXT", "deleted_at": "DATETIME",
+        }
+        with engine.begin() as conn:
+            columns = {c["name"] for c in inspect(conn).get_columns("recordings")}
+            for name, sql_type in additions.items():
+                if name not in columns:
+                    conn.exec_driver_sql(f"ALTER TABLE recordings ADD COLUMN {name} {sql_type}")
 
 
 # ---------------------------------------------------------------------------

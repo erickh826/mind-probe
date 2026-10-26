@@ -19,7 +19,6 @@ import logging
 import os
 import re
 import secrets
-import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -30,11 +29,11 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from starlette.middleware.cors import CORSMiddleware as StarletteCORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DBSession
 
-from . import __version__, auth, cases, models, recording, websocket
+from . import __version__, auth, cases, models, recording, websocket, jobs, storage
 from .events import EventType
 from .models import get_db, init_db
 from .recording import router as recording_router
@@ -79,40 +78,20 @@ def _session_cookie_secure() -> bool:
     return env_name not in {"", "dev", "development", "local", "test"}
 
 
-def _upload_grace_loop(stop: threading.Event) -> None:
-    """Re-check ended sessions once a minute (ADR-0005 §7.3). No job table."""
-    while not stop.is_set():
-        try:
-            with models.session_scope() as db:
-                recording.recording_integrity.apply_upload_grace_deadlines(db)
-        except Exception:
-            logger.exception("upload grace check failed")
-        stop.wait(60)
-
-
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
     _ensure_ws_token_secret()
-    # Tests share one SQLite connection across threads. The check itself is
-    # callable without this loop; production leaves the scheduler on.
-    scheduler = os.environ.get("MINDPROBE_UPLOAD_GRACE_SCHEDULER", "true")
-    stop_grace = threading.Event()
-    grace_thread: threading.Thread | None = None
-    if scheduler.strip().lower() not in {"0", "false", "no", "off"}:
-        grace_thread = threading.Thread(
-            target=_upload_grace_loop,
-            args=(stop_grace,),
-            name="upload-grace",
-            daemon=True,
-        )
-        grace_thread.start()
+    # Tests drive run_once deterministically. Production uses one app worker.
+    worker = None
+    if os.environ.get("MINDPROBE_JOB_WORKER", "true").lower() not in {"0", "false", "no", "off"}:
+        worker = jobs.Worker()
+        worker.start()
     try:
         yield
     finally:
-        stop_grace.set()
-        if grace_thread is not None:
-            grace_thread.join(timeout=1)
+        if worker is not None:
+            worker.stop()
 
 
 app = FastAPI(title="mind-probe Session Server", version=__version__, lifespan=lifespan)
@@ -1001,6 +980,9 @@ def get_session_recording_status(
     re-deriving completeness here would give the teacher app a second, drifting
     answer to the same question.
     """
+    rec = models.get_recording(db, session_id)
+    if rec and rec.recording_state in jobs.TOMBSTONES:
+        raise HTTPException(status_code=410, detail={"error": "recording_deleted", "recording_state": rec.recording_state})
     try:
         return recording.get_recording_status(
             session_id, db, include_chunks=include_chunks
@@ -1015,67 +997,110 @@ def get_session_recording_status(
 @app.get("/sessions/{session_id}/recording")
 def get_session_recording(
     session_id: str,
-    actor: auth.Actor = Depends(auth.require_review_actor),
+    actor: auth.Actor = Depends(auth.require_roles("teacher", "observer", allow_operator=True,
+                                                ended_exempt=True, allowed_typs=("live", "review"))),
     db: DBSession = Depends(get_db),
-) -> FileResponse:
-    """Stream or download the student recording for review (spec §10.1).
+) -> Response:
+    """Issue an audited short-lived MP4 URL, or persist a processing job.
 
-    The mp4 is preferred because it is the artefact the review player is built
-    for -- baseline H.264/AAC with ``+faststart``, so playback can begin before
-    the file is fully fetched. When the transcode has not run, failed, or the
-    box has no FFmpeg, the merged ``student_raw.webm`` is served instead rather
-    than a 404: under ADR-0004 §4 the raw WebM outranks the mp4, and a teacher
-    watching a WebM beats a teacher watching nothing.
-
-    ``Accept-Ranges`` comes from ``FileResponse``, so seeking in the review
-    player works against either artefact.
-
-    Every served byte is preceded by an audit row (ADR-0004 §3's "誰檢視或下載
-    錄影"); the 404 path is not audited, since nothing was disclosed.
+    No FFmpeg or storage network IO runs here. Raw/incomplete takes are never
+    exposed as a fallback. Signed URLs are returned, never stored in audit/DB.
     """
     try:
-        mp4 = recording.mp4_path(session_id)
-        raw = recording.merged_path(session_id)
+        recording.validate_session_id(session_id)
     except recording.InvalidSessionId as exc:
         raise HTTPException(
             status_code=400,
             detail={"error": "invalid_session_id", "message": str(exc)},
         ) from exc
 
-    if mp4.is_file() and mp4.stat().st_size > 0:
-        path, media_type, filename, artefact = (
-            mp4,
-            "video/mp4",
-            f"{session_id}_student.mp4",
-            "mp4",
-        )
-    elif raw.is_file() and raw.stat().st_size > 0:
-        path, media_type, filename, artefact = (
-            raw,
-            "video/webm",
-            f"{session_id}_student_raw.webm",
-            "raw_webm",
-        )
-    else:
-        raise HTTPException(
-            status_code=404, detail=f"recording not found for session: {session_id}"
-        )
+    rec = models.get_recording(db, session_id)
+    if rec and rec.recording_state in jobs.TOMBSTONES:
+        raise HTTPException(status_code=410, detail="recording_deleted")
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"recording not found for session: {session_id}")
+    if rec.finalize_state != "complete" or rec.needs_operator or rec.incomplete_reason:
+        raise HTTPException(status_code=409, detail="recording_not_complete")
+    store = storage.get_storage()
+    if rec.recording_key:
+        # Signing is local work; no HEAD/FFmpeg in this request.
+        url = store.presign_get(rec.recording_key)
+        auth.record_access_audit(db, action=auth.AUDIT_RECORDING_VIEWED, actor=actor,
+                                 session_id=session_id, details={"artefact": "mp4"})
+        return JSONResponse({"session_id": session_id, "url": url, "expires_in": storage.PRESIGN_TTL,
+                             "recording_state": rec.recording_state})
+    kind = "upload" if rec.recording_state == "transcoded" else "transcode"
+    latest = db.scalar(select(models.Job).where(
+        models.Job.kind == kind, models.Job.session_id == session_id,
+    ).order_by(models.Job.id.desc()).limit(1))
+    if latest is not None and latest.status == "failed":
+        # Polling must not reset the bounded retry budget. OP/teacher-review
+        # may explicitly retry through POST /process after fixing the cause.
+        raise HTTPException(status_code=409, detail="processing_failed")
+    job_id = jobs.enqueue(db, kind, session_id)
+    db.commit()
+    return JSONResponse({"session_id": session_id, "status": "queued", "job_id": job_id},
+                         status_code=202, headers={"Retry-After": "2"})
 
-    auth.record_access_audit(
-        db,
-        action=auth.AUDIT_RECORDING_VIEWED,
-        actor=actor,
-        session_id=session_id,
-        details={"artefact": artefact, "size_bytes": path.stat().st_size},
-    )
-    # `content-disposition: inline` so a browser <video> plays it in place; the
-    # filename is still offered for an explicit download.
-    return FileResponse(
-        path,
-        media_type=media_type,
-        filename=filename,
-        content_disposition_type="inline",
-    )
+
+class DeleteRecordingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    confirm: str
+
+
+@app.delete("/sessions/{session_id}/recording", status_code=202)
+def delete_session_recording(
+    session_id: str, body: DeleteRecordingRequest,
+    actor: auth.Actor = Depends(auth.require_recording_delete_actor),
+    db: DBSession = Depends(get_db),
+) -> dict:
+    if body.confirm != session_id:
+        raise HTTPException(status_code=400, detail="confirmation_mismatch")
+    try:
+        recording.validate_session_id(session_id)
+    except recording.InvalidSessionId as exc:
+        raise HTTPException(status_code=400, detail="invalid_session_id") from exc
+    rec = models.ensure_recording(db, session_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="unknown session")
+    if rec.recording_state not in jobs.TOMBSTONES:
+        db.execute(update(models.Recording).where(
+            models.Recording.session_id == session_id,
+            ~models.Recording.recording_state.in_(jobs.TOMBSTONES),
+        ).values(recording_state="deleting", deleted_by=actor.role, updated_at=jobs.now_utc()))
+        db.execute(update(models.Job).where(models.Job.session_id == session_id,
+            models.Job.status.in_(jobs.ACTIVE), models.Job.kind.in_(("transcode", "upload", "finalize_timeout")),
+        ).values(status="cancelled", updated_at=jobs.now_utc()))
+        models.record_audit(db, action="recording_delete_requested", actor_role=actor.role,
+                            token_hash=actor.token_hash, session_id=session_id,
+                            details={}, commit=False)
+    jobs.enqueue(db, "delete_recording", session_id)
+    db.commit()
+    db.refresh(rec)
+    return {"session_id": session_id, "recording_state": rec.recording_state}
+
+
+@app.get("/recording-media/{session_id}")
+def get_local_recording_media(session_id: str, expires: int, signature: str,
+                             db: DBSession = Depends(get_db)) -> FileResponse:
+    try:
+        key = storage.recording_key(session_id)
+        valid = storage.valid_local_signature(key, expires, signature)
+    except (ValueError, recording.InvalidSessionId):
+        valid = False
+    if not valid:
+        raise HTTPException(status_code=401, detail="invalid_media_signature")
+    rec = models.get_recording(db, session_id)
+    if rec is None or rec.recording_state in jobs.TOMBSTONES:
+        raise HTTPException(status_code=410, detail="recording_deleted")
+    store = storage.get_storage()
+    if not isinstance(store, storage.LocalStorage) or rec.recording_key != key:
+        raise HTTPException(status_code=404, detail="recording_not_found")
+    path = store.path(key)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="recording_not_found")
+    return FileResponse(path, media_type="video/mp4", content_disposition_type="inline",
+                        headers={"Cache-Control": "private, no-store"})
 
 
 # ---------------------------------------------------------------------------

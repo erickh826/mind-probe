@@ -42,6 +42,8 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
+import time
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
@@ -448,7 +450,7 @@ def _discard_invalid_mp4(out: Path) -> None:
         logger.warning("Could not remove the incomplete transcode at %s.", out)
 
 
-def remux_to_mp4(session_id: str, *, ffmpeg_bin: str | None = None) -> Path:
+def remux_to_mp4(session_id: str, *, ffmpeg_bin: str | None = None, cancel_check=None) -> Path:
     """Transcode ``student_raw.webm`` to ``student.mp4`` (H.264/AAC).
 
     Baseline profile plus ``yuv420p`` so the result plays in every browser the
@@ -469,7 +471,8 @@ def remux_to_mp4(session_id: str, *, ffmpeg_bin: str | None = None) -> Path:
             f"no merged stream at {merged}; call concat_chunks() first"
         )
 
-    out = mp4_path(session_id)
+    final = mp4_path(session_id)
+    out = final.with_name("student.part.mp4")
     out.parent.mkdir(parents=True, exist_ok=True)
     binary = ffmpeg_bin or _ffmpeg_bin()
     cmd = [
@@ -493,7 +496,27 @@ def remux_to_mp4(session_id: str, *, ffmpeg_bin: str | None = None) -> Path:
     ]
 
     try:
-        subprocess.run(cmd, check=True, capture_output=True)
+        if cancel_check is None:
+            subprocess.run(cmd, check=True, capture_output=True)
+        else:
+            # A real worker can stop FFmpeg promptly after delete/shutdown.
+            # File-backed stderr avoids filling a pipe while polling.
+            with tempfile.TemporaryFile() as stderr:
+                process = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr)
+                try:
+                    started = time.monotonic()
+                    while process.poll() is None:
+                        cancel_check()
+                        if time.monotonic() - started > 900:
+                            raise RemuxFailed("FFmpeg timeout")
+                        time.sleep(0.2)
+                    if process.returncode:
+                        stderr.seek(0)
+                        raise subprocess.CalledProcessError(process.returncode, cmd, stderr=stderr.read())
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait()
     except FileNotFoundError as exc:
         # Nothing ran, so nothing to clean up; the WebM is transcodable later.
         raise FFmpegUnavailable(
@@ -529,7 +552,10 @@ def remux_to_mp4(session_id: str, *, ffmpeg_bin: str | None = None) -> Path:
         logger.warning("Transcoded mp4 for session %s has no audio stream.", session_id)
 
     logger.info("Transcoded session %s to %s.", session_id, out)
-    return out
+    if cancel_check is not None:
+        cancel_check()
+    out.replace(final)
+    return final
 
 
 # ---------------------------------------------------------------------------
@@ -590,7 +616,7 @@ def get_recording_status(
             status["incomplete_reason"] = rec.incomplete_reason
             if rec.final_sequence is not None:
                 status["missing_sequences"] = recording_integrity.missing_for_final(
-                    sequences, rec.final_sequence
+                    recording_integrity._received(session_id, rec), rec.final_sequence
                 )
 
     if include_chunks:
@@ -616,6 +642,7 @@ def process_recording(
     *,
     remux: bool = True,
     allow_missing_header: bool = False,
+    cancel_check=None,
 ) -> dict:
     """Merge a session's chunks and, optionally, transcode the result.
 
@@ -650,7 +677,7 @@ def process_recording(
         return result
 
     try:
-        out = remux_to_mp4(session_id)
+        out = remux_to_mp4(session_id, cancel_check=cancel_check) if cancel_check else remux_to_mp4(session_id)
     except (FFmpegUnavailable, RemuxFailed) as exc:
         # Both WebM artefacts survive by construction; report and move on.
         logger.warning("Transcode unavailable for session %s: %s", session_id, exc)
@@ -761,6 +788,16 @@ async def upload_chunk(
         )
 
     path = chunk_path(session_id, sequence)
+    db.expire_all()
+    declared = models.get_recording(db, session_id)
+    if declared and declared.recording_state in {"deleting", "deleted"}:
+        raise HTTPException(status_code=409, detail="recording_deleted")
+    if declared and declared.manifest:
+        entry = next((row for row in declared.manifest.get("chunks", []) if row["sequence"] == sequence), None)
+        if entry and entry["sha256"] == digest:
+            return {"session_id": session_id, "sequence": sequence, "size_bytes": len(data),
+                    "checksum": digest, "status": "duplicate", "metadata_persisted": True}
+        raise HTTPException(status_code=409, detail={"error": "sequence_conflict", "sequence": sequence})
     if path.is_file():
         stored_digest = sha256_file(path)
         if stored_digest != digest:
@@ -799,7 +836,7 @@ async def upload_chunk(
             checksum=digest,
             start_ms=start_ms,
             end_ms=end_ms,
-            path=str(path),
+            path=f"sessions/{session_id}/chunks/{path.name}",
             commit=False,
         )
         db.commit()
@@ -862,6 +899,9 @@ def recording_status(
         validate_session_id(session_id)
     except InvalidSessionId as exc:
         raise _invalid_session_id_response(exc) from exc
+    rec = models.get_recording(db, session_id)
+    if rec and rec.recording_state in {"deleting", "deleted"}:
+        raise HTTPException(status_code=410, detail="recording_deleted")
     return recording_integrity.student_upload_status(session_id, db)
 
 
@@ -905,25 +945,18 @@ def finalize_recording(
     )
 
 
-@router.post("/{session_id}/process")
+@router.post("/{session_id}/process", status_code=202)
 def process_session_recording(
     session_id: str,
     remux: bool = True,
     allow_missing_header: bool = False,
-    _actor: auth.Actor = Depends(auth.require_operator),
+    _actor: auth.Actor = Depends(auth.require_recording_delete_actor),
     db: DBSession = Depends(get_db),
 ) -> dict:
-    """Merge this session's chunks and transcode them for review (spec §10.1).
+    """Enqueue processing only; FFmpeg and filesystem cleanup run in the worker.
 
-    Declared ``def`` rather than ``async def`` on purpose: FastAPI runs sync
-    handlers in a threadpool, so a multi-minute FFmpeg call does not stall the
-    event loop that the live WebSocket sessions share.
-
-    The trigger is unchanged — this route still runs FFmpeg in the request —
-    but it only runs for a take the completeness check has marked ``complete``.
-    ``incomplete`` / ``recorder_lost`` recordings are refused, and this route
-    never deletes raw chunks. ``allow_missing_header`` does not bypass that
-    gate; partial salvage waits for the operator job-queue batch.
+    Incomplete/recorder_lost takes are refused even for OP. Raw-only processing
+    is no longer a request operation. Partial salvage has no implemented path.
     """
     try:
         validate_session_id(session_id)
@@ -940,19 +973,13 @@ def process_session_recording(
                 ),
             },
         )
-    recording_integrity.mark_transcode_started(db, session_id)
-    try:
-        result = process_recording(
-            session_id, db, remux=remux, allow_missing_header=allow_missing_header
-        )
-    except NoChunksStored as exc:
-        recording_integrity.mark_transcode_result(db, session_id, status="raw_only")
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except MissingHeaderChunk as exc:
-        recording_integrity.mark_transcode_result(db, session_id, status="raw_only")
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    outcome = str(result.get("status") or "raw_only")
-    if result.get("remux_error") == "skipped":
-        outcome = "skipped"
-    recording_integrity.mark_transcode_result(db, session_id, status=outcome)
-    return result
+    if allow_missing_header and not _actor.is_operator:
+        raise HTTPException(status_code=403, detail="operator_required")
+    if not remux:
+        raise HTTPException(status_code=400, detail="remux_required")
+    from .jobs import enqueue
+    rec = models.get_recording(db, session_id)
+    kind = "upload" if rec and rec.recording_state in {"transcoded", "uploaded"} else "transcode"
+    job_id = enqueue(db, kind, session_id)
+    db.commit()
+    return {"session_id": session_id, "status": "queued", "job_id": job_id}

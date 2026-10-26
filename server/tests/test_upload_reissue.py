@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -108,7 +109,9 @@ def _redeem(client: TestClient, session_id: str, code: str):
 
 
 def _upload_token(client: TestClient, session_id: str) -> str:
+    before_issue = int(time.time())
     body = _redeem(client, session_id, _reissue(client, session_id)["upload_code"])
+    after_issue = int(time.time())
     assert body.status_code == 200, body.text
     payload = body.json()
     assert payload["token_type"] == "upload"
@@ -117,7 +120,12 @@ def _upload_token(client: TestClient, session_id: str) -> str:
     assert claims["typ"] == "upload"
     assert claims["grant_id"] == session_id
     assert claims["role"] == "student"
-    assert claims["exp"] - claims["iat"] == auth.UPLOAD_TOKEN_TTL_SECONDS
+    # Expiry is computed before signing sets iat. Crossing a wall-clock second
+    # between those operations is legitimate; bound both to the actual request
+    # interval instead of requiring two separate time() calls to be identical.
+    assert before_issue + auth.UPLOAD_TOKEN_TTL_SECONDS <= claims["exp"] <= after_issue + auth.UPLOAD_TOKEN_TTL_SECONDS
+    assert before_issue <= claims["iat"] <= after_issue
+    assert 0 < claims["exp"] - claims["iat"] <= auth.UPLOAD_TOKEN_TTL_SECONDS
     return payload["access_token"]
 
 

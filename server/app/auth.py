@@ -476,6 +476,18 @@ def require_review_actor(
     return dependency(request, session_id, db)
 
 
+def require_recording_delete_actor(
+    request: Request,
+    session_id: str,
+    db: DBSession = Depends(get_db),
+) -> Actor:
+    """Strict teacher review or OP, Bearer only; no ended-session exemption."""
+    header = request.headers.get("authorization", "")
+    if not header.lower().startswith("bearer ") or not header[7:].strip():
+        raise HTTPException(status_code=401, detail="missing_session_token")
+    return require_roles("teacher", typ="review", allow_operator=True)(request, session_id, db)
+
+
 def require_roles(
     *roles: str,
     allow_operator: bool = False,
