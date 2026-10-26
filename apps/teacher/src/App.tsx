@@ -1,15 +1,38 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { clearReviewSession, readReviewSession, rememberAccessToken } from "@mind-probe/shared";
-import { fetchAuditLogs, fetchClipManifest, fetchRecordingStatus, fetchRubric, fetchSession, fetchTimeline, joinSession, reviewLogin } from "./api";
+import {
+  clearReviewSession,
+  readReviewSession,
+  rememberAccessToken,
+  subscribeReviewSessionDrop,
+} from "@mind-probe/shared";
+import { fetchAuditLogs, fetchClipManifest, fetchRecordingStatus, fetchRubric, fetchSession, fetchTimeline, joinSession, reviewLogin, reviewLogout } from "./api";
 import "./App.css";
 import { DualVideoPlayer } from "./components/DualVideoPlayer";
 import { InteractiveTimeline } from "./components/InteractiveTimeline";
 import { RubricScoringPanel } from "./components/RubricScoringPanel";
 import { SessionJoinBar, type SessionLoadRequest } from "./components/SessionJoinBar";
+import { reviewErrorMessage, ReviewRequestError, shouldReturnToReviewLogin } from "./reviewErrors";
+import { readAuthMode, rememberAuthMode, type SessionAuthMode } from "./sessionAuthMode";
 import type { AuthContext, AuditResponse, ClipManifestEntry, RecordingStatus, RubricData, SessionInfo, TeacherMarker, TimelineResponse } from "./types";
 
+function errorText(error: unknown): string {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  return "Unable to load review session.";
+}
+
 function App() {
+  const boot = useState(() => {
+    const review = readReviewSession();
+    if (review) {
+      rememberAuthMode("review_code");
+      return { authMode: "review_code" as SessionAuthMode, sessionId: review.sessionId, signedIn: true };
+    }
+    return { authMode: readAuthMode(), sessionId: "", signedIn: false };
+  })[0];
+  const [authMode, setAuthMode] = useState<SessionAuthMode>(boot.authMode);
   const [auth, setAuth] = useState<AuthContext>({ token: "" });
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [timeline, setTimeline] = useState<TimelineResponse | null>(null);
@@ -22,6 +45,9 @@ function App() {
   const [seekTarget, setSeekTarget] = useState<{ tMs: number; nonce: number } | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [reviewSignedIn, setReviewSignedIn] = useState(boot.signedIn);
+  const [logoutPending, setLogoutPending] = useState(false);
+  const [formNonce, setFormNonce] = useState(0);
 
   const caseId = timeline?.case_id ?? session?.case_id ?? rubric?.case_id ?? "";
 
@@ -98,12 +124,77 @@ function App() {
         throw new Error("A Bearer token is required to load the review.");
       }
       await applyLoaded(request.sessionId, token);
+      setReviewSignedIn(readReviewSession()?.sessionId === request.sessionId);
     } catch (error) {
-      setLoadError(error instanceof Error ? error.message : "Unable to load review session.");
+      if (
+        request.authMode === "review_code" ||
+        (error instanceof ReviewRequestError && shouldReturnToReviewLogin(error.detail))
+      ) {
+        setAuthMode("review_code");
+        rememberAuthMode("review_code");
+      }
+      if (readReviewSession() === null) {
+        setReviewSignedIn(false);
+      }
+      setLoadError(errorText(error));
     } finally {
       setIsLoading(false);
     }
   }, [applyLoaded]);
+
+  const chooseAuthMode = useCallback((mode: SessionAuthMode) => {
+    setAuthMode(mode);
+    rememberAuthMode(mode);
+  }, []);
+
+  const abandonReview = useCallback((message: string | null) => {
+    setAuth({ token: "" });
+    setSession(null);
+    setTimeline(null);
+    setRecordingStatus(null);
+    setRubric(null);
+    setAudit(null);
+    setClips([]);
+    setTeacherMarkers([]);
+    setCurrentTimeMs(0);
+    setSeekTarget(null);
+    setIsLoading(false);
+    setReviewSignedIn(false);
+    setAuthMode("review_code");
+    rememberAuthMode("review_code");
+    setLoadError(message);
+    setFormNonce((nonce) => nonce + 1);
+  }, []);
+
+  useEffect(() => {
+    return subscribeReviewSessionDrop((detail) => {
+      abandonReview(reviewErrorMessage(detail));
+    });
+  }, [abandonReview]);
+
+  const logout = useCallback(async () => {
+    const review = readReviewSession();
+    const sessionId = review?.sessionId || session?.session_id || "";
+    const token = review?.accessToken || auth.token;
+    setLogoutPending(true);
+    setLoadError(null);
+    try {
+      if (review && sessionId && token) {
+        await reviewLogout(sessionId, { token });
+      } else {
+        clearReviewSession();
+      }
+      abandonReview(null);
+    } catch (error) {
+      if (readReviewSession() === null) {
+        abandonReview(null);
+        return;
+      }
+      setLoadError(errorText(error));
+    } finally {
+      setLogoutPending(false);
+    }
+  }, [abandonReview, auth.token, session]);
 
   useEffect(() => {
     const stored = readReviewSession();
@@ -114,10 +205,24 @@ function App() {
     setIsLoading(true);
     setLoadError(null);
     applyLoaded(stored.sessionId, stored.accessToken)
-      .catch((error: unknown) => {
+      .then(() => {
         if (!cancelled) {
-          setLoadError(error instanceof Error ? error.message : "Unable to load review session.");
+          setReviewSignedIn(readReviewSession()?.sessionId === stored.sessionId);
         }
+      })
+      .catch((error: unknown) => {
+        if (cancelled) {
+          return;
+        }
+        if (
+          readReviewSession() === null ||
+          (error instanceof ReviewRequestError && shouldReturnToReviewLogin(error.detail))
+        ) {
+          setAuthMode("review_code");
+          rememberAuthMode("review_code");
+          setReviewSignedIn(false);
+        }
+        setLoadError(errorText(error));
       })
       .finally(() => {
         if (!cancelled) {
@@ -141,10 +246,17 @@ function App() {
   return (
     <main className="app-shell">
       <SessionJoinBar
+        authMode={authMode}
+        formNonce={formNonce}
+        initialSessionId={boot.sessionId}
         isLoading={isLoading}
+        logoutPending={logoutPending}
+        onAuthModeChange={chooseAuthMode}
         onLoadSession={loadSession}
+        onLogout={() => void logout()}
         recordingStatus={recordingStatus}
         session={session}
+        showLogout={reviewSignedIn}
       />
 
       {loadError ? <div className="alert alert-error">{loadError}</div> : null}

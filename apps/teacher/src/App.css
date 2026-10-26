@@ -180,13 +180,30 @@ button:disabled {
   resize: vertical;
 }
 
-.primary-button {
+.join-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.primary-button,
+.secondary-button {
   min-height: 39px;
-  border: 0;
   border-radius: 7px;
+  font-weight: 760;
+}
+
+.primary-button {
+  border: 0;
   background: #a8e6c3;
   color: #092116;
-  font-weight: 760;
+}
+
+.secondary-button {
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: transparent;
+  color: #e8edf2;
+  padding: 0 12px;
 }
 
 .full-width {

@@ -1,12 +1,15 @@
 import {
   authorizedReviewFetch,
   clearReviewSession,
+  isExpiredReviewDetail,
+  isUnrecoverableReviewDetail,
   readReviewSession,
   rememberAccessToken,
   rememberReviewSession,
   type ReviewTokenResponse,
 } from "@mind-probe/shared";
 import { apiUrl } from "./config";
+import { ReviewRequestError } from "./reviewErrors";
 import type {
   AuditResponse,
   AuthContext,
@@ -48,22 +51,24 @@ function bearerFrom(headers: Headers): string {
   return value.slice(prefix.length).trim();
 }
 
-async function errorMessage(response: Response): Promise<string> {
-  let message = `${response.status} ${response.statusText}`;
+async function responseError(response: Response): Promise<ReviewRequestError> {
   try {
     const body = (await response.json()) as { detail?: unknown };
-    if (typeof body.detail === "string") {
-      message = body.detail;
-    } else if (body.detail) {
-      message = JSON.stringify(body.detail);
+    if (typeof body.detail === "string" && body.detail) {
+      return new ReviewRequestError(body.detail);
+    }
+    if (body.detail) {
+      const encoded = JSON.stringify(body.detail);
+      return new ReviewRequestError(encoded, encoded);
     }
   } catch {
     const text = await response.text();
     if (text) {
-      message = text;
+      return new ReviewRequestError(text, text);
     }
   }
-  return message;
+  const fallback = `${response.status} ${response.statusText}`.trim();
+  return new ReviewRequestError(fallback, fallback);
 }
 
 async function readDetail(response: Response): Promise<string> {
@@ -83,7 +88,7 @@ function postReviewRefresh(sessionId: string, refreshToken: string): Promise<Rev
     body: JSON.stringify({ refresh_token: refreshToken }),
   }).then(async (response) => {
     if (!response.ok) {
-      throw new Error(await errorMessage(response));
+      throw await responseError(response);
     }
     return response.json() as Promise<ReviewTokenResponse>;
   });
@@ -125,9 +130,21 @@ async function send(path: string, init: RequestInit = {}): Promise<Response> {
 async function fetchJson<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await send(path, init);
   if (!response.ok) {
-    throw new Error(await errorMessage(response));
+    throw await responseError(response);
   }
   return response.json() as Promise<T>;
+}
+
+export async function reviewLogout(sessionId: string, auth: AuthContext): Promise<void> {
+  const response = await send(`/sessions/${encodeURIComponent(sessionId)}/review-logout`, {
+    method: "POST",
+    headers: authHeaders(auth),
+  });
+  if (response.ok || response.status === 401) {
+    clearReviewSession();
+    return;
+  }
+  throw await responseError(response);
 }
 
 export async function joinSession(
@@ -215,10 +232,16 @@ export async function fetchAuditLogs(
     headers: authHeaders(auth),
   });
   if (response.status === 401 || response.status === 403) {
+    if (response.status === 401) {
+      const detail = await readDetail(response);
+      if (isUnrecoverableReviewDetail(detail) || isExpiredReviewDetail(detail)) {
+        throw new ReviewRequestError(detail);
+      }
+    }
     return null;
   }
   if (!response.ok) {
-    throw new Error(await errorMessage(response));
+    throw await responseError(response);
   }
   return response.json() as Promise<AuditResponse>;
 }
