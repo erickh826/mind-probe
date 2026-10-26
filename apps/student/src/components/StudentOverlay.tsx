@@ -1,5 +1,6 @@
 import type { StudentRecorder } from "../useMediaRecorder";
 import type { StudentSocket } from "../useStudentSocket";
+import { permanentBlockMessage } from "../uploadQueue";
 
 interface StudentOverlayProps {
   socket: StudentSocket;
@@ -26,9 +27,7 @@ export function StudentOverlay({
   allowStartRecording = true,
 }: StudentOverlayProps) {
   const paused = socket.session.session_state === "paused";
-  const isStoppedOrEnded = recorder.status === "stopped" || socket.session.session_state === "ended";
-  const hasPending = recorder.chunks.some((c) => c.status === "queued" || c.status === "uploading");
-  const isSafeToClose = isStoppedOrEnded && !hasPending && recorder.failedCount === 0 && recorder.uploadedCount > 0;
+  const banner = recorder.banner;
 
   return (
     <>
@@ -63,18 +62,41 @@ export function StudentOverlay({
           <p className="eyebrow">Recording Queue</p>
           <strong>
             {recorder.uploadedCount} uploaded / {recorder.failedCount} failed
+            {recorder.pendingCount > 0 ? ` / 尚有 ${recorder.pendingCount} 段未上傳` : ""}
           </strong>
-          {isSafeToClose ? (
+          {banner.kind === "safe" ? (
             <span style={{ color: "#42d392", fontWeight: 700, marginTop: "4px", display: "block" }}>
-              ✅ 錄影已全數保存，可安全關閉 (Safe to close)
+              可以安全關閉
             </span>
-          ) : isStoppedOrEnded && hasPending ? (
+          ) : null}
+          {banner.kind === "confirming" ? (
             <span style={{ color: "#f2c14e", fontWeight: 600, marginTop: "4px", display: "block" }}>
-              ⏳ 正在上傳剩餘錄影，請勿關閉視窗...
+              正在確認…請勿關閉
             </span>
-          ) : isStoppedOrEnded && recorder.failedCount > 0 ? (
-            <span style={{ color: "#ff8a8a", fontWeight: 600, marginTop: "4px", display: "block" }}>
-              ❌ 有片段上傳失敗，請點擊 Retry 重試
+          ) : null}
+          {banner.kind === "uploading" ? (
+            <span style={{ color: "#f2c14e", fontWeight: 600, marginTop: "4px", display: "block" }}>
+              尚有 {banner.pending} 段未上傳
+            </span>
+          ) : null}
+          {banner.kind === "interrupted" ? (
+            <span style={{ color: "#ff8a8a", fontWeight: 700, marginTop: "4px", display: "block" }}>
+              錄影已中斷，請通知老師或管理員
+            </span>
+          ) : null}
+          {banner.kind === "incomplete" ? (
+            <span style={{ color: "#ff8a8a", fontWeight: 700, marginTop: "4px", display: "block" }}>
+              錄影不完整，已通知管理員
+            </span>
+          ) : null}
+          {banner.kind === "needs_operator" ? (
+            <span style={{ color: "#ff8a8a", fontWeight: 700, marginTop: "4px", display: "block" }}>
+              {permanentBlockMessage(banner.block)}
+            </span>
+          ) : null}
+          {recorder.storageWarning ? (
+            <span style={{ color: "#f2c14e", display: "block", marginTop: "4px" }}>
+              {recorder.storageWarning}
             </span>
           ) : null}
           {recorder.error ? <span className="panel-error">{recorder.error}</span> : null}
@@ -82,7 +104,7 @@ export function StudentOverlay({
         <div className="button-row">
           {recorder.status === "recording" ? (
             <button onClick={onStopRecording}>Stop REC</button>
-          ) : allowStartRecording ? (
+          ) : allowStartRecording && recorder.canStart ? (
             <button onClick={onStartRecording}>Start REC</button>
           ) : null}
           <button onClick={recorder.retryFailed} disabled={recorder.failedCount === 0}>

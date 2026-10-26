@@ -246,7 +246,8 @@ button:disabled {
   font-size: 14px;
 }
 
-.join-panel input {
+.join-panel input,
+.join-panel select {
   width: 100%;
   min-height: 42px;
   border: 1px solid rgba(255, 255, 255, 0.22);
@@ -254,6 +255,11 @@ button:disabled {
   background: #12161a;
   color: #fff;
   padding: 0 12px;
+}
+
+.join-secondary {
+  background: transparent;
+  color: #f7f7f2;
 }
 
 .join-error,

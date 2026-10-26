@@ -5,9 +5,13 @@ import {
   readJoinedSession,
   rememberJoinedSession,
 } from "@mind-probe/shared";
-import { ApiError, fetchClipManifest, fetchSession, joinSession } from "./api";
+import { fetchClipManifest, fetchSession, fetchUploadStatus, joinSession, uploadLogin } from "./api";
+import { restoreStudentSession, UNAVAILABLE_RESTORE_MESSAGE } from "./restoreSession";
 import { mediaUrl } from "./config";
 import { JoinSessionModal } from "./components/JoinSessionModal";
+import { UploadCodeForm } from "./components/UploadCodeForm";
+import { resumeUnauthorizedUploads } from "./recordingController";
+import { findUnfinishedUploadSessions, type UploadRecovery } from "./uploadRecovery";
 import { StudentOverlay } from "./components/StudentOverlay";
 import { SuspectVideoPlayer } from "./components/SuspectVideoPlayer";
 import { useMediaRecorder } from "./useMediaRecorder";
@@ -44,11 +48,18 @@ export default function App() {
   const [restorePending, setRestorePending] = useState(
     () => readJoinedSession()?.role === "student",
   );
+  const [restoreError, setRestoreError] = useState<string | null>(null);
+  const [recoveries, setRecoveries] = useState<UploadRecovery[]>([]);
+  const [recoveryChecked, setRecoveryChecked] = useState(false);
+  const [preferJoin, setPreferJoin] = useState(false);
   const [cameraVisible, setCameraVisible] = useState(true);
   const autoRecordingAttemptedRef = useRef(false);
   const previousRecorderStatusRef = useRef<string>("idle");
 
-  const socket = useStudentSocket(joined?.sessionId ?? null, joined?.accessToken ?? null);
+  const socket = useStudentSocket(
+    joined?.uploadOnly ? null : (joined?.sessionId ?? null),
+    joined?.uploadOnly ? null : (joined?.accessToken ?? null),
+  );
   const recorder = useMediaRecorder({
     sessionId: joined?.sessionId ?? null,
     onChunkUploaded: socket.sendChunkUploaded,
@@ -114,6 +125,32 @@ export default function App() {
     }
   }, []);
 
+  const handleUploadLogin = useCallback(async (sessionId: string, code: string) => {
+    setJoinPending(true);
+    setJoinError(null);
+    try {
+      const login = await uploadLogin(sessionId, code);
+      await resumeUnauthorizedUploads(sessionId);
+      rememberJoinedSession({
+        sessionId,
+        role: "student",
+        accessToken: login.access_token,
+      });
+      setJoined({
+        sessionId,
+        caseId: "",
+        clips: [],
+        accessToken: login.access_token,
+        restoredFromStorage: true,
+        uploadOnly: true,
+      });
+    } catch (cause) {
+      setJoinError(String(cause instanceof Error ? cause.message : cause));
+    } finally {
+      setJoinPending(false);
+    }
+  }, []);
+
   useEffect(() => {
     if (!restorePending) {
       return;
@@ -125,37 +162,73 @@ export default function App() {
     }
     let cancelled = false;
     void (async () => {
-      try {
-        const session = await fetchSession(stored.sessionId);
-        const clips = await fetchClipManifest(session.case_id);
-        if (cancelled) {
-          return;
-        }
+      const restored = await restoreStudentSession(stored, {
+        fetchSession,
+        fetchClipManifest,
+        fetchUploadStatus,
+        clearJoinedSession,
+      });
+      if (cancelled) {
+        return;
+      }
+      if (restored.kind === "live") {
+        setRestoreError(null);
         setJoined({
-          sessionId: session.session_id,
-          caseId: session.case_id,
-          clips,
-          accessToken: stored.accessToken,
+          sessionId: restored.sessionId,
+          caseId: restored.caseId,
+          clips: restored.clips,
+          accessToken: restored.accessToken,
           restoredFromStorage: true,
         });
-      } catch (cause) {
-        if (cancelled) {
-          return;
-        }
-        if (cause instanceof ApiError && [401, 403, 404].includes(cause.status)) {
-          clearJoinedSession(stored.sessionId);
-          setJoinError("Saved session is no longer valid. Join again.");
-        }
-      } finally {
-        if (!cancelled) {
-          setRestorePending(false);
-        }
+      } else if (restored.kind === "upload-only") {
+        setRestoreError(null);
+        setJoined({
+          sessionId: restored.sessionId,
+          caseId: "",
+          clips: [],
+          accessToken: restored.accessToken,
+          restoredFromStorage: true,
+          uploadOnly: true,
+        });
+      } else if (restored.kind === "rejected") {
+        setRestoreError(null);
+        setJoinError(restored.message);
+      } else {
+        setRestoreError(UNAVAILABLE_RESTORE_MESSAGE);
       }
+      setRestorePending(false);
     })();
     return () => {
       cancelled = true;
     };
   }, [restorePending]);
+
+  useEffect(() => {
+    if (restorePending || joined !== null || readJoinedSession() !== null) {
+      return;
+    }
+    let cancelled = false;
+    setRecoveryChecked(false);
+    void findUnfinishedUploadSessions()
+      .then((found) => {
+        if (!cancelled) {
+          setRecoveries(found);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setRecoveries([]);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setRecoveryChecked(true);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [restorePending, joined]);
 
   useEffect(() => {
     if (
@@ -192,8 +265,60 @@ export default function App() {
         </div>
       );
     }
+    if (restoreError && joined === null) {
+      return (
+        <div className="join-shell">
+          <div className="join-panel">
+            <h1>Session not reachable</h1>
+            <p className="join-error">{restoreError}</p>
+            <button
+              type="button"
+              onClick={() => {
+                setRestoreError(null);
+                setRestorePending(true);
+              }}
+            >
+              Retry
+            </button>
+          </div>
+        </div>
+      );
+    }
+    if (!recoveryChecked) {
+      return (
+        <div className="join-shell">
+          <p className="join-panel">Checking local recording…</p>
+        </div>
+      );
+    }
+    if (!preferJoin && recoveries.length > 0) {
+      return (
+        <UploadCodeForm
+          sessions={recoveries}
+          pending={joinPending}
+          error={joinError}
+          onSubmit={handleUploadLogin}
+          onJoinAnother={() => {
+            setJoinError(null);
+            setPreferJoin(true);
+          }}
+        />
+      );
+    }
     return (
-      <JoinSessionModal pending={joinPending} error={joinError} onJoin={handleJoin} />
+      <JoinSessionModal
+        pending={joinPending}
+        error={joinError}
+        onJoin={handleJoin}
+        onResumeUpload={
+          recoveries.length > 0
+            ? () => {
+                setJoinError(null);
+                setPreferJoin(false);
+              }
+            : undefined
+        }
+      />
     );
   }
 
@@ -215,7 +340,7 @@ export default function App() {
           void recorder.start();
         }}
         onStopRecording={recorder.stop}
-        allowStartRecording={!joined.restoredFromStorage}
+        allowStartRecording={!joined.restoredFromStorage && recorder.canStart}
       />
     </div>
   );

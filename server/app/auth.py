@@ -26,8 +26,10 @@ import hmac
 import json
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from fastapi import Depends, HTTPException, Request
@@ -41,6 +43,114 @@ logger = logging.getLogger(__name__)
 AUTH_COOKIE_ENV = "MINDPROBE_AUTH_COOKIE"
 OPERATOR_TOKEN_ENV = "MINDPROBE_OPERATOR_TOKEN"
 OPERATOR_ROLE = "operator"
+UPLOAD_GRACE_ENV = "MINDPROBE_UPLOAD_GRACE_SECONDS"
+DEFAULT_UPLOAD_GRACE_SECONDS = 600
+#: Upload recovery tokens are shorter than the two-hour live join token.
+UPLOAD_TOKEN_TTL_SECONDS = 15 * 60
+UPLOAD_ISSUE_LIMIT = 5
+UPLOAD_ISSUE_WINDOW_SECONDS = 10 * 60
+UPLOAD_REDEEM_LIMIT = 5
+UPLOAD_REDEEM_WINDOW_SECONDS = 60
+
+
+def utcnow() -> datetime:
+    """Clock for grace-window checks. Tests replace this rather than sleeping."""
+    return datetime.now(timezone.utc)
+
+
+def upload_rate_now() -> float:
+    """Clock for upload-code rate limits. Tests replace this rather than sleeping."""
+    return time.monotonic()
+
+
+class SlidingWindowLimiter:
+    """Process-local counter. ``reset`` keeps tests from sharing a window."""
+
+    def __init__(self) -> None:
+        self._events: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, key: str, *, limit: int, window_s: float, now: float) -> bool:
+        with self._lock:
+            hits = [stamp for stamp in self._events.get(key, []) if now - stamp < window_s]
+            if len(hits) >= limit:
+                self._events[key] = hits
+                return False
+            hits.append(now)
+            self._events[key] = hits
+            return True
+
+    def reset(self) -> None:
+        with self._lock:
+            self._events.clear()
+
+
+upload_issue_limiter = SlidingWindowLimiter()
+upload_redeem_limiter = SlidingWindowLimiter()
+
+
+def reset_upload_rate_limits() -> None:
+    upload_issue_limiter.reset()
+    upload_redeem_limiter.reset()
+
+
+def upload_grace_seconds() -> int:
+    """How long a student may keep uploading after ``/end`` (ADR-0005 §7.3)."""
+    raw = os.environ.get(UPLOAD_GRACE_ENV, str(DEFAULT_UPLOAD_GRACE_SECONDS))
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_UPLOAD_GRACE_SECONDS
+    if value < 0:
+        return DEFAULT_UPLOAD_GRACE_SECONDS
+    return value
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def within_upload_grace(
+    db: DBSession, session_id: str, reason: str | None, role: str
+) -> bool:
+    """True when a student token revoked by ``/end`` is still inside the grace window.
+
+    Only ``revoke_reason=session_ended`` qualifies. A security revocation never
+    does, and the window does not open for any other role (ADR-0005 §7.3).
+    """
+    if reason != models.REVOKE_REASON_SESSION_ENDED or role != "student":
+        return False
+    session = models.get_session(db, session_id)
+    if session is None or session.status != "ended" or session.ended_at is None:
+        return False
+    deadline = _as_utc(session.ended_at) + timedelta(seconds=upload_grace_seconds())
+    return utcnow() < deadline
+
+
+def session_upload_grace_open(session: models.Session) -> bool:
+    """True while ``now < ended_at + grace``. Unended sessions are not in grace."""
+    if session.status != "ended" or session.ended_at is None:
+        return False
+    deadline = _as_utc(session.ended_at) + timedelta(seconds=upload_grace_seconds())
+    return utcnow() < deadline
+
+
+def enforce_upload_token_use(db: DBSession, session_id: str) -> None:
+    """Refuse a ``typ=upload`` credential whose grant or grace window is closed.
+
+    Checked on every chunk, finalize, and status call. A token minted before
+    ``/end`` does not keep working after grace just because its ``exp`` is later.
+    ``/end`` does not set the security flag, so grace uploads still pass.
+    """
+    if models.upload_security_revoked(db, session_id):
+        raise HTTPException(status_code=401, detail="revoked_session_token")
+    session = models.get_session(db, session_id)
+    if session is None:
+        raise HTTPException(status_code=401, detail="revoked_session_token")
+    if session.status == "ended" and not session_upload_grace_open(session):
+        raise HTTPException(status_code=401, detail="upload_grace_expired")
 
 
 def cookie_auth_enabled() -> bool:
@@ -259,7 +369,7 @@ def get_current_actor(
             status_code=403, detail="operator may not use this endpoint"
         )
     try:
-        claims = decode_session_token(token, session_id=session_id)
+        claims = decode_session_token(token, session_id=session_id, typ="live")
     except TokenInvalid as exc:
         raise HTTPException(status_code=401, detail=exc.reason) from exc
 
@@ -307,15 +417,37 @@ def require_roles(
     allow_operator: bool = False,
     ended_exempt: bool = False,
     typ: str | None = None,
+    allowed_typs: tuple[str, ...] | frozenset[str] | None = None,
+    revocation: str | None = None,
 ) -> Callable[..., Actor]:
     """Build a ``/sessions/{session_id}/...`` dependency for the ADR-0005 §5 table.
 
-    ``ended_exempt`` lets a live token revoked by ``/end`` (reason
-    ``session_ended``) keep reading once the session is ended. A token revoked
-    for any other reason is always refused. 403 means a valid token with the
+    Omitted ``typ`` claims stay ``live``. Callers that do not pass
+    ``allowed_typs`` accept only ``live`` (or the single ``typ`` they name).
+    The three upload routes pass ``allowed_typs=("live", "upload")``. A
+    ``typ=upload`` token is refused everywhere else with ``token_type_mismatch``.
+
+    ``ended_exempt`` (or ``revocation="ended_exempt"``) lets a live token revoked
+    by ``/end`` (reason ``session_ended``) keep reading once the session is
+    ended. ``revocation="grace_upload"`` is narrower: only a student token, only
+    until ``ended_at + MINDPROBE_UPLOAD_GRACE_SECONDS``, and only on the three
+    upload endpoints that pass this mode. A token revoked for any other reason
+    is always refused. ``typ=upload`` also rechecks the grant flag and, once the
+    session has ended, the grace window, even when that token has no revocation
+    row and its ``exp`` is still in the future. 403 means a valid token with the
     wrong role; 401 means the token itself is unusable.
     """
     allowed = frozenset(roles)
+    if allowed_typs is not None:
+        accepted_typs = frozenset(allowed_typs)
+        decode_typ = None
+    else:
+        decode_typ = typ or "live"
+        accepted_typs = frozenset({decode_typ})
+    if revocation is None:
+        mode = "ended_exempt" if ended_exempt else "strict"
+    else:
+        mode = revocation
 
     def dependency(
         request: Request,
@@ -332,24 +464,37 @@ def require_roles(
                 )
             return _operator_actor(token, session_id)
         try:
-            claims = decode_session_token(token, session_id=session_id, typ=typ)
+            claims = decode_session_token(token, session_id=session_id, typ=decode_typ)
         except TokenInvalid as exc:
             raise HTTPException(status_code=401, detail=exc.reason) from exc
 
+        token_typ = str(claims.get("typ", "live"))
+        if token_typ not in accepted_typs:
+            raise HTTPException(status_code=401, detail="token_type_mismatch")
+
+        role = str(claims.get("role") or "")
         token_hash = models.hash_token(token)
         reason = models.token_revocation_reason(db, session_id, token_hash)
         if reason is not None:
             session = models.get_session(db, session_id)
-            exempt = (
-                ended_exempt
-                and reason == models.REVOKE_REASON_SESSION_ENDED
-                and session is not None
-                and session.status == "ended"
-            )
+            if mode == "grace_upload":
+                exempt = within_upload_grace(db, session_id, reason, role)
+            elif mode == "ended_exempt":
+                exempt = (
+                    reason == models.REVOKE_REASON_SESSION_ENDED
+                    and session is not None
+                    and session.status == "ended"
+                )
+            else:
+                exempt = False
             if not exempt:
                 raise HTTPException(status_code=401, detail="revoked_session_token")
 
-        role = str(claims.get("role") or "")
+        if token_typ == "upload":
+            if claims.get("grant_id") != session_id:
+                raise HTTPException(status_code=401, detail="token_type_mismatch")
+            enforce_upload_token_use(db, session_id)
+
         if role not in allowed:
             raise HTTPException(
                 status_code=403,
@@ -415,7 +560,7 @@ def _resolve_pathless_actor(
     if allow_operator and is_operator_token(token):
         return _operator_actor(token)
     try:
-        claims = decode_session_token(token)
+        claims = decode_session_token(token, typ="live")
     except TokenInvalid as exc:
         raise HTTPException(status_code=401, detail=exc.reason) from exc
     session_id = str(claims.get("session_id") or "")
