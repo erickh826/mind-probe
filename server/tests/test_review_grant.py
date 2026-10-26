@@ -370,9 +370,10 @@ def test_expired_review_access_can_refresh_until_the_grant_is_revoked(client, mo
     created = create(client)
     logged = review_login(client, "S-R", created["review_codes"]["observer"]).json()
     clock = {"now": None}
+    real_time = time.time
 
     def fake_time() -> float:
-        return clock["now"] if clock["now"] is not None else time.time()
+        return clock["now"] if clock["now"] is not None else real_time()
 
     monkeypatch.setattr(auth.time, "time", fake_time)
     clock["now"] = logged["expires_at"] + 5
