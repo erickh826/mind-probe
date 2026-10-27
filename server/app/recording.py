@@ -474,6 +474,8 @@ def remux_to_mp4(session_id: str, *, ffmpeg_bin: str | None = None, cancel_check
     final = mp4_path(session_id)
     out = final.with_name("student.part.mp4")
     out.parent.mkdir(parents=True, exist_ok=True)
+    # Drop a partial left by a killed worker before this attempt writes its own.
+    _discard_invalid_mp4(out)
     binary = ffmpeg_bin or _ffmpeg_bin()
     cmd = [
         binary,
@@ -495,67 +497,76 @@ def remux_to_mp4(session_id: str, *, ffmpeg_bin: str | None = None, cancel_check
         str(out),
     ]
 
+    published = False
     try:
-        if cancel_check is None:
-            subprocess.run(cmd, check=True, capture_output=True)
-        else:
-            # A real worker can stop FFmpeg promptly after delete/shutdown.
-            # File-backed stderr avoids filling a pipe while polling.
-            with tempfile.TemporaryFile() as stderr:
-                process = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr)
-                try:
-                    started = time.monotonic()
-                    while process.poll() is None:
-                        cancel_check()
-                        if time.monotonic() - started > 900:
-                            raise RemuxFailed("FFmpeg timeout")
-                        time.sleep(0.2)
-                    if process.returncode:
-                        stderr.seek(0)
-                        raise subprocess.CalledProcessError(process.returncode, cmd, stderr=stderr.read())
-                finally:
-                    if process.poll() is None:
-                        process.kill()
-                    process.wait()
-    except FileNotFoundError as exc:
-        # Nothing ran, so nothing to clean up; the WebM is transcodable later.
-        raise FFmpegUnavailable(
-            f"FFmpeg binary not found: {binary!r}. The raw WebM for session "
-            f"{session_id} is untouched and can be transcoded later."
-        ) from exc
-    except subprocess.CalledProcessError as exc:
-        _discard_invalid_mp4(out)
-        raise RemuxFailed(
-            f"FFmpeg exited {exc.returncode} for session {session_id}: "
-            f"{_stderr_tail(exc.stderr)}"
-        ) from exc
+        try:
+            if cancel_check is None:
+                subprocess.run(cmd, check=True, capture_output=True)
+            else:
+                # A real worker can stop FFmpeg promptly after delete/shutdown.
+                # File-backed stderr avoids filling a pipe while polling.
+                # Any exit before replace() — cancel, failure, or a lock error
+                # that escapes the poll — must kill FFmpeg and drop the partial.
+                with tempfile.TemporaryFile() as stderr:
+                    process = subprocess.Popen(
+                        cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr
+                    )
+                    try:
+                        started = time.monotonic()
+                        while process.poll() is None:
+                            cancel_check()
+                            if time.monotonic() - started > 900:
+                                raise RemuxFailed("FFmpeg timeout")
+                            time.sleep(0.2)
+                        if process.returncode:
+                            stderr.seek(0)
+                            raise subprocess.CalledProcessError(
+                                process.returncode, cmd, stderr=stderr.read()
+                            )
+                    finally:
+                        if process.poll() is None:
+                            process.kill()
+                        process.wait()
+        except FileNotFoundError as exc:
+            # Nothing ran, so nothing to clean up; the WebM is transcodable later.
+            raise FFmpegUnavailable(
+                f"FFmpeg binary not found: {binary!r}. The raw WebM for session "
+                f"{session_id} is untouched and can be transcoded later."
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            raise RemuxFailed(
+                f"FFmpeg exited {exc.returncode} for session {session_id}: "
+                f"{_stderr_tail(exc.stderr)}"
+            ) from exc
 
-    if not out.is_file() or out.stat().st_size == 0:
-        _discard_invalid_mp4(out)
-        raise RemuxFailed(
-            f"FFmpeg reported success but produced no usable mp4 for session "
-            f"{session_id}."
-        )
+        if not out.is_file() or out.stat().st_size == 0:
+            raise RemuxFailed(
+                f"FFmpeg reported success but produced no usable mp4 for session "
+                f"{session_id}."
+            )
 
-    probe = probe_media(out)
-    if probe is not None and not probe["has_video"]:
-        # No video track means the source never carried a decodable one;
-        # surfacing it now beats a teacher discovering it at review time.
-        _discard_invalid_mp4(out)
-        raise RemuxFailed(
-            f"the transcoded mp4 for session {session_id} has no video stream "
-            f"(streams: {probe['codec_types']})."
-        )
-    if probe is not None and not probe["has_audio"]:
-        # Legitimate when the student had no microphone -- worth a line in the
-        # log, not worth discarding the video over.
-        logger.warning("Transcoded mp4 for session %s has no audio stream.", session_id)
+        probe = probe_media(out)
+        if probe is not None and not probe["has_video"]:
+            # No video track means the source never carried a decodable one;
+            # surfacing it now beats a teacher discovering it at review time.
+            raise RemuxFailed(
+                f"the transcoded mp4 for session {session_id} has no video stream "
+                f"(streams: {probe['codec_types']})."
+            )
+        if probe is not None and not probe["has_audio"]:
+            # Legitimate when the student had no microphone -- worth a line in the
+            # log, not worth discarding the video over.
+            logger.warning("Transcoded mp4 for session %s has no audio stream.", session_id)
 
-    logger.info("Transcoded session %s to %s.", session_id, out)
-    if cancel_check is not None:
-        cancel_check()
-    out.replace(final)
-    return final
+        logger.info("Transcoded session %s to %s.", session_id, out)
+        if cancel_check is not None:
+            cancel_check()
+        out.replace(final)
+        published = True
+        return final
+    finally:
+        if not published:
+            _discard_invalid_mp4(out)
 
 
 # ---------------------------------------------------------------------------

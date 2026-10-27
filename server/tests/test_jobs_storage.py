@@ -447,10 +447,12 @@ def test_delete_cancels_running_ffmpeg_before_output_publication(env, monkeypatc
     factory, client, store = env
     take(factory)
     fake_probe(monkeypatch)
+    part = recording.mp4_path("TAKE").with_name("student.part.mp4")
     class Process:
         killed = waited = False
         returncode = None
         def __init__(self, *args, **kwargs):
+            part.write_bytes(b"partial-transcode")
             assert client.request("DELETE", "/sessions/TAKE/recording", headers=OP,
                                   json={"confirm": "TAKE"}).status_code == 202
         def poll(self): return self.returncode
@@ -465,9 +467,98 @@ def test_delete_cancels_running_ffmpeg_before_output_publication(env, monkeypatc
     assert Process.killed and Process.waited
     assert job_row(factory, jid).status == "cancelled"
     assert recording.chunk_path("TAKE", 0).exists()
+    assert not part.exists()
     assert not recording.mp4_path("TAKE").exists()
+    # A second observation is still a cancel, and it does not recreate the partial.
+    with pytest.raises(jobs.JobCancelled):
+        worker._ffmpeg_cancel_check(jobs.ClaimedJob(jid, "transcode", "TAKE", {}))
+    assert not part.exists()
+    assert client.request("DELETE", "/sessions/TAKE/recording", headers=OP, json={"confirm": "TAKE"}).status_code == 202
     assert worker.run_once()
     assert not recording.session_dir("TAKE").exists()
+
+
+def test_sqlite_lock_on_cancel_poll_does_not_abort_transcode(env, monkeypatch, caplog):
+    """A busy database during the 0.2s poll must not kill FFmpeg or leave a part file."""
+    factory, _, store = env
+    take(factory)
+    fake_probe(monkeypatch)
+    monkeypatch.setattr(recording.time, "sleep", lambda _seconds: None)
+    part = recording.mp4_path("TAKE").with_name("student.part.mp4")
+    db_path = models.engine.url.database
+    held = {"conn": None}
+    polls = {"n": 0}
+
+    class Process:
+        killed = False
+        returncode = None
+        def __init__(self, *args, **kwargs):
+            part.write_bytes(b"partial-transcode")
+            # Drop idle pooled transactions so this write lock is the only one.
+            models.engine.dispose()
+            conn = sqlite3.connect(db_path, timeout=2, isolation_level=None)
+            # IMMEDIATE still lets readers through. EXCLUSIVE is the commit-window
+            # lock that makes the cancel poll raise "database is locked".
+            conn.execute("BEGIN EXCLUSIVE")
+            held["conn"] = conn
+        def poll(self):
+            polls["n"] += 1
+            if polls["n"] >= 2 and held["conn"] is not None:
+                held["conn"].rollback()
+                held["conn"].close()
+                held["conn"] = None
+                part.write_bytes(b"verified-mp4")
+                self.returncode = 0
+            return self.returncode
+        def kill(self):
+            Process.killed = True
+            self.returncode = -9
+        def wait(self):
+            pass
+
+    monkeypatch.setattr(recording.subprocess, "Popen", Process)
+    jid = queued(factory, "transcode")
+    worker = jobs.Worker(store=store)
+    caplog.set_level("WARNING")
+    try:
+        assert worker.run_once()
+    finally:
+        if held["conn"] is not None:
+            held["conn"].close()
+    assert not Process.killed
+    assert "database is locked" in caplog.text
+    assert job_row(factory, jid).status == "succeeded"
+    assert not part.exists()
+    assert recording.mp4_path("TAKE").is_file()
+    with factory() as db:
+        assert models.get_recording(db, "TAKE").recording_state == "transcoded"
+
+
+def test_finish_retries_sqlite_lock_without_leaving_job_running(env, monkeypatch):
+    from contextlib import contextmanager
+    from sqlalchemy.exc import OperationalError
+    factory, _, store = env
+    jid = queued(factory, "sqlite_backup", "2026-10-26")
+    worker = jobs.Worker(store=store)
+    with factory() as db:
+        claimed = jobs.claim(db, worker.worker_id)
+    original = models.session_scope
+    calls = {"n": 0}
+
+    @contextmanager
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OperationalError("UPDATE", {}, sqlite3.OperationalError("database is locked"))
+        with original() as db:
+            yield db
+
+    monkeypatch.setattr(models, "session_scope", flaky)
+    worker._finish(claimed)
+    assert calls["n"] >= 2
+    row = job_row(factory, jid)
+    assert row.status == "succeeded"
+    assert row.locked_by is None
 
 
 def test_finalization_autoqueues_and_timeout_preserves_missing_take(env):
@@ -523,6 +614,60 @@ def test_process_teacher_review_and_deleted_upload_refusal(env):
     assert client.post("/recording/TAKE/finalize", headers=student_header,
                        json={"final_sequence": 0, "total_chunks": 1, "total_duration_ms": 2000}).status_code == 409
     assert client.post("/recording/TAKE/process", headers=OP).status_code == 409
+
+
+@pytest.mark.skipif(__import__("shutil").which("ffmpeg") is None or __import__("shutil").which("ffprobe") is None,
+                    reason="real FFmpeg required")
+def test_real_ffmpeg_sqlite_lock_during_cancel_poll_leaves_no_part(env, caplog):
+    import subprocess
+    import time
+    factory, _, store = env
+    take(factory)
+    source = recording.chunk_path("TAKE", 0)
+    subprocess.run(["ffmpeg", "-y", "-nostdin", "-f", "lavfi", "-i",
+                    "testsrc=size=160x120:rate=10:duration=2", "-f", "lavfi", "-i",
+                    "sine=frequency=440:duration=2", "-c:v", "libvpx", "-deadline", "realtime",
+                    "-cpu-used", "8", "-c:a", "libopus", str(source)],
+                   check=True, capture_output=True)
+    part = recording.mp4_path("TAKE").with_name("student.part.mp4")
+    db_path = models.engine.url.database
+    errors: list[BaseException] = []
+
+    def hold_write_lock():
+        try:
+            deadline = time.time() + 20
+            while not part.exists() and time.time() < deadline:
+                time.sleep(0.01)
+            if not part.exists():
+                raise RuntimeError("transcode never created a partial mp4")
+            conn = sqlite3.connect(db_path, timeout=5, isolation_level=None)
+            try:
+                # IMMEDIATE still lets readers through. EXCLUSIVE matches the
+                # lock SQLite takes while another connection is committing.
+                conn.execute("BEGIN EXCLUSIVE")
+                time.sleep(0.7)
+                conn.rollback()
+            finally:
+                conn.close()
+        except BaseException as exc:
+            errors.append(exc)
+
+    locker = threading.Thread(target=hold_write_lock, daemon=True)
+    jid = queued(factory, "transcode")
+    worker = jobs.Worker(store=store)
+    caplog.set_level("WARNING")
+    locker.start()
+    try:
+        assert worker.run_once()
+    finally:
+        locker.join(timeout=10)
+    assert not errors, errors
+    assert "database is locked" in caplog.text
+    assert job_row(factory, jid).status == "succeeded"
+    assert not part.exists()
+    assert recording.mp4_path("TAKE").is_file()
+    with factory() as db:
+        assert models.get_recording(db, "TAKE").recording_state == "transcoded"
 
 
 @pytest.mark.skipif(__import__("shutil").which("ffmpeg") is None or __import__("shutil").which("ffprobe") is None,

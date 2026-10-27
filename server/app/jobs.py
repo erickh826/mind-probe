@@ -115,6 +115,24 @@ class JobCancelled(Exception):
     pass
 
 
+def _sqlite_busy(exc: BaseException) -> bool:
+    """True when SQLite refused a short read because another writer holds the file."""
+    pending: list[BaseException | None] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        text = str(current).lower()
+        if "database is locked" in text or "database is busy" in text:
+            return True
+        pending.append(current.__cause__)
+        pending.append(current.__context__)
+        pending.append(getattr(current, "orig", None))
+    return False
+
+
 class Worker:
     def __init__(self, *, store: storage.Storage | None = None):
         self.worker_id = str(uuid.uuid4())
@@ -181,23 +199,101 @@ class Worker:
                 reconcile(db)
                 self._last_reconcile = tick
 
+    def _require_runnable(self, job: ClaimedJob, *, status: str | None, locked_by: str | None,
+                          have_recording: bool, recording_state: str | None, needs_operator: bool,
+                          finalize_state: str | None, incomplete_reason: str | None) -> None:
+        if status != "running" or locked_by != self.worker_id:
+            raise JobCancelled("job cancelled")
+        if job.kind in DELETE_KINDS | {"sqlite_backup", "finalize_timeout"}:
+            return
+        if (not have_recording or recording_state in TOMBSTONES or needs_operator
+                or finalize_state != "complete" or incomplete_reason):
+            raise JobCancelled("recording is not complete")
+
     def _guard(self, job: ClaimedJob) -> dict:
         if self.stop_event.is_set():
             raise JobCancelled("worker stopping")
         with models.session_scope() as db:
+            # Read and release. A shared lock must not stay open across FFmpeg.
             row = db.get(models.Job, job.id)
-            if row is None or row.status != "running" or row.locked_by != self.worker_id:
-                raise JobCancelled("job cancelled")
+            status = None if row is None else row.status
+            locked_by = None if row is None else row.locked_by
             if job.kind in DELETE_KINDS | {"sqlite_backup", "finalize_timeout"}:
+                self._require_runnable(job, status=status, locked_by=locked_by, have_recording=False,
+                                       recording_state=None, needs_operator=False, finalize_state=None,
+                                       incomplete_reason=None)
+                db.rollback()
                 return {}
             rec = models.get_recording(db, job.session_id)
-            if (rec is None or rec.recording_state in TOMBSTONES or rec.needs_operator
-                    or rec.finalize_state != "complete" or rec.incomplete_reason):
-                raise JobCancelled("recording is not complete")
-            return {"recording_state": rec.recording_state, "recording_key": rec.recording_key,
-                    "manifest": rec.manifest, "final_sequence": rec.final_sequence,
-                    "total_chunks": rec.total_chunks,
-                    "total_duration_ms": rec.total_duration_ms}
+            if rec is None:
+                state = key = manifest = final_sequence = total_chunks = total_duration_ms = None
+                needs_operator, finalize, incomplete, have_recording = False, None, None, False
+            else:
+                state = rec.recording_state
+                needs_operator = bool(rec.needs_operator)
+                finalize = rec.finalize_state
+                incomplete = rec.incomplete_reason
+                key = rec.recording_key
+                manifest = dict(rec.manifest) if isinstance(rec.manifest, dict) else rec.manifest
+                final_sequence = rec.final_sequence
+                total_chunks = rec.total_chunks
+                total_duration_ms = rec.total_duration_ms
+                have_recording = True
+            self._require_runnable(job, status=status, locked_by=locked_by, have_recording=have_recording,
+                                   recording_state=state, needs_operator=needs_operator,
+                                   finalize_state=finalize, incomplete_reason=incomplete)
+            db.rollback()
+        return {"recording_state": state, "recording_key": key, "manifest": manifest,
+                "final_sequence": final_sequence, "total_chunks": total_chunks,
+                "total_duration_ms": total_duration_ms}
+
+    def _ffmpeg_cancel_check(self, job: ClaimedJob) -> None:
+        """Notice delete/shutdown while FFmpeg runs, without aborting on a busy database.
+
+        The poll used to borrow a pooled session. Under load that read raises
+        ``database is locked``; the remux loop treated every exception as fatal,
+        killed FFmpeg, and left ``student.part.mp4`` behind. A dedicated
+        connection with a short busy timeout either observes a committed cancel
+        or skips this tick. The next poll retries. The write lock is never held
+        here, and the read lock is dropped before the sleep.
+        """
+        if self.stop_event.is_set():
+            raise JobCancelled("worker stopping")
+        url = models.engine.url
+        database = url.database if url.get_backend_name() == "sqlite" else None
+        if not database or database == ":memory:":
+            self._guard(job)
+            return
+        conn = sqlite3.connect(database, timeout=0.2)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only = ON")
+            job_row = conn.execute(
+                "SELECT status, locked_by FROM jobs WHERE id = ?", (job.id,)
+            ).fetchone()
+            rec = conn.execute(
+                "SELECT recording_state, needs_operator, finalize_state, incomplete_reason "
+                "FROM recordings WHERE session_id = ?",
+                (job.session_id,),
+            ).fetchone()
+            conn.rollback()
+        except sqlite3.OperationalError as exc:
+            if _sqlite_busy(exc):
+                logger.warning("job %s transcode cancel check skipped; database is locked", job.id)
+                return
+            raise
+        finally:
+            conn.close()
+        self._require_runnable(
+            job,
+            status=None if job_row is None else job_row["status"],
+            locked_by=None if job_row is None else job_row["locked_by"],
+            have_recording=rec is not None,
+            recording_state=None if rec is None else rec["recording_state"],
+            needs_operator=bool(rec["needs_operator"]) if rec is not None else False,
+            finalize_state=None if rec is None else rec["finalize_state"],
+            incomplete_reason=None if rec is None else rec["incomplete_reason"],
+        )
 
     def _heartbeat(self, job: ClaimedJob, done: threading.Event) -> None:
         # This helper only renews a lease; it never executes a second job.
@@ -236,6 +332,21 @@ class Worker:
         return True
 
     def _finish(self, job: ClaimedJob, *, error: str | None = None, cancelled: bool = False) -> None:
+        # A lock at the commit must not leave a finished or cancelled job `running`.
+        # The status guard makes a retry after a committed attempt a no-op.
+        delay = 0.05
+        for attempt in range(6):
+            try:
+                self._finish_once(job, error=error, cancelled=cancelled)
+                return
+            except Exception as exc:
+                if attempt == 5 or not _sqlite_busy(exc):
+                    raise
+                logger.warning("job %s finish waiting on sqlite lock", job.id)
+                time.sleep(delay)
+                delay = min(delay * 2, 0.4)
+
+    def _finish_once(self, job: ClaimedJob, *, error: str | None = None, cancelled: bool = False) -> None:
         with models.session_scope() as db:
             row = db.get(models.Job, job.id)
             if row is None or row.status != "running" or row.locked_by != self.worker_id:
@@ -301,7 +412,9 @@ class Worker:
         self._set_recording(job, recording_state="transcoding")
         mp4 = recording.mp4_path(job.session_id)
         if not self._valid_mp4(mp4, facts["total_duration_ms"]):
-            result = recording.process_recording(job.session_id, cancel_check=lambda: self._guard(job))
+            result = recording.process_recording(
+                job.session_id, cancel_check=lambda: self._ffmpeg_cancel_check(job)
+            )
             if result["status"] != "completed" or not self._valid_mp4(mp4, facts["total_duration_ms"]):
                 raise RuntimeError("MP4 validation failed; original media retained")
             if result.get("duration_delta_s") is not None and result["duration_delta_s"] >= 1:
