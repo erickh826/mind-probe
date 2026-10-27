@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { fetchRecordingBlob } from "../api";
+import { readReviewSession } from "@mind-probe/shared";
+import { deleteRecording, fetchRecordingPlayback, fetchRecordingStatus } from "../api";
 import { mediaUrl } from "../config";
 import type { AuthContext, ClipManifestEntry, ClipTimelineEntry, TimelineResponse } from "../types";
 
@@ -43,6 +44,12 @@ export function DualVideoPlayer({ auth, caseId, clips, onTimeChange, seekTarget,
   const [recordingSrc, setRecordingSrc] = useState<string>("");
   const [activeClip, setActiveClip] = useState<ClipTimelineEntry | null>(null);
   const [videoError, setVideoError] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState("");
+  const [deletionState, setDeletionState] = useState("none");
+  const requestRef = useRef<AbortController | null>(null);
+  const restoreRef = useRef<{ time: number; playing: boolean } | null>(null);
+  const refreshingRef = useRef(false);
+  const lastRefreshRef = useRef(0);
 
   const clipEntries = useMemo(
     () => timeline?.entries.filter((entry): entry is ClipTimelineEntry => entry.kind === "clip") ?? [],
@@ -56,16 +63,19 @@ export function DualVideoPlayer({ auth, caseId, clips, onTimeChange, seekTarget,
   useEffect(() => {
     setVideoError(null);
     setRecordingSrc("");
+    setDeletionState("none");
+    setConfirmDelete("");
+    restoreRef.current = null;
+    lastRefreshRef.current = 0;
     if (!sessionId) {
       return undefined;
     }
 
     const controller = new AbortController();
-    let objectUrl = "";
-    fetchRecordingBlob(sessionId, auth, controller.signal)
-      .then((blob) => {
-        objectUrl = URL.createObjectURL(blob);
-        setRecordingSrc(objectUrl);
+    requestRef.current = controller;
+    fetchRecordingPlayback(sessionId, auth, controller.signal)
+      .then((url) => {
+        if (!controller.signal.aborted) setRecordingSrc(url);
       })
       .catch((error) => {
         if (!controller.signal.aborted) {
@@ -75,11 +85,62 @@ export function DualVideoPlayer({ auth, caseId, clips, onTimeChange, seekTarget,
 
     return () => {
       controller.abort();
-      if (objectUrl) {
-        URL.revokeObjectURL(objectUrl);
-      }
+      requestRef.current = null;
     };
   }, [auth, sessionId]);
+
+  useEffect(() => {
+    if (deletionState !== "deleting" || !sessionId) return;
+    let cancelled = false;
+    let timer = 0;
+    const poll = async () => {
+      try {
+        const state = await fetchRecordingStatus(sessionId, auth);
+        if (cancelled) return;
+        if (state.recording_state === "deleted") { setDeletionState("deleted"); return; }
+        timer = window.setTimeout(() => { void poll(); }, 1500);
+      } catch (error) {
+        if (!cancelled) setVideoError(error instanceof Error ? error.message : "Deletion status unavailable.");
+      }
+    };
+    void poll();
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [auth, deletionState, sessionId]);
+
+  async function refreshPlayback() {
+    const controller = requestRef.current;
+    const video = studentRef.current;
+    if (!sessionId || !controller || controller.signal.aborted || !video || refreshingRef.current) return;
+    if (Date.now() - lastRefreshRef.current < 5000) {
+      setVideoError("Recording could not be played. Retry by reopening this session.");
+      return;
+    }
+    lastRefreshRef.current = Date.now();
+    refreshingRef.current = true;
+    restoreRef.current = { time: video.currentTime, playing: !video.paused };
+    try {
+      const url = await fetchRecordingPlayback(sessionId, auth, controller.signal);
+      if (!controller.signal.aborted) { setVideoError(null); setRecordingSrc(url); }
+    } catch (error) {
+      if (!controller.signal.aborted) setVideoError(error instanceof Error ? error.message : "Recording unavailable.");
+    } finally {
+      refreshingRef.current = false;
+    }
+  }
+
+  async function requestDeletion() {
+    if (!sessionId || confirmDelete !== sessionId) return;
+    try {
+      const result = await deleteRecording(sessionId, confirmDelete, auth);
+      requestRef.current?.abort();
+      studentRef.current?.pause();
+      setRecordingSrc("");
+      setVideoError(null);
+      setDeletionState(result.recording_state);
+    } catch (error) {
+      setVideoError(error instanceof Error ? error.message : "Deletion failed.");
+    }
+  }
 
   useEffect(() => {
     // Initialize suspect video with idle clip or first frame on load
@@ -173,7 +234,17 @@ export function DualVideoPlayer({ auth, caseId, clips, onTimeChange, seekTarget,
         <video
           className="review-video"
           controls
-          crossOrigin="use-credentials"
+          crossOrigin="anonymous"
+          onError={() => { if (recordingSrc) void refreshPlayback(); }}
+          onLoadedMetadata={() => {
+            const restore = restoreRef.current;
+            const video = studentRef.current;
+            if (restore && video) {
+              video.currentTime = restore.time;
+              if (restore.playing) void video.play().catch(() => undefined);
+              restoreRef.current = null;
+            }
+          }}
           onPause={handlePause}
           onPlay={handlePlay}
           onRateChange={handleRateChange}
@@ -183,6 +254,15 @@ export function DualVideoPlayer({ auth, caseId, clips, onTimeChange, seekTarget,
           src={recordingSrc}
         />
         {videoError ? <p className="video-message">{videoError}</p> : null}
+        {deletionState !== "none" ? <p role="status">{deletionState === "deleted" ? "Recording deleted." : "Deleting recording…"}</p> : null}
+        {sessionId && readReviewSession()?.role === "teacher" && deletionState === "none" ? (
+          <div>
+            <label>Confirm recording deletion: type {sessionId}
+              <input value={confirmDelete} onChange={(event) => setConfirmDelete(event.target.value)} autoComplete="off" />
+            </label>
+            <button type="button" disabled={confirmDelete !== sessionId} onClick={() => { void requestDeletion(); }}>Delete recording</button>
+          </div>
+        ) : null}
       </div>
 
       <div className="player-card">

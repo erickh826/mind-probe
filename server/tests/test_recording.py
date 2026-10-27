@@ -515,7 +515,7 @@ def test_remux_builds_the_h264_aac_faststart_command(chunk_root, monkeypatch):
                 cmd, 0, b'{"streams":[{"codec_type":"video"}],"format":{}}', b""
             )
         # Stand in for FFmpeg by producing a non-empty output file.
-        recording.mp4_path(session_id).write_bytes(b"fake-mp4-bytes")
+        Path(cmd[-1]).write_bytes(b"fake-mp4-bytes")
         return subprocess.CompletedProcess(cmd, 0, b"", b"")
 
     monkeypatch.setattr(subprocess, "run", _capture)
@@ -534,7 +534,7 @@ def test_remux_builds_the_h264_aac_faststart_command(chunk_root, monkeypatch):
         ("-movflags", "+faststart"),
     ):
         assert ffmpeg_cmd[ffmpeg_cmd.index(flag) + 1] == value
-    assert ffmpeg_cmd[-1] == str(recording.mp4_path(session_id))
+    assert ffmpeg_cmd[-1] == str(recording.mp4_path(session_id).with_name("student.part.mp4"))
 
 
 def test_remux_without_a_merged_stream_raises(chunk_root):
@@ -575,8 +575,10 @@ def test_failed_transcode_raises_and_keeps_every_webm_artefact(chunk_root, monke
     assert "Invalid data found" in str(excinfo.value)
     assert merged.read_bytes() == merged_before
     assert _chunk_files(session_id) == ["000000.webm", "000001.webm"]
-    # The invalid mp4 -- the lowest-priority artefact -- is the only casualty.
-    assert not recording.mp4_path(session_id).exists()
+    # Atomic output leaves the previous file untouched and discards only the
+    # failed attempt. The worker cannot publish a file that fails validation.
+    assert recording.mp4_path(session_id).read_bytes() == b"truncated"
+    assert not recording.mp4_path(session_id).with_name("student.part.mp4").exists()
 
 
 def test_transcode_producing_no_output_is_reported_as_a_failure(chunk_root, monkeypatch):
@@ -672,7 +674,7 @@ def test_status_endpoint_is_safe_for_a_session_with_no_recording(client, db, chu
     assert body["recording_state"] == "recording"
 
 
-def test_process_endpoint_degrades_to_raw_only_without_ffmpeg(
+def test_process_endpoint_queues_without_running_ffmpeg(
     client, db, chunk_root, monkeypatch
 ):
     """The route degrades where the library raises (ADR-0004 §4).
@@ -689,31 +691,26 @@ def test_process_endpoint_degrades_to_raw_only_without_ffmpeg(
 
     response = client.post(f"/recording/{session_id}/process", headers=OPERATOR_HEADERS)
 
-    assert response.status_code == 200, response.text
+    assert response.status_code == 202, response.text
     body = response.json()
-    assert body["status"] == "raw_only"
-    assert body["chunk_count"] == 2
-    assert body["raw_webm"]["exists"] is True
-    assert body["raw_webm"]["path"] == f"{session_id}/student_raw.webm"
-    assert body["mp4"] is None
-    assert "FFmpeg binary not found" in body["remux_error"]
-    assert recording.merged_path(session_id).read_bytes() == EBML_HEADER + b"-tail"
+    assert body["status"] == "queued" and body["job_id"] > 0
+    assert not recording.merged_path(session_id).exists()
+    assert _chunk_files(session_id) == ["000000.webm", "000001.webm"]
 
 
-def test_process_endpoint_can_skip_the_transcode(client, db, chunk_root):
+def test_process_endpoint_rejects_raw_only_processing(client, db, chunk_root):
     session_id = _new_session(db)
     assert _post_chunk(client, session_id, 0, EBML_HEADER).status_code == 200
     _mark_complete(db, session_id, final_sequence=0, total_chunks=1)
 
-    body = client.post(
+    response = client.post(
         f"/recording/{session_id}/process",
         params={"remux": False},
         headers=OPERATOR_HEADERS,
-    ).json()
+    )
 
-    assert body["status"] == "raw_only"
-    assert body["remux_error"] == "skipped"
-    assert body["metadata_rows"] == 1
+    assert response.status_code == 400
+    assert response.json()["detail"] == "remux_required"
     assert not recording.mp4_path(session_id).exists()
 
 
@@ -786,9 +783,13 @@ def test_real_ffmpeg_pipeline_produces_h264_aac_within_the_duration_tolerance(
         assert response.status_code == 200, response.text
     _mark_complete(db, session_id, final_sequence=2, total_chunks=3)
 
-    body = client.post(
+    queued = client.post(
         f"/recording/{session_id}/process", headers=OPERATOR_HEADERS
     ).json()
+    assert queued["status"] == "queued"
+    # The synchronous library is exercised outside the request. Worker/raw
+    # cleanup and storage publication are covered in test_jobs_storage.py.
+    body = recording.process_recording(session_id, db)
 
     assert body["status"] == "completed", body.get("remux_error")
     assert body["missing_sequences"] == []

@@ -11,6 +11,7 @@ dependencies = [
     "sqlalchemy>=2.0",
     "python-multipart>=0.0.9",
     "websockets>=12.0",
+    "boto3>=1.35",
 ]
 
 [project.optional-dependencies]

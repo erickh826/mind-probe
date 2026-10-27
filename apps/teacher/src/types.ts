@@ -28,6 +28,7 @@ export interface ArtefactInfo {
 }
 
 export interface RecordingStatus {
+  recording_state?: import("@mind-probe/shared").RecordingState;
   session_id: string;
   chunk_count: number;
   first_sequence: number | null;

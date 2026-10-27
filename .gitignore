@@ -22,6 +22,9 @@ npm-debug.log*
 sessions/*
 !sessions/.gitkeep
 server/sessions/
+server/objects/
+server/.pytest_jobs*/
+server/.qa-jobs*.xml
 *.sqlite
 *.sqlite3
 *.db

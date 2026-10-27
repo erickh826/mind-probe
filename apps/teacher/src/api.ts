@@ -7,6 +7,8 @@ import {
   rememberAccessToken,
   rememberReviewSession,
   type ReviewTokenResponse,
+  type RecordingPlaybackResponse,
+  type DeleteRecordingResponse,
 } from "@mind-probe/shared";
 import { apiUrl } from "./config";
 import { ReviewRequestError } from "./reviewErrors";
@@ -113,6 +115,9 @@ async function send(path: string, init: RequestInit = {}): Promise<Response> {
         ...init,
         headers: nextHeaders,
         credentials: "omit",
+        // Chromium stores a 410 with no cache policy and replays "deleting"
+        // forever. Bypass the HTTP cache on every review call.
+        cache: "no-store",
       });
     },
     refresh: (refreshToken) => {
@@ -203,10 +208,46 @@ export function fetchTimeline(sessionId: string, auth: AuthContext): Promise<Tim
   });
 }
 
-export function fetchRecordingStatus(sessionId: string, auth: AuthContext): Promise<RecordingStatus> {
-  return fetchJson<RecordingStatus>(`/sessions/${encodeURIComponent(sessionId)}/recording/status`, {
+export async function fetchRecordingStatus(sessionId: string, auth: AuthContext): Promise<RecordingStatus> {
+  const response = await send(`/sessions/${encodeURIComponent(sessionId)}/recording/status`, {
     headers: authHeaders(auth),
   });
+  if (response.status === 410) {
+    const body = await response.json() as { detail: { recording_state: "deleting" | "deleted" } };
+    return { session_id: sessionId, recording_state: body.detail.recording_state,
+      chunk_count: 0, first_sequence: null, last_sequence: null, missing_sequences: [],
+      total_bytes: 0, header_chunk_ok: false, metadata_rows: 0,
+      raw_webm: { exists: false, size_bytes: null }, mp4: { exists: false, size_bytes: null } };
+  }
+  if (!response.ok) throw await responseError(response);
+  return response.json() as Promise<RecordingStatus>;
+}
+
+export function deleteRecording(sessionId: string, confirm: string, auth: AuthContext): Promise<DeleteRecordingResponse> {
+  return fetchJson(`/sessions/${encodeURIComponent(sessionId)}/recording`, {
+    method: "DELETE", headers: authHeaders(auth), body: JSON.stringify({ confirm }),
+  });
+}
+
+export async function fetchRecordingPlayback(sessionId: string, auth: AuthContext, signal: AbortSignal): Promise<string> {
+  while (!signal.aborted) {
+    const response = await send(`/sessions/${encodeURIComponent(sessionId)}/recording`, {
+      headers: authHeaders(auth), signal,
+    });
+    if (response.status === 202) {
+      await new Promise<void>((resolve, reject) => {
+        const onAbort = () => { window.clearTimeout(timer); reject(new DOMException("Aborted", "AbortError")); };
+        const timer = window.setTimeout(() => { signal.removeEventListener("abort", onAbort); resolve(); }, 2000);
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (signal.aborted) onAbort();
+      });
+      continue;
+    }
+    if (!response.ok) throw await responseError(response);
+    const body = await response.json() as RecordingPlaybackResponse;
+    return /^https?:\/\//i.test(body.url) ? body.url : apiUrl(body.url);
+  }
+  throw new DOMException("Aborted", "AbortError");
 }
 
 export async function fetchRubric(caseId: string, auth: AuthContext): Promise<RubricData> {
@@ -251,10 +292,8 @@ export async function fetchRecordingBlob(
   auth: AuthContext,
   signal: AbortSignal,
 ): Promise<Blob> {
-  const response = await send(`/sessions/${encodeURIComponent(sessionId)}/recording`, {
-    headers: authHeaders(auth),
-    signal,
-  });
+  const url = await fetchRecordingPlayback(sessionId, auth, signal);
+  const response = await fetch(url, { credentials: "omit", signal });
   if (!response.ok) {
     throw new Error(`${response.status} ${response.statusText}`);
   }
