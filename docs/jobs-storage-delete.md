@@ -63,6 +63,12 @@ table/index; it does not modify or delete existing session/media rows.
 | MINDPROBE_S3_ENDPOINT / MINDPROBE_S3_REGION | S3-compatible endpoint and region (R2: auto) |
 | MINDPROBE_S3_ACCESS_KEY_ID / MINDPROBE_S3_SECRET_ACCESS_KEY | Inject credentials only for an explicitly configured remote backend |
 | MINDPROBE_RECORDINGS_BUCKET | Private recording and backup bucket; required for s3 |
+| MINDPROBE_MEDIA_BUCKET | Public case-media bucket for `cases/` keys. Empty keeps those keys on the recordings bucket. Example name: `mindprobe-media` |
+| MINDPROBE_PRESIGN_TTL_SECONDS | Presigned GET lifetime in seconds. Default `900` (the previous hard-coded 15 minutes). Allowed `1`–`86400` |
+| MINDPROBE_DISK_WARN_PCT | `/health` `disk.level` is `warn` when used percent exceeds this. Default `70` |
+| MINDPROBE_DISK_MIN_FREE_GB | `POST /sessions` returns 507 when free space on the sessions filesystem is below this many GiB. Default `5` |
+| MINDPROBE_FFMPEG_THREADS | libx264 `-threads`. Default `2`. Allowed `1`–`32` |
+| MINDPROBE_FFMPEG_PRESET | libx264 `-preset`. Default `veryfast` |
 | MINDPROBE_WS_TOKEN_SECRET | Existing persistent signing secret; also domain-separates local media signatures |
 | MINDPROBE_UPLOAD_GRACE_SECONDS | Existing grace duration, default 600; not extended by jobs |
 | MINDPROBE_UPLOAD_GRACE_SYNTHESIZE_AFTER | Existing historical-session cutover policy, unchanged |

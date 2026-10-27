@@ -178,6 +178,50 @@ def _ffprobe_bin() -> str:
     return os.environ.get("MINDPROBE_FFPROBE_BIN", "ffprobe")
 
 
+#: libx264 presets. Anything else is ignored so the argv stays a fixed token.
+_X264_PRESETS = frozenset({
+    "ultrafast", "superfast", "veryfast", "faster", "fast",
+    "medium", "slow", "slower", "veryslow", "placebo",
+})
+FFMPEG_PRESET_ENV = "MINDPROBE_FFMPEG_PRESET"
+FFMPEG_THREADS_ENV = "MINDPROBE_FFMPEG_THREADS"
+DEFAULT_FFMPEG_PRESET = "veryfast"
+DEFAULT_FFMPEG_THREADS = 2
+
+
+def ffmpeg_preset() -> str:
+    """``-preset`` for libx264. Unset uses ``veryfast`` (design §11)."""
+    raw = os.environ.get(FFMPEG_PRESET_ENV, "").strip().lower()
+    if not raw:
+        return DEFAULT_FFMPEG_PRESET
+    if raw not in _X264_PRESETS:
+        logger.warning(
+            "Ignoring invalid %s=%r; using %s.", FFMPEG_PRESET_ENV, raw, DEFAULT_FFMPEG_PRESET
+        )
+        return DEFAULT_FFMPEG_PRESET
+    return raw
+
+
+def ffmpeg_threads() -> int:
+    """``-threads`` for libx264. Unset uses 2 (design §11). Allowed 1–32."""
+    raw = os.environ.get(FFMPEG_THREADS_ENV, "").strip()
+    if not raw:
+        return DEFAULT_FFMPEG_THREADS
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid %s=%r; using %s.", FFMPEG_THREADS_ENV, raw, DEFAULT_FFMPEG_THREADS
+        )
+        return DEFAULT_FFMPEG_THREADS
+    if not 1 <= value <= 32:
+        logger.warning(
+            "Ignoring out-of-range %s=%r; using %s.", FFMPEG_THREADS_ENV, raw, DEFAULT_FFMPEG_THREADS
+        )
+        return DEFAULT_FFMPEG_THREADS
+    return value
+
+
 def _invalid_session_id_response(exc: InvalidSessionId) -> HTTPException:
     return HTTPException(
         status_code=400,
@@ -486,12 +530,16 @@ def remux_to_mp4(session_id: str, *, ffmpeg_bin: str | None = None, cancel_check
         str(merged),
         "-c:v",
         "libx264",
+        "-preset",
+        ffmpeg_preset(),
         "-profile:v",
         "baseline",
         "-pix_fmt",
         "yuv420p",
         "-c:a",
         "aac",
+        "-threads",
+        str(ffmpeg_threads()),
         "-movflags",
         "+faststart",
         str(out),

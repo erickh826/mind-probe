@@ -528,13 +528,46 @@ def test_remux_builds_the_h264_aac_faststart_command(chunk_root, monkeypatch):
     assert str(recording.merged_path(session_id)) in ffmpeg_cmd
     for flag, value in (
         ("-c:v", "libx264"),
+        ("-preset", "veryfast"),
         ("-profile:v", "baseline"),
         ("-pix_fmt", "yuv420p"),
         ("-c:a", "aac"),
+        ("-threads", "2"),
         ("-movflags", "+faststart"),
     ):
         assert ffmpeg_cmd[ffmpeg_cmd.index(flag) + 1] == value
     assert ffmpeg_cmd[-1] == str(recording.mp4_path(session_id).with_name("student.part.mp4"))
+
+
+def test_remux_preset_and_threads_follow_env(chunk_root, monkeypatch):
+    session_id = "S-ffmpeg-env"
+    _write_chunks(session_id, {0: EBML_HEADER})
+    recording.concat_chunks(session_id)
+    monkeypatch.setenv("MINDPROBE_FFMPEG_PRESET", "fast")
+    monkeypatch.setenv("MINDPROBE_FFMPEG_THREADS", "1")
+    seen: list[list[str]] = []
+
+    def _capture(cmd, *args, **kwargs):
+        seen.append(cmd)
+        if Path(cmd[0]).name.startswith("ffprobe"):
+            return subprocess.CompletedProcess(cmd, 0, b'{"streams":[{"codec_type":"video"}]}', b"")
+        Path(cmd[-1]).write_bytes(b"fake-mp4-bytes")
+        return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+    monkeypatch.setattr(subprocess, "run", _capture)
+    recording.remux_to_mp4(session_id)
+    ffmpeg_cmd = seen[0]
+    assert ffmpeg_cmd[ffmpeg_cmd.index("-preset") + 1] == "fast"
+    assert ffmpeg_cmd[ffmpeg_cmd.index("-threads") + 1] == "1"
+
+    monkeypatch.setenv("MINDPROBE_FFMPEG_PRESET", "not-a-preset;rm")
+    monkeypatch.setenv("MINDPROBE_FFMPEG_THREADS", "0")
+    seen.clear()
+    recording.remux_to_mp4(session_id)
+    ffmpeg_cmd = seen[0]
+    assert "not-a-preset;rm" not in ffmpeg_cmd
+    assert ffmpeg_cmd[ffmpeg_cmd.index("-preset") + 1] == "veryfast"
+    assert ffmpeg_cmd[ffmpeg_cmd.index("-threads") + 1] == "2"
 
 
 def test_remux_without_a_merged_stream_raises(chunk_root):

@@ -551,7 +551,8 @@ def prepared_take(db, session_id, *, published=False):
     db.commit()
 
 
-def test_recording_returns_signed_mp4(client, sessions_root, db):
+def test_recording_returns_signed_mp4(client, sessions_root, db, monkeypatch):
+    monkeypatch.delenv("MINDPROBE_PRESIGN_TTL_SECONDS", raising=False)
     created = create_session(client, "S-MP4")
     token = join(client, "S-MP4", "teacher", created["join_codes"])
     (sessions_root / "S-MP4").mkdir(parents=True)

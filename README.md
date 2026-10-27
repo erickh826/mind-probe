@@ -79,11 +79,24 @@ npm run build      # production build
 
 ### Docker
 
+Development (API on port 8000, `MINDPROBE_ENV=development`, no TLS):
+
 ```bash
 docker compose up server
 ```
 
-The frontend apps are run with Vite dev servers during development (see `docker-compose.yml` notes).
+Production-shaped stack for a Lightsail host: Caddy terminates TLS, uvicorn runs one worker with `--proxy-headers`, and only ports 80 and 443 are published. A local smoke test leaves `.env` unset, so storage stays on the local adapter and Caddy serves `https://localhost` with its internal certificate.
+
+```bash
+docker compose -f docker-compose.prod.yml up --build
+curl -k https://localhost/health
+```
+
+Copy `.env.example` to `.env` (mode 600) on the host before a real deploy. `.env` is gitignored.
+
+### Vercel
+
+Each frontend (`apps/student`, `apps/wizard`, `apps/teacher`) has a `vercel.json` with the SPA rewrite, Content-Security-Policy, and Permissions-Policy from the deploy design. Point the Vercel project root at that app directory and leave `"@mind-probe/shared": "file:../../packages/shared"` unchanged. Set `VITE_API_BASE_URL` and `VITE_MEDIA_BASE_URL` on the project (placeholders are in `.env.example`). The CSP allows the trial hosts `*.sslip.io`, `*.r2.dev`, and `*.r2.cloudflarestorage.com` (path-style presigned URLs). Add the real origin to those directives before moving the API or media onto a custom domain.
 
 ## 架構決策記錄（ADR）
 

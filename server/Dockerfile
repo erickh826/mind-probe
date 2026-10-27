@@ -7,8 +7,12 @@ RUN apt-get update \
 
 WORKDIR /app
 
+# requirements.txt mirrors pyproject.toml runtime dependencies (including
+# boto3). uv.lock pins the same set for `uv sync`; the image installs this
+# file so a plain pip build can open the S3 client.
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && python -c "import boto3"
 
 COPY . .
 
