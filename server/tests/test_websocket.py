@@ -13,11 +13,14 @@ autouse `db_factory` fixture below, so nothing here touches the real
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import time
 from pathlib import Path
 from uuid import uuid4
 
+import anyio
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
@@ -35,6 +38,7 @@ from app.websocket import (
     DISCONNECT_GRACE_MS,
     FALLBACK_THRESHOLD,
     HEARTBEAT_STALE_MS,
+    WS_PROTOCOL,
     WS_SESSION_COOKIE,
     compute_offset_median,
     create_session_token,
@@ -403,7 +407,8 @@ def test_role_mismatched_token_is_rejected():
     with pytest.raises(WebSocketDisconnect) as exc_info:
         with _connect(session_id, "wizard", token_role="student"):
             pass
-    assert exc_info.value.code == 4401
+    assert exc_info.value.code == 4403
+    assert exc_info.value.reason == "role_token_mismatch"
 
 
 def test_second_student_connection_is_rejected_while_first_is_live():
@@ -421,6 +426,178 @@ def test_invalid_role_is_rejected_at_handshake():
         with client.websocket_connect(f"/ws/{session_id}/not_a_role"):
             pass
     assert exc_info.value.code == 4400
+
+
+def _subprotocols(token: str) -> list[str]:
+    return [WS_PROTOCOL, f"bearer.{token}"]
+
+
+def _connect_subprotocol(session_id: str, role: str, token: str):
+    return client.websocket_connect(
+        f"/ws/{session_id}/{role}",
+        subprotocols=_subprotocols(token),
+    )
+
+
+def test_subprotocol_auth_echoes_only_mindprobe_v1():
+    session_id = _fresh_session_id()
+    token = create_session_token(session_id, "student")
+    with _connect_subprotocol(session_id, "student", token) as sock:
+        assert sock.accepted_subprotocol == WS_PROTOCOL
+        assert not str(sock.accepted_subprotocol).startswith("bearer.")
+        sock.send_json({"type": "ping", "ping_id": "sub", "client_timestamp_ms": 0})
+        assert sock.receive_json()["ping_id"] == "sub"
+
+
+def test_subprotocol_auth_rejects_missing_token():
+    session_id = _fresh_session_id()
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(
+            f"/ws/{session_id}/student",
+            subprotocols=[WS_PROTOCOL],
+        ):
+            pass
+    assert exc_info.value.code == 4401
+    assert exc_info.value.reason == "missing_session_token"
+
+
+def test_bearer_subprotocol_without_mindprobe_v1_is_rejected():
+    session_id = _fresh_session_id()
+    token = create_session_token(session_id, "student")
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(
+            f"/ws/{session_id}/student",
+            subprotocols=[f"bearer.{token}"],
+        ):
+            pass
+    assert exc_info.value.code == 4401
+    assert exc_info.value.reason == "missing_subprotocol"
+
+
+def test_subprotocol_auth_rejects_wrong_role():
+    session_id = _fresh_session_id()
+    token = create_session_token(session_id, "student")
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with _connect_subprotocol(session_id, "wizard", token):
+            pass
+    assert exc_info.value.code == 4403
+    assert exc_info.value.reason == "role_token_mismatch"
+
+
+def test_subprotocol_auth_rejects_wrong_session():
+    session_id = _fresh_session_id()
+    other_id = _fresh_session_id()
+    token = create_session_token(other_id, "student")
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with _connect_subprotocol(session_id, "student", token):
+            pass
+    assert exc_info.value.code == 4401
+    assert exc_info.value.reason == "session_token_mismatch"
+
+
+def test_subprotocol_auth_rejects_revoked_token():
+    session_id = _fresh_session_id()
+    token = create_session_token(session_id, "wizard")
+    with models.session_scope() as db:
+        models.revoke_token_hash(db, session_id, models.hash_token(token))
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with _connect_subprotocol(session_id, "wizard", token):
+            pass
+    assert exc_info.value.code == 4401
+    assert exc_info.value.reason == "token_revoked"
+
+
+def _note(sequence: int, event_id: str) -> dict:
+    return {
+        "sequence": sequence,
+        "client_timestamp_ms": 0,
+        "event_type": "observer_note",
+        "payload": {"event_id": event_id, "note": event_id},
+    }
+
+
+def _expect_closed(sock, *, reason: str) -> None:
+    """The next frame must not be applied; the socket closes 4401."""
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        sock.send_json(_note(99, "evt-after-close"))
+        sock.receive_json()
+    assert exc_info.value.code == 4401
+    assert exc_info.value.reason == reason
+
+
+def test_security_revocation_drops_events_on_the_live_socket():
+    session_id = _fresh_session_id()
+    wizard_token = create_session_token(session_id, "wizard")
+    student_token = create_session_token(session_id, "student")
+    with (
+        _connect_subprotocol(session_id, "wizard", wizard_token) as wizard,
+        _connect_subprotocol(session_id, "student", student_token) as student,
+    ):
+        with models.session_scope() as db:
+            models.revoke_token_hash(
+                db, session_id, models.hash_token(wizard_token)
+            )
+        _expect_closed(wizard, reason="token_revoked")
+        assert _stored_events(session_id) == []
+
+        student.send_json({"type": "ping", "ping_id": "still-live"})
+        reply = student.receive_json()
+        assert reply["type"] == "pong"
+        assert reply["ping_id"] == "still-live"
+
+
+def test_end_session_drops_events_on_the_live_socket():
+    session_id = _fresh_session_id()
+    with _connect(session_id, "wizard") as wizard:
+        response = client.post(f"/sessions/{session_id}/end")
+        assert response.status_code == 200
+        _expect_closed(wizard, reason="session_ended")
+        assert _stored_events(session_id) == []
+
+
+def test_events_after_accepted_session_ended_are_not_persisted():
+    session_id = _fresh_session_id()
+    with _connect(session_id, "wizard") as wizard:
+        wizard.send_json(
+            {
+                "sequence": 1,
+                "client_timestamp_ms": 0,
+                "event_type": "session_ended",
+                "payload": {"event_id": "evt-end"},
+            }
+        )
+        assert wizard.receive_json()["status"] == "accepted"
+        _expect_closed(wizard, reason="session_ended")
+
+    events = _stored_events(session_id)
+    assert [event.event_type for event in events] == ["session_ended"]
+
+
+def test_cookie_is_ignored_when_cookie_auth_is_disabled(monkeypatch):
+    monkeypatch.setenv("MINDPROBE_AUTH_COOKIE", "false")
+    session_id = _fresh_session_id()
+    token = create_session_token(session_id, "student")
+    headers = {"cookie": f"{WS_SESSION_COOKIE}={token}"}
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(f"/ws/{session_id}/student", headers=headers):
+            pass
+    assert exc_info.value.code == 4401
+    assert exc_info.value.reason == "missing_session_token"
+
+    with _connect_subprotocol(session_id, "student", token) as sock:
+        assert sock.accepted_subprotocol == WS_PROTOCOL
+
+
+def test_query_string_token_is_not_a_credential():
+    session_id = _fresh_session_id()
+    token = create_session_token(session_id, "student")
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect(
+            f"/ws/{session_id}/student?access_token={token}"
+        ):
+            pass
+    assert exc_info.value.code == 4401
+    assert exc_info.value.reason == "missing_session_token"
 
 
 def _far_future_ms() -> int:
@@ -1022,10 +1199,14 @@ def test_resolve_fallback_clip_prefers_the_case_manifest_without_changing_catego
     assert cases.resolve_fallback_clip("CASE001", "CLARIFY") == (
         "C001_FALLBACK_CLARIFY_01"
     )
-    # CASE001 has no approved clip for the other three categories; ADR-0002 §4
-    # forbids answering with a different category, so the generic clip stands.
+    assert cases.resolve_fallback_clip("CASE001", "ONE_AT_A_TIME") == (
+        "C001_FALLBACK_ONEATATIME_01"
+    )
     assert cases.resolve_fallback_clip("CASE001", "UNKNOWN_OR_UNSURE") == (
-        "GEN_UNKNOWN_01"
+        "C001_FALLBACK_UNKNOWN_01"
+    )
+    assert cases.resolve_fallback_clip("CASE001", "DECLINE_OR_BOUNDARY") == (
+        "C001_FALLBACK_DECLINE_01"
     )
 
 
@@ -1151,9 +1332,9 @@ def test_request_fallback_resolves_each_category_and_broadcasts_fallback_used(
     session_id = _fresh_session_id()
     expected = {
         "CLARIFY": "C001_FALLBACK_CLARIFY_01",
-        "ONE_AT_A_TIME": "GEN_ONE_AT_A_TIME_01",
-        "UNKNOWN_OR_UNSURE": "GEN_UNKNOWN_01",
-        "DECLINE_OR_BOUNDARY": "GEN_DECLINE_01",
+        "ONE_AT_A_TIME": "C001_FALLBACK_ONEATATIME_01",
+        "UNKNOWN_OR_UNSURE": "C001_FALLBACK_UNKNOWN_01",
+        "DECLINE_OR_BOUNDARY": "C001_FALLBACK_DECLINE_01",
     }
     with _connect(session_id, "wizard") as wizard, \
             _connect(session_id, "student") as student:
@@ -1192,7 +1373,7 @@ def test_request_fallback_resolves_each_category_and_broadcasts_fallback_used(
                     assert sock.receive_json()["type"] == "fallback_threshold_reached"
 
         assert websocket_module.manager.snapshot_for(session_id).active_clip == (
-            "GEN_DECLINE_01"
+            "C001_FALLBACK_DECLINE_01"
         )
 
     fallback_events = [
@@ -1526,16 +1707,6 @@ def _age_disconnect_mark(session_id: str, role: str) -> None:
     marks[role] -= DISCONNECT_GRACE_MS + 1_000
 
 
-def _wait_for_session_pause(session_id: str, *, timeout_s: float = 1.0) -> None:
-    """Poll the row until an async disconnect task has had a chance to run."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if _session_row(session_id).status == "paused":
-            return
-        time.sleep(0.01)
-    assert _session_row(session_id).status == "paused"
-
-
 def _assert_network_failure_pause(session_id: str, lost_role: str) -> None:
     row = _session_row(session_id)
     assert row.status == "paused"
@@ -1647,9 +1818,102 @@ def test_critical_role_disconnect_pauses_only_after_the_grace_window():
     assert websocket_module.manager.snapshot_for(session_id).session_state == "paused"
 
 
+def _cancel_background_tasks() -> None:
+    """Cancel grace timers still queued on this module's TestClient loop.
+
+    Disconnect schedules ``_delayed_disconnect_pause_check``. Most tests leave
+    that task sleeping out the real 2s window after they have already paused
+    via a later inbound frame. The next test shares the portal. On a loaded
+    Windows run that sleeper wakes during the following test. A grace shorter
+    than the ~15.6ms Windows monotonic tick can also fire in the same tick as
+    the disconnect, see a role that is not lost yet, and never reschedule.
+    This fixture drops those leftover tasks. The no-traffic test uses a 300ms
+    grace and ages the disconnect mark so the check does not depend on the
+    sleep lasting the whole window.
+    """
+    for task in list(websocket_module.manager._background_tasks):
+        task.cancel()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_disconnect_tasks():
+    _cancel_background_tasks()
+    yield
+    _cancel_background_tasks()
+
+
+def _receive_json_within(sock, timeout_s: float):
+    """Read one JSON frame, and fail the test if it does not arrive in time.
+
+    ``WebSocketTestSession.receive_json`` waits forever. A timeout has to run
+    inside the portal: a thread blocked in ``portal.call`` cannot be joined
+    without wedging every later portal call, including the socket's ``__exit__``.
+    """
+
+    async def _recv():
+        with anyio.fail_after(timeout_s):
+            return await sock._send_rx.receive()
+
+    try:
+        message = sock.portal.call(_recv)
+    except TimeoutError as exc:
+        raise AssertionError(f"no websocket frame within {timeout_s:.1f}s") from exc
+    if message["type"] == "websocket.close":
+        raise WebSocketDisconnect(
+            code=message.get("code", 1000), reason=message.get("reason", "")
+        )
+    return json.loads(message["text"])
+
+
+def _wait_for_auto_pause_frame(sock, session_id: str, *, timeout_s: float = 3.0):
+    """Return the pause frame the server sends with no further inbound traffic.
+
+    Disconnect schedules ``_delayed_disconnect_pause_check`` on the socket's
+    loop. That task sleeps out the grace window, pauses, then broadcasts. The
+    product path does not need another client frame: the same check passes on
+    feat/m2 when the test only sleeps, and it passes here once the frame is
+    already buffered.
+
+    Blocking in ``receive_json`` *before* that broadcast hangs on Windows.
+    Starlette delivers the frame through an anyio memory stream on the
+    TestClient portal. On the Windows ProactorEventLoop a receive that is
+    already waiting is not woken when this raw ``asyncio`` task later sends,
+    so the call never returns (observed at 60s and 90s). Sleeping on the test
+    thread leaves the portal free to finish the task, which is why the old
+    poll passed on that machine in a few seconds. This wait therefore watches
+    the in-memory snapshot and the test client's buffer, and only then reads.
+
+    The snapshot flips to ``paused`` after the pause transaction commits.
+    Opening ``models.SessionLocal`` during that commit is unsafe: this file's
+    in-memory database is one StaticPool connection, and a second session on
+    it can roll the audit row or the timeline event back. A second connection
+    would be a different ``:memory:`` database, so it cannot see the row.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        paused = (
+            websocket_module.manager.snapshot_for(session_id).session_state == "paused"
+        )
+        buffered = sock._send_rx.statistics().current_buffer_used > 0
+        if paused and buffered:
+            return _receive_json_within(sock, timeout_s)
+        time.sleep(0.01)
+    raise AssertionError(
+        "server did not auto-pause and deliver session_paused "
+        f"without later inbound traffic within {timeout_s:.1f}s"
+    )
+
+
 def test_critical_role_disconnect_pauses_without_later_inbound_traffic(monkeypatch):
+    """The server pauses on its own after the grace window, with no further traffic.
+
+    300ms stays above Windows' ~15.6ms monotonic clock, so the timer cannot
+    elapse inside the same tick as the disconnect and give up before the role
+    is lost. Aging the mark after the socket is down means the check does not
+    depend on the sleep lasting the whole window. No frame is sent.
+    """
     session_id = _fresh_session_id()
-    monkeypatch.setattr(websocket_module, "DISCONNECT_GRACE_MS", 10)
+    monkeypatch.setattr(websocket_module, "DISCONNECT_GRACE_MS", 300)
 
     with _connect(session_id, "wizard") as wizard:
         student = _connect(session_id, "student")
@@ -1657,9 +1921,9 @@ def test_critical_role_disconnect_pauses_without_later_inbound_traffic(monkeypat
         _start_session(wizard)
         _make_start_due(session_id)
         student.__exit__(None, None, None)
+        _age_disconnect_mark(session_id, "student")
 
-        _wait_for_session_pause(session_id)
-        paused = wizard.receive_json()
+        paused = _wait_for_auto_pause_frame(wizard, session_id)
         assert paused["event_type"] == "session_paused"
         assert paused["payload"]["reason"] == "network_failure"
         assert paused["payload"]["lost_roles"] == ["student"]
@@ -1683,3 +1947,34 @@ def test_disconnect_does_not_pause_a_session_that_never_started():
     assert row.status == "created"
     assert row.pause_reason is None
     assert _audit_rows(session_id, models.AUDIT_SESSION_PAUSED) == []
+
+
+def test_schedule_on_a_closed_loop_drops_the_socket_and_does_not_raise():
+    """A socket left on a shut-down portal must not abort the caller.
+
+    ``session_ended`` posts a close onto every role's loop. When that loop
+    belongs to a TestClient portal that has already stopped,
+    ``call_soon_threadsafe`` raises ``RuntimeError: Event loop is closed``.
+    The sockets are undeliverable, so the schedule drops them and returns.
+    """
+    loop = asyncio.new_event_loop()
+    loop.close()
+    session_id = f"S-closed-loop-{uuid4().hex}"
+    manager = websocket_module.manager
+    manager._connections[session_id]["student"].append(
+        websocket_module.ConnectionInfo(
+            websocket=object(),  # type: ignore[arg-type]
+            connected_at_ms=0,
+            last_heartbeat_ms=0,
+            event_loop=loop,
+        )
+    )
+
+    async def _must_not_run() -> None:
+        raise AssertionError("a closed loop must not run the coroutine")
+
+    try:
+        manager._schedule_on_loop(loop, _must_not_run())
+        assert manager._connections[session_id]["student"] == []
+    finally:
+        manager._connections.pop(session_id, None)

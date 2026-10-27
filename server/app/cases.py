@@ -24,7 +24,18 @@ from .events import ClipManifestEntry
 
 logger = logging.getLogger(__name__)
 
-CASES_DIR = Path(os.environ.get("MINDPROBE_CASES_DIR", "./cases"))
+def _resolve_cases_dir() -> Path:
+    env_dir = os.environ.get("MINDPROBE_CASES_DIR")
+    if env_dir:
+        return Path(env_dir)
+    if Path("./cases").is_dir():
+        return Path("./cases")
+    if Path("../cases").is_dir():
+        return Path("../cases")
+    return Path("./cases")
+
+
+CASES_DIR = _resolve_cases_dir()
 
 # The JSON files that make up a case (spec §12).
 CASE_FILES = (

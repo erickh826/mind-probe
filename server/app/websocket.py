@@ -128,6 +128,10 @@ PAUSE_REASONS = {
 }
 
 WS_SESSION_COOKIE = "mindprobe_session_token"
+# Offered by the browser as ``Sec-WebSocket-Protocol: mindprobe.v1, bearer.<token>``.
+# The server echoes only ``mindprobe.v1`` (ADR-0005 §1, design §6.6).
+WS_PROTOCOL = "mindprobe.v1"
+BEARER_SUBPROTOCOL_PREFIX = "bearer."
 WS_TOKEN_SECRET_ENV = "MINDPROBE_WS_TOKEN_SECRET"
 WS_TOKEN_TTL_SECONDS = 2 * 60 * 60
 
@@ -211,6 +215,12 @@ class ConnectionInfo:
     # events can record which offset/version they were normalized against.
     clock_offset_ms: int = 0
     clock_offset_version: int = 1
+    # Digest of the token presented at the upgrade. Security revocation closes
+    # only the sockets that presented that digest; session end closes them all.
+    token_hash: str = ""
+    # Set for typ=review so logout and refresh-reuse can close this socket
+    # without revoking the student or wizard connection.
+    review_jti: str | None = None
 
 
 @dataclass
@@ -308,7 +318,16 @@ class ConnectionManager:
     def case_id_for(self, session_id: str) -> str | None:
         return self._case_ids.get(session_id)
 
-    async def connect(self, session_id: str, role: str, ws: WebSocket) -> bool:
+    async def connect(
+        self,
+        session_id: str,
+        role: str,
+        ws: WebSocket,
+        *,
+        subprotocol: str | None = None,
+        token_hash: str = "",
+        review_jti: str | None = None,
+    ) -> bool:
         """Accept `ws` for (session_id, role).
 
         Returns True if this connection replaced a stale prior connection for
@@ -316,6 +335,9 @@ class ConnectionManager:
         `role_connection_replaced`). Raises RoleConnectionConflict if a
         single-connection role already has a live connection -- the caller
         must reject the new socket without accepting it.
+
+        ``subprotocol`` is the negotiated application protocol. It is either
+        ``mindprobe.v1`` or omitted. A ``bearer.*`` value is never echoed.
         """
         replaced = False
         if role in SINGLE_CONNECTION_ROLES:
@@ -335,7 +357,9 @@ class ConnectionManager:
                 existing.clear()
                 replaced = True
 
-        await ws.accept()
+        if subprotocol not in (None, WS_PROTOCOL):
+            raise ValueError("refusing to echo a non-mindprobe subprotocol")
+        await ws.accept(subprotocol=subprotocol)
         now = _now_ms()
         self._connections[session_id][role].append(
             ConnectionInfo(
@@ -343,6 +367,8 @@ class ConnectionManager:
                 connected_at_ms=now,
                 last_heartbeat_ms=now,
                 event_loop=asyncio.get_running_loop(),
+                token_hash=token_hash,
+                review_jti=review_jti,
             )
         )
         # The role is back: clear any outstanding disconnect mark last, so a
@@ -433,10 +459,110 @@ class ConnectionManager:
             for c in list(conns):
                 await c.websocket.send_json(message)
 
+    def schedule_broadcast(self, session_id: str, message: dict) -> None:
+        """Broadcast from a sync REST handler onto the loops that own the sockets.
+
+        No-op when nobody is connected. Mirrors :meth:`schedule_close_live_sockets`:
+        the request thread must not ``create_task`` on a loop it does not own.
+        """
+        loops: set[asyncio.AbstractEventLoop] = set()
+        for conns in self._connections.get(session_id, {}).values():
+            for info in conns:
+                loops.add(info.event_loop)
+        for loop in loops:
+            self._schedule_on_loop(loop, self.broadcast(session_id, message))
+
     def spawn_background_task(self, coro) -> None:
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+
+    def _forget_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Drop sockets bound to a loop that can no longer run them."""
+        for roles in self._connections.values():
+            for role, conns in list(roles.items()):
+                roles[role] = [info for info in conns if info.event_loop is not loop]
+
+    def _schedule_on_loop(self, loop: asyncio.AbstractEventLoop, coro) -> None:
+        """Run `coro` on `loop`.
+
+        REST handlers and a socket on one TestClient portal both end up here
+        when they need to touch a socket accepted on another loop. A portal
+        that has already shut down leaves its loop closed while the connection
+        is still registered. ``call_soon_threadsafe`` then raises
+        ``RuntimeError: Event loop is closed`` and aborts session end or a
+        broadcast. Those sockets cannot receive anything, so drop them and
+        discard the coroutine instead of failing the caller. A live loop is
+        unchanged.
+        """
+        if loop.is_closed():
+            self._forget_loop(loop)
+            coro.close()
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        try:
+            if running is loop:
+                self.spawn_background_task(coro)
+            else:
+                loop.call_soon_threadsafe(self.spawn_background_task, coro)
+        except RuntimeError:
+            self._forget_loop(loop)
+            coro.close()
+
+    def schedule_close_live_sockets(
+        self,
+        session_id: str,
+        *,
+        code: int = 4401,
+        reason: str,
+        token_hash: str | None = None,
+    ) -> None:
+        """Close live sockets for a session on the loop that accepted them.
+
+        ``token_hash`` None closes every role. A digest closes only the
+        sockets that presented that token, so revoking the wizard credential
+        leaves the student connection up. REST handlers run in a worker
+        thread, so they cannot ``create_task`` directly.
+        """
+        by_loop: dict[asyncio.AbstractEventLoop, list[WebSocket]] = {}
+        for conns in self._connections.get(session_id, {}).values():
+            for info in list(conns):
+                if token_hash is None or info.token_hash == token_hash:
+                    by_loop.setdefault(info.event_loop, []).append(info.websocket)
+        for loop, sockets in by_loop.items():
+            self._schedule_on_loop(
+                loop, self._close_sockets(sockets, code=code, reason=reason)
+            )
+
+    def schedule_close_review_jtis(
+        self, session_id: str, jtis: set[str], *, reason: str
+    ) -> None:
+        """Close review sockets whose access-token ``jti`` was revoked."""
+        if not jtis:
+            return
+        by_loop: dict[asyncio.AbstractEventLoop, list[WebSocket]] = {}
+        for conns in self._connections.get(session_id, {}).values():
+            for info in list(conns):
+                if info.review_jti in jtis:
+                    by_loop.setdefault(info.event_loop, []).append(info.websocket)
+        for loop, sockets in by_loop.items():
+            self._schedule_on_loop(
+                loop, self._close_sockets(sockets, code=4401, reason=reason)
+            )
+
+    async def _close_sockets(
+        self, sockets: list[WebSocket], *, code: int, reason: str
+    ) -> None:
+        for ws in sockets:
+            try:
+                await ws.close(code=code, reason=reason)
+            except (WebSocketDisconnect, RuntimeError):
+                # Starlette 1.3.1 raises RuntimeError when close() is called
+                # after the socket has already been closed.
+                pass
 
 
 manager = ConnectionManager()
@@ -464,13 +590,16 @@ def create_session_token(
     *,
     client_id: str = "temporary-client-id",
     expires_at_s: int | None = None,
+    typ: str | None = None,
+    grant_id: str | None = None,
+    jti: str | None = None,
 ) -> str:
-    """Create a short-lived, role-bound token for the WS cookie.
+    """Create a short-lived, role-bound HMAC token for Bearer and WebSocket auth.
 
-    The join-code exchange endpoint that will issue this token belongs in a
-    later Integration Agent task. Keeping the signer here lets the WebSocket
-    upgrade validate a real HMAC-protected cookie now without trusting role or
-    session claims from the URL alone.
+    ``POST /sessions/{id}/join`` returns this token in the response body. The
+    WebSocket upgrade reads it from the ``bearer.<token>`` subprotocol, and
+    only falls back to the HttpOnly cookie when ``MINDPROBE_AUTH_COOKIE`` is
+    enabled. The path role is never trusted on its own (ADR-0001 §8, ADR-0005).
     """
     if role not in VALID_ROLES:
         raise ValueError(f"invalid role: {role}")
@@ -483,6 +612,15 @@ def create_session_token(
         "iat": now_s,
         "exp": expires_at_s if expires_at_s is not None else now_s + WS_TOKEN_TTL_SECONDS,
     }
+    # Omitted ``typ`` stays live. Upload recovery sets ``typ`` and ``grant_id``.
+    if typ is not None:
+        claims["typ"] = typ
+    if grant_id is not None:
+        claims["grant_id"] = grant_id
+    if jti is not None:
+        if not jti:
+            raise ValueError("invalid jti")
+        claims["jti"] = jti
     payload = _b64encode(
         json.dumps(claims, separators=(",", ":"), sort_keys=True).encode("utf-8")
     )
@@ -500,43 +638,99 @@ def _cookie_value(websocket: WebSocket, name: str) -> str | None:
     return morsel.value if morsel is not None else None
 
 
-def _verify_session_token(websocket: WebSocket, session_id: str, role: str) -> None:
-    token = _cookie_value(websocket, WS_SESSION_COOKIE)
+def _offered_subprotocols(websocket: WebSocket) -> list[str]:
+    """Subprotocols the client offered, never values taken from the query string."""
+    scope = getattr(websocket, "scope", None)
+    if not isinstance(scope, dict):
+        return []
+    raw = scope.get("subprotocols") or []
+    return [item for item in raw if isinstance(item, str)]
+
+
+def _selected_subprotocol(websocket: WebSocket) -> str | None:
+    """The protocol to echo: ``mindprobe.v1`` when the client offered it.
+
+    ``bearer.*`` is a credential, not a protocol the server may select.
+    """
+    if WS_PROTOCOL in _offered_subprotocols(websocket):
+        return WS_PROTOCOL
+    return None
+
+
+def _extract_session_token(websocket: WebSocket) -> str | None:
+    """Read the upgrade token from the subprotocol, then the dev cookie.
+
+    Clients send ``Sec-WebSocket-Protocol: mindprobe.v1, bearer.<token>``.
+    The query string is ignored on purpose: it would land in access logs.
+    A ``bearer.*`` offer without ``mindprobe.v1`` is rejected rather than
+    silently falling back to a cookie. The cookie is read only when
+    ``MINDPROBE_AUTH_COOKIE`` is enabled.
+    """
+    # Local import: auth.py imports this module for signing helpers.
+    from . import auth
+
+    protocols = _offered_subprotocols(websocket)
+    bearer_tokens = [
+        protocol[len(BEARER_SUBPROTOCOL_PREFIX) :]
+        for protocol in protocols
+        if protocol.startswith(BEARER_SUBPROTOCOL_PREFIX)
+    ]
+    if bearer_tokens:
+        if WS_PROTOCOL not in protocols:
+            raise WebSocketAuthError("missing_subprotocol")
+        token = bearer_tokens[0]
+        if not token:
+            raise WebSocketAuthError("malformed_session_token")
+        return token
+    if auth.cookie_auth_enabled():
+        return _cookie_value(websocket, WS_SESSION_COOKIE)
+    return None
+
+
+def _verify_session_token(websocket: WebSocket, session_id: str, role: str) -> str:
+    """Validate the upgrade token and return the raw token.
+
+    Signature, expiry, session binding and role binding go through
+    ``auth.verify_token`` so REST and WebSocket cannot drift. Join tokens
+    omit ``typ`` and count as ``live``. ``teacher`` and ``observer`` may also
+    present ``typ=review``; the caller then checks ``review_grants``. A review
+    token with no ``jti``, and every ``typ=upload`` token, is refused here.
+
+    Raises :class:`WebSocketAuthError`. The caller maps
+    ``role_token_mismatch`` to close code 4403 and every other reason to 4401.
+    """
+    from . import auth
+
+    token = _extract_session_token(websocket)
     if not token:
         raise WebSocketAuthError("missing_session_token")
-
     try:
-        payload_b64, signature_b64 = token.split(".", 1)
-    except ValueError as exc:
-        raise WebSocketAuthError("malformed_session_token") from exc
+        claims = auth.verify_token(
+            token,
+            session_id=session_id,
+            roles={role},
+        )
+    except auth.TokenInvalid as exc:
+        raise WebSocketAuthError(exc.reason) from exc
+    typ = str(claims.get("typ", "live"))
+    if typ == "live":
+        return token
+    if (
+        typ == "review"
+        and role in {"teacher", "observer"}
+        and isinstance(claims.get("jti"), str)
+        and claims.get("jti")
+    ):
+        return token
+    raise WebSocketAuthError("token_type_mismatch")
 
-    expected_signature = hmac.new(
-        _token_secret(), payload_b64.encode("ascii"), hashlib.sha256
-    ).digest()
-    try:
-        supplied_signature = _b64decode(signature_b64)
-    except Exception as exc:
-        raise WebSocketAuthError("malformed_session_token") from exc
 
-    if not hmac.compare_digest(supplied_signature, expected_signature):
-        raise WebSocketAuthError("invalid_session_token")
-
-    try:
-        claims = json.loads(_b64decode(payload_b64))
-    except Exception as exc:
-        raise WebSocketAuthError("malformed_session_token") from exc
-
-    try:
-        expires_at_s = int(claims["exp"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise WebSocketAuthError("malformed_session_token") from exc
-
-    if expires_at_s < int(time.time()):
-        raise WebSocketAuthError("expired_session_token")
-    if claims.get("session_id") != session_id:
-        raise WebSocketAuthError("session_token_mismatch")
-    if claims.get("role") != role:
-        raise WebSocketAuthError("role_token_mismatch")
+_WS_REVIEW_BLOCK = {
+    "revoked": "token_revoked",
+    "expired": "expired_session_token",
+    "session": "session_token_mismatch",
+    "role": "role_token_mismatch",
+}
 
 
 def _event_dedup_key(envelope: EventEnvelope) -> str:
@@ -689,11 +883,9 @@ def _db_scope(websocket: WebSocket) -> Iterator[DBSession]:
     of work, exactly as ``models.session_scope``'s docstring prescribes.
 
     When the app carries a ``get_db`` dependency override the override wins.
-    That mirrors ``main._websocket_guard_db`` (main.py:84-107), which had to
-    solve the same problem for the ASGI-level revocation guard: tests point
-    ``get_db`` at a private in-memory database and open a real WebSocket
-    against a session that exists *only* there, so honouring the override is
-    what keeps the realtime layer writing to the same database as the REST
+    Tests point ``get_db`` at a private in-memory database and open a real
+    WebSocket against a session that exists *only* there, so honouring the
+    override keeps the realtime layer on the same database as the REST
     surface it is being tested against.
     """
     app = websocket.scope.get("app")
@@ -1306,7 +1498,7 @@ async def _handle_message(
         return
 
     # Anything else is expected to be a standard event envelope. The URL path
-    # role/session have already been bound to the verified cookie; never trust
+    # role/session have already been bound to the verified token; never trust
     # client-supplied identity fields in the envelope.
     payload = raw.get("payload", {})
     event_id = payload.get("event_id") if isinstance(payload, dict) else None
@@ -1518,6 +1710,12 @@ async def _handle_message(
         return
 
     await manager.broadcast(session_id, message, exclude=role)
+    if envelope.event_type is EventType.SESSION_ENDED:
+        # The ended event itself was already ACKed and broadcast. Further
+        # frames from this socket, and from every other live role, are refused.
+        manager.schedule_close_live_sockets(
+            session_id, code=4401, reason="session_ended"
+        )
 
 
 @router.websocket("/ws/{session_id}/{role}")
@@ -1528,28 +1726,62 @@ async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
     'teacher', 'observer' (multiple read-only connections allowed) per
     ADR-0001 §9.
 
-    The full join-code exchange endpoint belongs to a later Integration Agent
-    task, but the upgrade itself already requires an HMAC-protected,
-    role-bound cookie so the path role is never treated as authoritative by
-    itself (ADR-0001 §8).
+    The upgrade requires an HMAC token carried as the ``bearer.<token>``
+    subprotocol (or, only when ``MINDPROBE_AUTH_COOKIE`` is on, the dev
+    cookie). The path role is never treated as authoritative by itself
+    (ADR-0001 §8, ADR-0005 §6.6). Revocation and ended-session refusal are
+    checked again on every inbound frame, and live sockets are closed when
+    a token is revoked or the session ends.
     """
     if role not in VALID_ROLES:
         await websocket.close(code=4400, reason="invalid_role")
         return
     try:
-        _verify_session_token(websocket, session_id, role)
+        token = _verify_session_token(websocket, session_id, role)
     except WebSocketAuthError as exc:
-        await websocket.close(code=4401, reason=exc.reason)
+        # 4403 is reserved for a valid token whose role does not match the
+        # path. Every other authentication failure stays 4401.
+        close_code = 4403 if exc.reason == "role_token_mismatch" else 4401
+        await websocket.close(code=close_code, reason=exc.reason)
         return
 
     # A valid token proves the bearer's role and session claim, not that the
-    # session it names was ever created. Refuse before any in-memory state is
-    # spun up for a session no event could be persisted against.
+    # session it names was ever created, is still live, or that the token
+    # has not been revoked. Refuse before any in-memory state is spun up.
+    from . import auth
+
+    try:
+        claims = auth.verify_token(token, session_id=session_id, roles={role})
+    except auth.TokenInvalid as exc:
+        await websocket.close(code=4401, reason=exc.reason)
+        return
+    review_jti = claims.get("jti") if claims.get("typ") == "review" else None
+    if review_jti is not None and not isinstance(review_jti, str):
+        review_jti = None
+    token_hash = models.hash_token(token)
     try:
         with _db_scope(websocket) as db:
             session = models.get_session(db, session_id)
-            session_exists = session is not None
-            if session is not None:
+            if session is None:
+                rejection = "session_not_found"
+            elif review_jti and (
+                block := models.review_access_block(
+                    db, review_jti, session_id=session_id, role=role
+                )
+            ):
+                rejection = _WS_REVIEW_BLOCK[block]
+            elif review_jti and models.is_token_hash_revoked(
+                db, session_id, token_hash
+            ):
+                rejection = "token_revoked"
+            elif session.status == "ended":
+                rejection = "session_ended"
+            elif review_jti is None and models.is_token_hash_revoked(
+                db, session_id, token_hash
+            ):
+                rejection = "token_revoked"
+            else:
+                rejection = None
                 # Memoised here so ADR-0002 fallback resolution never needs a
                 # query of its own on the realtime path.
                 manager.remember_case_id(session_id, session.case_id)
@@ -1559,16 +1791,24 @@ async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
             session_id,
             role,
         )
-        # Same close signal main.py's ASGI guard already emits when it cannot
-        # read session state, so clients need no new code to handle this.
         await websocket.close(code=4401, reason="session_state_unavailable")
         return
-    if not session_exists:
+    if rejection == "session_not_found":
         await websocket.close(code=4404, reason="session_not_found")
+        return
+    if rejection is not None:
+        await websocket.close(code=4401, reason=rejection)
         return
 
     try:
-        replaced = await manager.connect(session_id, role, websocket)
+        replaced = await manager.connect(
+            session_id,
+            role,
+            websocket,
+            subprotocol=_selected_subprotocol(websocket),
+            token_hash=token_hash,
+            review_jti=review_jti if isinstance(review_jti, str) else None,
+        )
     except RoleConnectionConflict:
         # ADR-0001 §9: a live connection must not be silently evicted by a
         # new one for the same role -- reject the new connection instead.
@@ -1593,6 +1833,20 @@ async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
         while True:
             try:
                 raw = await websocket.receive_json()
+                rejection = _live_socket_rejection(
+                    websocket,
+                    session_id,
+                    token_hash,
+                    review_jti=review_jti if isinstance(review_jti, str) else None,
+                    role=role,
+                )
+                if rejection is not None:
+                    close_code, close_reason = rejection
+                    try:
+                        await websocket.close(code=close_code, reason=close_reason)
+                    except (WebSocketDisconnect, RuntimeError):
+                        pass
+                    raise WebSocketDisconnect(code=close_code, reason=close_reason)
                 await _handle_message(websocket, session_id, role, raw)
             except ValidationError as exc:
                 await websocket.send_json(
@@ -1609,14 +1863,77 @@ async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
         manager.disconnect(session_id, role, websocket)
         if role in SINGLE_CONNECTION_ROLES:
             live_connection = manager.first_live_connection(session_id)
-            if live_connection is not None:
-                live_connection.event_loop.call_soon_threadsafe(
-                    manager.spawn_background_task,
+            if live_connection is not None and not live_connection.event_loop.is_closed():
+                manager._schedule_on_loop(
+                    live_connection.event_loop,
                     _delayed_disconnect_pause_check(
                         live_connection.websocket, session_id, role
                     ),
                 )
             else:
+                if live_connection is not None:
+                    manager._forget_loop(live_connection.event_loop)
+                # This handler is already on a running loop. The grace check
+                # only needs that loop, not the socket that just went away.
                 manager.spawn_background_task(
                     _delayed_disconnect_pause_check(websocket, session_id, role)
                 )
+
+
+def _live_socket_rejection(
+    websocket: WebSocket,
+    session_id: str,
+    token_hash: str,
+    *,
+    review_jti: str | None = None,
+    role: str = "",
+) -> tuple[int, str] | None:
+    """Refuse a frame once the session has ended or this token was revoked.
+
+    The handshake check is not enough: a socket accepted earlier can still
+    write events after ``POST /end`` or a security revocation unless each
+    message is checked again. Review grants are rechecked here too, with no
+    ended exemption; an ended session still closes the socket afterwards.
+    Live tokens keep the previous order: ended is reported before a hash
+    revocation so ``POST /end`` still closes with ``session_ended``.
+    """
+    try:
+        with _db_scope(websocket) as db:
+            session = models.get_session(db, session_id)
+            if session is None:
+                return 4404, "session_not_found"
+            if review_jti:
+                block = models.review_access_block(
+                    db, review_jti, session_id=session_id, role=role
+                )
+                if block is not None:
+                    return 4401, _WS_REVIEW_BLOCK[block]
+                if models.is_token_hash_revoked(db, session_id, token_hash):
+                    return 4401, "token_revoked"
+            if session.status == "ended":
+                return 4401, "session_ended"
+            if review_jti is None and models.is_token_hash_revoked(
+                db, session_id, token_hash
+            ):
+                return 4401, "token_revoked"
+    except SQLAlchemyError:
+        logger.exception(
+            "failed to recheck authorization for session %s", session_id
+        )
+        return 4401, "session_state_unavailable"
+    return None
+
+
+def _on_tokens_revoked(
+    session_id: str, token_hash: str | None, reason: str
+) -> None:
+    """Close sockets after a revocation commit. Registered below."""
+    manager.schedule_close_live_sockets(
+        session_id,
+        code=4401,
+        reason=reason,
+        token_hash=token_hash,
+    )
+
+
+models.add_revocation_listener(_on_tokens_revoked)

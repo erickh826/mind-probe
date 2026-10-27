@@ -1,0 +1,26 @@
+# TLS terminator for the Session Server on one Lightsail host.
+#
+# Trial (design §10, §12): set MINDPROBE_API_HOST to the static IP in sslip.io
+# form, for example 1-2-3-4.sslip.io. Caddy obtains a Let's Encrypt certificate
+# for that name. Local smoke tests leave the variable unset; the default
+# localhost site uses Caddy's internal CA (curl -k https://localhost/health).
+#
+# Request logs drop Authorization and the WebSocket subprotocol. Those headers
+# carry bearer tokens (ADR-0005) and must not land in the container log.
+
+{$MINDPROBE_API_HOST:localhost} {
+	request_body {
+		max_size 20MB
+	}
+	log {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>headers>Authorization delete
+				request>headers>Sec-Websocket-Protocol delete
+			}
+		}
+	}
+	reverse_proxy server:8000
+}

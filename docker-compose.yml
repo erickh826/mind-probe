@@ -1,8 +1,11 @@
-# mind-probe — Docker Compose
+# mind-probe — Docker Compose (development)
 #
-# Only the Session Server is containerized here. The three frontend apps
-# (apps/student, apps/wizard, apps/teacher) are Vite dev servers during
-# development; see the notes at the bottom for running them.
+# Only the Session Server is containerized here. The API is published on
+# port 8000 with MINDPROBE_ENV=development and no TLS proxy. For the
+# Lightsail-shaped stack (Caddy, proxy headers, production env) use
+# docker-compose.prod.yml. The three frontend apps (apps/student,
+# apps/wizard, apps/teacher) are Vite dev servers during development; see
+# the notes at the bottom for running them.
 
 services:
   server:
@@ -18,6 +21,9 @@ services:
       MINDPROBE_DB_URL: "sqlite:////data/sessions/mind-probe.sqlite"
       MINDPROBE_CASES_DIR: "/data/cases"
       MINDPROBE_SESSIONS_DIR: "/data/sessions"
+      # Same cutover switch as production. Blank (the default) does not invent
+      # recording rows for sessions that ended before this build.
+      MINDPROBE_UPLOAD_GRACE_SYNTHESIZE_AFTER: "${MINDPROBE_UPLOAD_GRACE_SYNTHESIZE_AFTER:-}"
     volumes:
       # Server owns all local storage (cases library + session recordings).
       - ./cases:/data/cases

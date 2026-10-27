@@ -1,15 +1,10 @@
 // Runtime endpoints for the Wizard console.
 //
 // Default is the *same origin* as the Vite dev server: `vite.config.ts` proxies
-// `/sessions`, `/cases`, `/health` and `/ws` to the Session Server. Going
-// through the proxy keeps the role-bound `mindprobe_session_token` cookie
-// (ADR-0001 §8) first-party, which is what makes it ride along on the
-// WebSocket upgrade — a WebSocket handshake is not covered by CORS, so a
-// genuinely cross-site upgrade would reach the server with no cookie at all.
-//
-// Set `VITE_API_BASE_URL` (e.g. "http://192.168.1.20:8000") to talk to a
-// server directly, e.g. from a `vite preview` / static build where no dev
-// proxy exists.
+// `/sessions`, `/cases`, `/health` and `/ws` to the Session Server. Production
+// builds set `VITE_API_BASE_URL` to the API host. Auth is a Bearer token from
+// `/join`, sent on REST and as the WebSocket `bearer.<token>` subprotocol
+// (ADR-0005). The token is not placed in the query string.
 
 /** Origin of the Session Server REST API. Empty string = same origin. */
 export const API_BASE_URL: string = (

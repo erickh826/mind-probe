@@ -15,7 +15,12 @@
 // no message shapes of its own.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { isEventEnvelope, isWebSocketControlMessage } from "@mind-probe/shared";
+import {
+  isEventEnvelope,
+  isWebSocketControlMessage,
+  readAccessToken,
+  websocketSubprotocols,
+} from "@mind-probe/shared";
 import type {
   AnyEventEnvelope,
   ClipCommandPayload,
@@ -69,7 +74,7 @@ export const FALLBACK_THRESHOLD = 3;
  * auth, 4404 unknown session, 4409 role conflict / taken over). Reconnecting
  * cannot fix any of them, so the ladder stops and the Wizard is told why.
  */
-const TERMINAL_CLOSE_CODES = new Set([4400, 4401, 4404, 4409]);
+const TERMINAL_CLOSE_CODES = new Set([4400, 4401, 4403, 4404, 4409]);
 
 /**
  * Event types for which the server bumps `snapshot_revision`. Mirrors
@@ -170,7 +175,10 @@ export interface SessionSocket {
  * caused by, say, an incoming log line must never tear down and rebuild a live
  * connection mid-interrogation.
  */
-export function useSessionSocket(sessionId: string | null): SessionSocket {
+export function useSessionSocket(
+  sessionId: string | null,
+  accessToken: string | null,
+): SessionSocket {
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [closedReason, setClosedReason] = useState<string | null>(null);
   const [session, setSession] = useState<SessionView>(INITIAL_SESSION_VIEW);
@@ -860,12 +868,22 @@ export function useSessionSocket(sessionId: string | null): SessionSocket {
     hasConnectedOnceRef.current = false;
     let disposed = false;
 
+    const token = accessToken ?? readAccessToken(sessionId);
+    if (!token) {
+      setStatus("closed");
+      setClosedReason("missing_session_token");
+      return;
+    }
+
     const connect = () => {
       if (disposed || !shouldReconnectRef.current) {
         return;
       }
       setStatus(hasConnectedOnceRef.current ? "reconnecting" : "connecting");
-      const socket = new WebSocket(sessionSocketUrl(sessionId));
+      const socket = new WebSocket(
+        sessionSocketUrl(sessionId),
+        websocketSubprotocols(token),
+      );
       socketRef.current = socket;
 
       socket.onopen = () => {
@@ -904,7 +922,7 @@ export function useSessionSocket(sessionId: string | null): SessionSocket {
           return;
         }
         if (TERMINAL_CLOSE_CODES.has(event.code)) {
-          // 4400/4401/4404/4409 are refusals rather than glitches — retrying
+          // 4400/4401/4403/4404/4409 are refusals rather than glitches — retrying
           // would hammer the server with the same rejected upgrade.
           shouldReconnectRef.current = false;
           setStatus("closed");
@@ -947,6 +965,7 @@ export function useSessionSocket(sessionId: string | null): SessionSocket {
       socketRef.current = null;
     };
   }, [
+    accessToken,
     appendLog,
     clearHeartbeat,
     handleMessage,

@@ -7,6 +7,10 @@ pydantic>=2.6
 sqlalchemy>=2.0
 python-multipart>=0.0.9
 websockets>=12.0
+# S3-compatible storage (R2). Imported when MINDPROBE_STORAGE_BACKEND=s3.
+# Keep this list aligned with [project.dependencies] in pyproject.toml;
+# uv.lock is the pinned set used by `uv sync`.
+boto3>=1.35
 
 # Dev / test (also in [project.optional-dependencies].dev):
 pytest>=8.0

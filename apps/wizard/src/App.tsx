@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { UncoveredQuestionPayload } from "@mind-probe/shared";
-import { ApiError, fetchDecisionTree, findThinkingClipId, resolveClipId } from "./api";
+import {
+  clearJoinedSession,
+  readJoinedSession,
+  rememberJoinedSession,
+} from "@mind-probe/shared";
+import { ApiError, fetchDecisionTree, fetchSession, findThinkingClipId, resolveClipId } from "./api";
 import { useSessionSocket } from "./useSessionSocket";
 import {
   CATEGORY_KEYS,
@@ -58,6 +63,10 @@ function isToneKey(key: string): key is ToneKey {
 
 export default function App() {
   const [joined, setJoined] = useState<JoinedSession | null>(null);
+  const [restorePending, setRestorePending] = useState(
+    () => readJoinedSession()?.role === "wizard",
+  );
+  const [restoreError, setRestoreError] = useState<string | null>(null);
   const [tree, setTree] = useState<DecisionTree>({});
   const [treeError, setTreeError] = useState<string | null>(null);
   const [selection, setSelection] = useState<StagedSelection>(EMPTY_SELECTION);
@@ -68,7 +77,57 @@ export default function App() {
   // it is running there is no server-supplied origin to subtract from.
   const [activeSinceMs, setActiveSinceMs] = useState<number | null>(null);
 
-  const socket = useSessionSocket(joined?.sessionId ?? null);
+  const handleJoined = useCallback((session: JoinedSession) => {
+    rememberJoinedSession({
+      sessionId: session.sessionId,
+      role: "wizard",
+      accessToken: session.accessToken,
+    });
+    setRestoreError(null);
+    setJoined(session);
+  }, []);
+
+  useEffect(() => {
+    if (!restorePending) {
+      return;
+    }
+    const stored = readJoinedSession();
+    if (stored === null || stored.role !== "wizard") {
+      setRestorePending(false);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const info = await fetchSession(stored.sessionId);
+        if (cancelled) {
+          return;
+        }
+        setJoined({
+          sessionId: stored.sessionId,
+          caseId: info.case_id,
+          accessToken: stored.accessToken,
+        });
+      } catch (cause) {
+        if (cancelled) {
+          return;
+        }
+        if (cause instanceof ApiError && [401, 403, 404].includes(cause.status)) {
+          clearJoinedSession(stored.sessionId);
+          setRestoreError("Saved session is no longer valid. Join again.");
+        }
+      } finally {
+        if (!cancelled) {
+          setRestorePending(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [restorePending]);
+
+  const socket = useSessionSocket(joined?.sessionId ?? null, joined?.accessToken ?? null);
   const { session, status } = socket;
 
   // 載入案件決策樹（cases/<case>/wizard_decision_tree.json）。
@@ -264,8 +323,25 @@ export default function App() {
     uncoveredOpen,
   ]);
 
+  if (restorePending && joined === null) {
+    return (
+      <div
+        style={{
+          fontFamily: "system-ui",
+          background: "#101216",
+          color: "#e8e8ea",
+          minHeight: "100vh",
+          display: "grid",
+          placeItems: "center",
+        }}
+      >
+        Restoring session…
+      </div>
+    );
+  }
+
   if (joined === null) {
-    return <SessionJoinModal onJoined={setJoined} />;
+    return <SessionJoinModal onJoined={handleJoined} error={restoreError} />;
   }
 
   return (

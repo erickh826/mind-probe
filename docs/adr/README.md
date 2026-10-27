@@ -18,6 +18,7 @@
 | [0002](0002-fallback-mechanism.md) | Fallback 機制設計 | 已接受（2026-07-22） |
 | [0003](0003-time-sync.md) | 時間同步機制 | 已接受（2026-07-22） |
 | [0004](0004-cross-cutting-rules.md) | 跨 ADR 共同規定 | 已接受（2026-07-22） |
+| [0005](0005-cloud-deployment-and-recording-retention.md) | 雲端部署、認證合約與錄影保留 | 已接受（2026-10-15） |
 
 ## 實作優先順序
 

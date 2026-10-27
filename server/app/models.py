@@ -32,23 +32,27 @@ locally and pinned by equivalence assertions in
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import secrets
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     DateTime,
     ForeignKey,
     Integer,
+    Index,
     String,
     Text,
     UniqueConstraint,
     create_engine,
+    inspect,
     select,
     update,
 )
@@ -63,6 +67,34 @@ from sqlalchemy.orm import (
 from sqlalchemy.orm import Session as DBSession
 
 from .events import EventEnvelope
+
+logger = logging.getLogger(__name__)
+
+# ``websocket.py`` registers this so a revocation commit can close live
+# sockets. models does not import the realtime module (that would cycle).
+RevocationListener = Callable[[str, str | None, str], None]
+_revocation_listeners: list[RevocationListener] = []
+
+
+def add_revocation_listener(listener: RevocationListener) -> None:
+    """Notify ``listener`` after a revocation is committed.
+
+    The callback is ``(session_id, token_hash, reason)``. ``token_hash`` is
+    None when every issued token for the session was revoked. Listeners are
+    skipped when the caller passes ``commit=False`` and commits later itself.
+    """
+    if listener not in _revocation_listeners:
+        _revocation_listeners.append(listener)
+
+
+def _notify_revocation(session_id: str, token_hash: str | None, reason: str) -> None:
+    for listener in list(_revocation_listeners):
+        try:
+            listener(session_id, token_hash, reason)
+        except Exception:
+            logger.exception(
+                "revocation listener failed for session %s", session_id
+            )
 
 DB_URL = os.environ.get("MINDPROBE_DB_URL", "sqlite:///./sessions/mind-probe.sqlite")
 
@@ -119,6 +151,18 @@ AUDIT_TOKEN_ISSUED = "token_issued"
 AUDIT_TOKEN_REVOKED = "token_revoked"
 AUDIT_SESSION_PAUSED = "session_paused"
 AUDIT_CONNECTION_TAKEOVER = "connection_takeover"
+AUDIT_UPLOAD_CODE_ISSUED = "upload_code_issued"
+AUDIT_UPLOAD_TOKEN_ISSUED = "upload_token_issued"
+AUDIT_REVIEW_LOGIN = "review_login"
+AUDIT_REVIEW_REFRESH = "review_refresh"
+AUDIT_REVIEW_LOGOUT = "review_logout"
+AUDIT_REVIEW_REVOKE = "review_revoke"
+
+#: Reusable review codes issued to the operator (ADR-0005 §6.5). Not join codes.
+REVIEW_CODE_ROLES = ("teacher", "observer")
+
+#: Plaintext upload codes live for ten minutes. Only the SHA-256 digest is stored.
+UPLOAD_CODE_TTL_SECONDS = 10 * 60
 
 
 class Base(DeclarativeBase):
@@ -175,6 +219,92 @@ class JoinCode(Base):
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     session: Mapped[Session] = relationship(back_populates="join_codes")
+
+
+class UploadGrant(Base):
+    """Session-level upload credential state.
+
+    One row per session. ``security_revoked_at`` is set in the same transaction
+    as a security revocation and is checked when an upload code is issued,
+    redeemed, or used. ``POST /sessions/{id}/end`` does not set it, so grace
+    uploads keep working.
+    """
+
+    __tablename__ = "upload_grants"
+
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id"), primary_key=True)
+    security_revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class UploadCode(Base):
+    """One-time upload code. The raw code is returned once and never stored."""
+
+    __tablename__ = "upload_codes"
+    __table_args__ = (UniqueConstraint("code_hash", name="uq_upload_codes_code_hash"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id"), index=True)
+    code_hash: Mapped[str] = mapped_column(String, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class UploadCodeInvalid(Exception):
+    """The code does not exist for this session."""
+
+
+class UploadCodeExpired(Exception):
+    """The code's ten-minute lifetime has elapsed. It is left unconsumed."""
+
+
+class UploadCodeConsumed(Exception):
+    """The code was already redeemed or withdrawn by a later reissue."""
+
+
+class ReviewCode(Base):
+    """Reusable teacher/observer review code. The raw code is never stored."""
+
+    __tablename__ = "review_codes"
+    __table_args__ = (
+        UniqueConstraint("session_id", "role", name="uq_review_codes_session_role"),
+        UniqueConstraint("code_hash", name="uq_review_codes_code_hash"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id"), index=True)
+    role: Mapped[str] = mapped_column(String, index=True)
+    code_hash: Mapped[str] = mapped_column(String, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class ReviewCodeInvalid(Exception):
+    """The review code does not match a hash stored for this session."""
+
+
+class ReviewGrant(Base):
+    """One review access/refresh pair (ADR-0005 §6.5).
+
+    ``expires_at`` is the refresh-token deadline. The access token carries its
+    own shorter ``exp``. ``rotated_from`` points at the grant whose refresh
+    token was exchanged for this row. SQLite UNIQUE allows many NULL parents,
+    so each login can start its own chain.
+    """
+
+    __tablename__ = "review_grants"
+
+    jti: Mapped[str] = mapped_column(String, primary_key=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id"), index=True)
+    role: Mapped[str] = mapped_column(String)
+    client_id: Mapped[str] = mapped_column(String)
+    refresh_hash: Mapped[str] = mapped_column(String, unique=True, index=True)
+    issued_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    rotated_from: Mapped[str | None] = mapped_column(
+        ForeignKey("review_grants.jti"), nullable=True, unique=True
+    )
 
 
 class Event(Base):
@@ -234,6 +364,83 @@ class RecordingChunk(Base):
     path: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+#: ``recordings.recording_state`` (ADR-0005 §7.1). Later states are stored so
+#: the machine can name them; this batch only transitions through recording,
+#: finalizing, complete, incomplete, and the existing synchronous transcode.
+RECORDING_STATES = (
+    "recording",
+    "finalizing",
+    "complete",
+    "incomplete",
+    "transcoding",
+    "transcoded",
+    "uploaded",
+    "transcode_failed",
+    "deleting",
+    "deleted",
+)
+FINALIZE_STATES = ("none", "pending", "complete", "incomplete")
+#: D8: these incomplete reasons are sticky. A full chunk set must not flip them
+#: back to complete, so nothing auto-transcodes or deletes their raw media.
+PROTECTED_INCOMPLETE_REASONS = frozenset({"recorder_lost", "operator_incomplete"})
+
+
+class Recording(Base):
+    """One MediaRecorder take for a session (ADR-0005 §7).
+
+    Phase 1 is a single take per session. ``next_sequence`` lives in the
+    browser; this row is the server's view of how far that take got.
+    """
+
+    __tablename__ = "recordings"
+
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("sessions.id"), primary_key=True
+    )
+    recording_state: Mapped[str] = mapped_column(String, default="recording")
+    finalize_state: Mapped[str] = mapped_column(String, default="none")
+    final_sequence: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_chunks: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: ``recorder_lost`` when the student declared the take dead, else None.
+    finalize_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    incomplete_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    needs_operator: Mapped[bool] = mapped_column(Boolean, default=False)
+    missing_sequences: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+    recording_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    recording_sha256: Mapped[str | None] = mapped_column(String, nullable=True)
+    manifest: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    deleted_by: Mapped[str | None] = mapped_column(String, nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class Job(Base):
+    """Durable, single-worker jobs; no URLs or credentials in payloads."""
+
+    __tablename__ = "jobs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(String)
+    session_id: Mapped[str] = mapped_column(String, default="")
+    status: Mapped[str] = mapped_column(String, default="queued")
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int | None] = mapped_column(Integer, default=3, nullable=True)
+    run_after: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    locked_by: Mapped[str | None] = mapped_column(String, nullable=True)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    __table_args__ = (
+        Index("uq_active_job", "kind", "session_id", unique=True,
+              sqlite_where=status.in_(("queued", "running"))),
+    )
+
+
 class AuditLog(Base):
     """Security-relevant action log (ADR-0004 §3).
 
@@ -259,13 +466,23 @@ class AuditLog(Base):
 def init_db() -> None:
     """Create tables. Called on server startup (spec §5).
 
-    ``create_all`` only creates *missing* tables -- it does not alter existing
-    ones. A sqlite file created before ``snapshot_revision`` / ``pause_reason``
-    / ``events.dedup_key`` / ``audit_logs`` existed must be deleted and
-    recreated; there is no migration tool wired up yet.
+    ``create_all`` creates missing tables; this batch additively migrates the
+    five recording-storage/deletion columns on existing SQLite databases.
+    No sessions, original media or audit records are removed by startup.
     """
     os.makedirs("./sessions", exist_ok=True)
     Base.metadata.create_all(bind=engine)
+    # Additive migration: never require deleting an existing research database.
+    if engine.dialect.name == "sqlite":
+        additions = {
+            "recording_key": "TEXT", "recording_sha256": "TEXT", "manifest": "JSON",
+            "deleted_by": "TEXT", "deleted_at": "DATETIME",
+        }
+        with engine.begin() as conn:
+            columns = {c["name"] for c in inspect(conn).get_columns("recordings")}
+            for name, sql_type in additions.items():
+                if name not in columns:
+                    conn.exec_driver_sql(f"ALTER TABLE recordings ADD COLUMN {name} {sql_type}")
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +638,8 @@ def consume_join_code(
     if join_code is None:
         raise JoinCodeInvalid("invalid join code")
     if join_code.consumed_at is not None:
+        if join_code.role in ("teacher", "observer"):
+            return join_code
         raise JoinCodeConsumed("join code already consumed")
     consumed_at = _utcnow()
     result = db.execute(
@@ -438,6 +657,112 @@ def consume_join_code(
     else:
         db.flush()
     return join_code
+
+
+def upload_security_revoked(db: DBSession, session_id: str) -> bool:
+    """True when this session's upload grant was closed for security."""
+    grant = db.get(UploadGrant, session_id)
+    return grant is not None and grant.security_revoked_at is not None
+
+
+def ensure_upload_grant(db: DBSession, session_id: str) -> UploadGrant:
+    """Return the session's upload grant, creating it if this is the first code."""
+    _require_session(db, session_id)
+    grant = db.get(UploadGrant, session_id)
+    if grant is None:
+        grant = UploadGrant(session_id=session_id)
+        db.add(grant)
+        db.flush()
+    return grant
+
+
+def mark_upload_grant_security_revoked(
+    db: DBSession, session_id: str, *, commit: bool = False
+) -> UploadGrant | None:
+    """Latch ``security_revoked_at`` for a security revocation of this session.
+
+    No row is written when the session itself is already gone. ``/end`` does
+    not call this.
+    """
+    if get_session(db, session_id) is None:
+        return None
+    grant = db.get(UploadGrant, session_id)
+    if grant is None:
+        grant = UploadGrant(session_id=session_id, security_revoked_at=_utcnow())
+        db.add(grant)
+    elif grant.security_revoked_at is None:
+        grant.security_revoked_at = _utcnow()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
+    return grant
+
+
+def issue_upload_code(db: DBSession, session_id: str, *, expires_at: datetime) -> str:
+    """Mint one upload code and withdraw every older unused code for the session.
+
+    The raw code is returned to the caller. The database stores only its hash.
+    The caller commits.
+    """
+    ensure_upload_grant(db, session_id)
+    withdrawn_at = _utcnow()
+    db.execute(
+        update(UploadCode)
+        .where(UploadCode.session_id == session_id)
+        .where(UploadCode.consumed_at.is_(None))
+        .values(consumed_at=withdrawn_at)
+    )
+    raw_code = secrets.token_urlsafe(24)
+    db.add(
+        UploadCode(
+            session_id=session_id,
+            code_hash=hash_join_code(raw_code),
+            expires_at=expires_at,
+        )
+    )
+    db.flush()
+    return raw_code
+
+
+def consume_upload_code(db: DBSession, session_id: str, code: str, *, now: datetime) -> UploadCode:
+    """Redeem one code for this session. A second concurrent redeem loses.
+
+    Lookup is scoped to ``session_id``, so a code for another session is
+    ``UploadCodeInvalid`` and is not consumed. An expired code is not consumed.
+    """
+    code_hash = hash_join_code(code)
+    upload_code = db.scalars(
+        select(UploadCode)
+        .where(UploadCode.session_id == session_id)
+        .where(UploadCode.code_hash == code_hash)
+        .limit(1)
+    ).first()
+    if upload_code is None:
+        raise UploadCodeInvalid("invalid upload code")
+    expires_at = upload_code.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    else:
+        expires_at = expires_at.astimezone(timezone.utc)
+    current = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    if current >= expires_at:
+        raise UploadCodeExpired("upload code expired")
+    if upload_code.consumed_at is not None:
+        raise UploadCodeConsumed("upload code already consumed")
+    consumed_at = _utcnow()
+    result = db.execute(
+        update(UploadCode)
+        .where(UploadCode.id == upload_code.id)
+        .where(UploadCode.consumed_at.is_(None))
+        .values(consumed_at=consumed_at)
+    )
+    if result.rowcount != 1:
+        db.rollback()
+        raise UploadCodeConsumed("upload code already consumed")
+    upload_code.consumed_at = consumed_at
+    db.flush()
+    return upload_code
 
 
 def start_session(
@@ -623,6 +948,100 @@ def load_events(db: DBSession, session_id: str) -> list[Event]:
 
 
 # ---------------------------------------------------------------------------
+# Recording chunk metadata (spec §10.1, ADR-0004 §4)
+# ---------------------------------------------------------------------------
+
+
+def get_recording_chunks(db: DBSession, session_id: str) -> list[RecordingChunk]:
+    """Return a session's chunk metadata ordered by ``sequence``.
+
+    ``id`` breaks ties so the order is deterministic even if a sequence was
+    somehow recorded twice.
+    """
+    return list(
+        db.scalars(
+            select(RecordingChunk)
+            .where(RecordingChunk.session_id == session_id)
+            .order_by(RecordingChunk.sequence, RecordingChunk.id)
+        )
+    )
+
+
+def save_recording_chunk_metadata(
+    db: DBSession,
+    session_id: str,
+    sequence: int,
+    *,
+    size_bytes: int | None = None,
+    checksum: str | None = None,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    path: str | None = None,
+    upload_status: str = "received",
+    commit: bool = True,
+) -> RecordingChunk:
+    """Upsert the metadata row for one uploaded chunk.
+
+    Upload retries are normal (ADR-0002 §8), so a second call for the same
+    ``(session_id, sequence)`` refreshes the existing row rather than adding a
+    duplicate. The uniqueness is enforced here rather than by a
+    ``UniqueConstraint`` on the table: as :func:`init_db` notes, ``create_all``
+    does not alter existing tables and there is no migration tool wired up, so
+    a new constraint would apply to fresh databases and silently not to the
+    ``sessions/mind-probe.sqlite`` already on disk -- the worst of both.
+
+    Unlike events, chunk metadata *is* mutable: it describes a file whose
+    bytes are the real artefact, and ADR-0004 §4's immutability applies to the
+    raw event log and the media, not to this index over it.
+    """
+    existing = db.scalars(
+        select(RecordingChunk)
+        .where(RecordingChunk.session_id == session_id)
+        .where(RecordingChunk.sequence == sequence)
+        .order_by(RecordingChunk.id)
+        .limit(1)
+    ).first()
+
+    chunk = existing or RecordingChunk(session_id=session_id, sequence=sequence)
+    chunk.size_bytes = size_bytes
+    chunk.checksum = checksum
+    chunk.start_ms = start_ms
+    chunk.end_ms = end_ms
+    chunk.path = path
+    chunk.upload_status = upload_status
+    if existing is None:
+        db.add(chunk)
+
+    if commit:
+        db.commit()
+    else:
+        db.flush()
+    return chunk
+
+
+def get_recording(db: DBSession, session_id: str) -> Recording | None:
+    """Return the recording row for a session, or None when ingest never started."""
+    return db.get(Recording, session_id)
+
+
+def ensure_recording(db: DBSession, session_id: str) -> Recording | None:
+    """Create the recording row on first ingest. Unknown sessions stay row-less.
+
+    Chunk bytes are still stored when the session row is missing (ADR-0004 §4);
+    the state machine cannot reference a session that does not exist.
+    """
+    existing = get_recording(db, session_id)
+    if existing is not None:
+        return existing
+    if get_session(db, session_id) is None:
+        return None
+    recording = Recording(session_id=session_id, missing_sequences=[])
+    db.add(recording)
+    db.flush()
+    return recording
+
+
+# ---------------------------------------------------------------------------
 # Audit log (ADR-0004 §3)
 # ---------------------------------------------------------------------------
 
@@ -776,8 +1195,8 @@ def revoke_session_tokens(
 
     Stateless HMAC tokens cannot be recovered from the database, so revocation
     is represented by appending ``token_revoked`` rows for each previously
-    issued token hash. The WebSocket ASGI guard in ``main.py`` rejects any
-    cookie whose digest appears in this set.
+    issued token hash. The WebSocket upgrade rejects any token whose digest
+    appears in this set, and a committed revocation closes live sockets.
     """
     revoked = revoked_token_hashes(db, session_id)
     entries: list[AuditLog] = []
@@ -798,6 +1217,251 @@ def revoke_session_tokens(
         revoked.add(token_hash)
     if commit:
         db.commit()
+        _notify_revocation(session_id, None, "session_ended")
     else:
         db.flush()
     return entries
+
+
+REVOKE_REASON_SESSION_ENDED = "session_ended"
+REVOKE_REASON_SECURITY = "security"
+
+
+def token_revocation_reason(
+    db: DBSession, session_id: str, token_hash: str
+) -> str | None:
+    """Why a token digest was revoked, or None when it is not revoked (ADR-0005 §1)."""
+    rows = db.scalars(
+        select(AuditLog)
+        .where(AuditLog.session_id == session_id)
+        .where(AuditLog.action == AUDIT_TOKEN_REVOKED)
+        .where(AuditLog.token_hash == token_hash)
+        .order_by(AuditLog.id)
+    ).all()
+    if not rows:
+        return None
+    # Any security revocation wins over a later session_ended one.
+    reasons = {(row.details or {}).get("reason") for row in rows}
+    if REVOKE_REASON_SECURITY in reasons:
+        return REVOKE_REASON_SECURITY
+    return REVOKE_REASON_SESSION_ENDED if REVOKE_REASON_SESSION_ENDED in reasons else str(next(iter(reasons)))
+
+
+def revoke_token_hash(
+    db: DBSession,
+    session_id: str,
+    token_hash: str,
+    *,
+    reason: str = REVOKE_REASON_SECURITY,
+    actor_role: str = "server",
+    commit: bool = True,
+) -> AuditLog:
+    """Revoke a single token digest, e.g. after a leak (ADR-0005 §1).
+
+    A security reason also latches ``upload_grants.security_revoked_at`` in
+    this same transaction, so a later upload code or token cannot bypass it.
+    """
+    if reason == REVOKE_REASON_SECURITY:
+        mark_upload_grant_security_revoked(db, session_id, commit=False)
+    entry = record_audit(
+        db,
+        action=AUDIT_TOKEN_REVOKED,
+        actor_role=actor_role,
+        session_id=session_id,
+        token_hash=token_hash,
+        details={"reason": reason},
+        commit=False,
+    )
+    if commit:
+        db.commit()
+        # Close reason is the wire code, not the audit detail ("security").
+        _notify_revocation(session_id, token_hash, "token_revoked")
+    return entry
+
+
+# ---------------------------------------------------------------------------
+# Review grants (ADR-0005 §6.5). Separate from upload grants and live tokens.
+# ---------------------------------------------------------------------------
+
+
+def _dt_aware(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def issue_review_codes(db: DBSession, session_id: str, *, commit: bool = True) -> dict[str, str]:
+    """Issue a fresh teacher code and observer code, replacing any previous hashes.
+
+    Raw codes are returned once. Regenerating does not revoke review grants
+    that were already minted from the old codes.
+    """
+    _require_session(db, session_id)
+    issued: dict[str, str] = {}
+    now = _utcnow()
+    for role in REVIEW_CODE_ROLES:
+        raw_code = secrets.token_urlsafe(24)
+        digest = hash_join_code(raw_code)
+        row = db.scalars(
+            select(ReviewCode)
+            .where(ReviewCode.session_id == session_id)
+            .where(ReviewCode.role == role)
+            .limit(1)
+        ).first()
+        if row is None:
+            db.add(
+                ReviewCode(
+                    session_id=session_id,
+                    role=role,
+                    code_hash=digest,
+                    created_at=now,
+                )
+            )
+        else:
+            row.code_hash = digest
+            row.created_at = now
+        issued[role] = raw_code
+    if commit:
+        db.commit()
+    else:
+        db.flush()
+    return issued
+
+
+def authenticate_review_code(db: DBSession, session_id: str, code: str) -> ReviewCode:
+    """Resolve a reusable review code to its role. Does not consume it."""
+    code_hash = hash_join_code(code)
+    row = db.scalars(
+        select(ReviewCode)
+        .where(ReviewCode.session_id == session_id)
+        .where(ReviewCode.code_hash == code_hash)
+        .limit(1)
+    ).first()
+    if row is None:
+        raise ReviewCodeInvalid("invalid review code")
+    return row
+
+
+def insert_review_grant(
+    db: DBSession,
+    *,
+    jti: str,
+    session_id: str,
+    role: str,
+    client_id: str,
+    refresh_hash: str,
+    issued_at: datetime,
+    expires_at: datetime,
+    rotated_from: str | None = None,
+) -> ReviewGrant:
+    """Insert one grant. The caller commits, including the audit row."""
+    grant = ReviewGrant(
+        jti=jti,
+        session_id=session_id,
+        role=role,
+        client_id=client_id,
+        refresh_hash=refresh_hash,
+        issued_at=issued_at,
+        expires_at=expires_at,
+        rotated_from=rotated_from,
+    )
+    db.add(grant)
+    db.flush()
+    return grant
+
+
+def review_grant_by_refresh_hash(db: DBSession, refresh_hash: str) -> ReviewGrant | None:
+    return db.scalars(
+        select(ReviewGrant).where(ReviewGrant.refresh_hash == refresh_hash).limit(1)
+    ).first()
+
+
+def review_grant_successor(db: DBSession, jti: str) -> ReviewGrant | None:
+    return db.scalars(
+        select(ReviewGrant).where(ReviewGrant.rotated_from == jti).limit(1)
+    ).first()
+
+
+def is_review_grant_revoked(db: DBSession, jti: str) -> bool:
+    """True when this jti is missing, revoked, or past its refresh expiry."""
+    grant = db.get(ReviewGrant, jti)
+    if grant is None or grant.revoked_at is not None:
+        return True
+    return _dt_aware(grant.expires_at) <= _utcnow()
+
+
+def review_access_block(
+    db: DBSession, jti: str | None, *, session_id: str, role: str
+) -> str | None:
+    """Why a review access token must be refused, or None when the grant is live.
+
+    Return values: ``revoked``, ``expired``, ``session``, ``role``.
+    """
+    if not jti:
+        return "revoked"
+    grant = db.get(ReviewGrant, jti)
+    if grant is None or grant.revoked_at is not None:
+        return "revoked"
+    if _dt_aware(grant.expires_at) <= _utcnow():
+        return "expired"
+    if grant.session_id != session_id:
+        return "session"
+    if grant.role != role:
+        return "role"
+    return None
+
+
+def revoke_review_chain(db: DBSession, jti: str) -> list[str]:
+    """Revoke ``jti`` and every grant in its rotation chain. Caller commits."""
+    start = db.get(ReviewGrant, jti)
+    if start is None:
+        return []
+    root = start
+    guard: set[str] = set()
+    while root.rotated_from and root.rotated_from not in guard:
+        guard.add(root.jti)
+        parent = db.get(ReviewGrant, root.rotated_from)
+        if parent is None or parent.session_id != start.session_id:
+            break
+        root = parent
+    rows = db.scalars(
+        select(ReviewGrant).where(ReviewGrant.session_id == root.session_id)
+    ).all()
+    children: dict[str, list[ReviewGrant]] = {}
+    for row in rows:
+        if row.rotated_from:
+            children.setdefault(row.rotated_from, []).append(row)
+    ordered: list[ReviewGrant] = []
+    stack = [root]
+    seen: set[str] = set()
+    while stack:
+        node = stack.pop()
+        if node.jti in seen:
+            continue
+        seen.add(node.jti)
+        ordered.append(node)
+        stack.extend(children.get(node.jti, []))
+    now = _utcnow()
+    for node in ordered:
+        if node.revoked_at is None:
+            node.revoked_at = now
+    db.flush()
+    return [node.jti for node in ordered]
+
+
+def revoke_all_review_grants(db: DBSession, session_id: str) -> list[str]:
+    """Revoke every live review grant for a session. Caller commits.
+
+    Does not touch upload grants or live join tokens.
+    """
+    rows = db.scalars(
+        select(ReviewGrant).where(ReviewGrant.session_id == session_id)
+    ).all()
+    now = _utcnow()
+    revoked: list[str] = []
+    for row in rows:
+        if row.revoked_at is None:
+            row.revoked_at = now
+            revoked.append(row.jti)
+    db.flush()
+    return revoked
