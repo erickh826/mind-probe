@@ -26,8 +26,10 @@ from datetime import timedelta
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
-from starlette.middleware.cors import CORSMiddleware as StarletteCORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.datastructures import MutableHeaders
+from starlette.middleware.cors import CORSMiddleware as StarletteCORSMiddleware
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
@@ -158,10 +160,11 @@ class EnvCORSMiddleware(StarletteCORSMiddleware):
         return origin in allowed
 
 
-# Registered after the upload-token middleware so this layer is outermost.
+# Registered after the upload-token middleware so CORS wraps that short-circuit.
 # A short-circuit 401 (upload token on any other route, or any earlier auth
 # rejection) must still carry Access-Control-Allow-Origin. Credentials stay
-# off: auth is Bearer (ADR-0005 §1).
+# off: auth is Bearer (ADR-0005 §1). NoStoreJsonMiddleware is added next and
+# stays the outermost user middleware.
 app.add_middleware(
     EnvCORSMiddleware,
     allow_origins=_configured_cors_origins(),
@@ -169,6 +172,42 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["Authorization", "Content-Type"],
 )
+
+
+class NoStoreJsonMiddleware:
+    """Put ``Cache-Control: no-store`` on every JSON response.
+
+    Chromium heuristically caches ``410 Gone`` when that response has no
+    cache policy, and then treats the stored body as permanently fresh.
+    Teacher polls ``GET /sessions/{id}/recording/status`` while a delete runs;
+    the first poll can be ``deleting`` and every later poll is served from
+    that cache, so the UI never observes ``deleted``. Stamping the header on
+    all JSON responses, including 401s and other recording/session polls,
+    keeps a new endpoint from dropping it again.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_no_store(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                media_type = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                if media_type == "application/json":
+                    headers["cache-control"] = "no-store"
+            await send(message)
+
+        await self.app(scope, receive, send_no_store)
+
+
+# Outermost user middleware so it sees HTTPException JSON (410/401) as well
+# as route JSON, after CORS has added its own headers.
+app.add_middleware(NoStoreJsonMiddleware)
 
 
 @app.get("/health")

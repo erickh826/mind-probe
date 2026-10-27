@@ -115,6 +115,9 @@ async function send(path: string, init: RequestInit = {}): Promise<Response> {
         ...init,
         headers: nextHeaders,
         credentials: "omit",
+        // Chromium stores a 410 with no cache policy and replays "deleting"
+        // forever. Bypass the HTTP cache on every review call.
+        cache: "no-store",
       });
     },
     refresh: (refreshToken) => {

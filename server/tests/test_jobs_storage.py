@@ -152,6 +152,28 @@ def test_failure_retry_bounds_and_delete_never_abandoned(env, monkeypatch, kind,
     assert row.max_attempts == limit
 
 
+def test_recording_status_410_and_auth_json_are_not_stored(env):
+    """Chromium caches a 410 with no Cache-Control and never sees `deleted`."""
+    factory, client, _ = env
+    take(factory)
+    session = client.get("/sessions/TAKE", headers=OP)
+    assert session.status_code == 200
+    assert session.headers["cache-control"] == "no-store"
+    live = client.get("/sessions/TAKE/recording/status", headers=OP)
+    assert live.status_code == 200
+    assert live.headers["cache-control"] == "no-store"
+    assert client.request(
+        "DELETE", "/sessions/TAKE/recording", headers=OP, json={"confirm": "TAKE"}
+    ).status_code == 202
+    gone = client.get("/sessions/TAKE/recording/status", headers=OP)
+    assert gone.status_code == 410
+    assert gone.json()["detail"]["recording_state"] == "deleting"
+    assert gone.headers["cache-control"] == "no-store"
+    missing = client.get("/sessions/TAKE/recording/status")
+    assert missing.status_code == 401
+    assert missing.headers["cache-control"] == "no-store"
+
+
 def test_delete_short_transaction_idempotency_and_tombstones(env):
     factory, client, store = env
     take(factory)
