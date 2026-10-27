@@ -644,8 +644,13 @@ def test_real_ffmpeg_sqlite_lock_during_cancel_poll_leaves_no_part(env, caplog):
             try:
                 # IMMEDIATE still lets readers through. EXCLUSIVE matches the
                 # lock SQLite takes while another connection is committing.
+                # sqlite3's timeout is a lower bound. On Windows, timeout=0.2
+                # (the cancel poll) does not return for ~0.55s, and timeout=1
+                # takes ~1.7s. A 0.7s hold ended before that wait, so the poll
+                # succeeded and never logged "database is locked". Hold the
+                # lock well past either wait so Linux and Windows both hit it.
                 conn.execute("BEGIN EXCLUSIVE")
-                time.sleep(0.7)
+                time.sleep(3)
                 conn.rollback()
             finally:
                 conn.close()
@@ -660,7 +665,7 @@ def test_real_ffmpeg_sqlite_lock_during_cancel_poll_leaves_no_part(env, caplog):
     try:
         assert worker.run_once()
     finally:
-        locker.join(timeout=10)
+        locker.join(timeout=20)
     assert not errors, errors
     assert "database is locked" in caplog.text
     assert job_row(factory, jid).status == "succeeded"
