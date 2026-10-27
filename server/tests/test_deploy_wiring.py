@@ -190,11 +190,14 @@ def test_disk_levels_and_session_refusal(api, monkeypatch):
 
 
 def test_prod_compose_proxies_without_publishing_the_api():
-    dev = (ROOT / "docker-compose.yml").read_text()
-    prod = (ROOT / "docker-compose.prod.yml").read_text()
-    caddy = (ROOT / "Caddyfile").read_text()
+    dev = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    prod = (ROOT / "docker-compose.prod.yml").read_text(encoding="utf-8")
+    caddy = (ROOT / "Caddyfile").read_text(encoding="utf-8")
     assert "MINDPROBE_ENV: \"development\"" in dev
     assert '"8000:8000"' in dev
+    grace = 'MINDPROBE_UPLOAD_GRACE_SYNTHESIZE_AFTER: "${MINDPROBE_UPLOAD_GRACE_SYNTHESIZE_AFTER:-}"'
+    assert grace in dev
+    assert grace in prod
     assert "8000:8000" not in prod
     assert "--proxy-headers" in prod
     assert '"${FORWARDED_ALLOW_IPS:-*}"' in prod
@@ -216,8 +219,8 @@ def test_vercel_csp_and_monorepo_layout():
     }
     for name, permissions in apps.items():
         directory = ROOT / "apps" / name
-        spec = json.loads((directory / "vercel.json").read_text())
-        package = json.loads((directory / "package.json").read_text())
+        spec = json.loads((directory / "vercel.json").read_text(encoding="utf-8"))
+        package = json.loads((directory / "package.json").read_text(encoding="utf-8"))
         assert package["dependencies"]["@mind-probe/shared"] == "file:../../packages/shared"
         assert spec["rewrites"] == [{"source": "/(.*)", "destination": "/index.html"}]
         headers = {item["key"]: item["value"] for item in spec["headers"][0]["headers"]}

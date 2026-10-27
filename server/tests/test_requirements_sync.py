@@ -24,12 +24,12 @@ def _requirement_names(text: str) -> set[str]:
 
 
 def test_requirements_txt_includes_every_runtime_dependency():
-    project = tomllib.loads((SERVER / "pyproject.toml").read_text())
+    project = tomllib.loads((SERVER / "pyproject.toml").read_text(encoding="utf-8"))
     runtime = {_dist_name(dep) for dep in project["project"]["dependencies"]}
-    installed = _requirement_names((SERVER / "requirements.txt").read_text())
+    installed = _requirement_names((SERVER / "requirements.txt").read_text(encoding="utf-8"))
     assert runtime <= installed
     assert "boto3" in installed
 
-    dockerfile = (SERVER / "Dockerfile").read_text()
+    dockerfile = (SERVER / "Dockerfile").read_text(encoding="utf-8")
     assert "requirements.txt" in dockerfile
     assert "import boto3" in dockerfile

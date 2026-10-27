@@ -21,6 +21,9 @@ services:
       MINDPROBE_DB_URL: "sqlite:////data/sessions/mind-probe.sqlite"
       MINDPROBE_CASES_DIR: "/data/cases"
       MINDPROBE_SESSIONS_DIR: "/data/sessions"
+      # Same cutover switch as production. Blank (the default) does not invent
+      # recording rows for sessions that ended before this build.
+      MINDPROBE_UPLOAD_GRACE_SYNTHESIZE_AFTER: "${MINDPROBE_UPLOAD_GRACE_SYNTHESIZE_AFTER:-}"
     volumes:
       # Server owns all local storage (cases library + session recordings).
       - ./cases:/data/cases
