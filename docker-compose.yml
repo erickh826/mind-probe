@@ -1,8 +1,11 @@
-# mind-probe — Docker Compose
+# mind-probe — Docker Compose (development)
 #
-# Only the Session Server is containerized here. The three frontend apps
-# (apps/student, apps/wizard, apps/teacher) are Vite dev servers during
-# development; see the notes at the bottom for running them.
+# Only the Session Server is containerized here. The API is published on
+# port 8000 with MINDPROBE_ENV=development and no TLS proxy. For the
+# Lightsail-shaped stack (Caddy, proxy headers, production env) use
+# docker-compose.prod.yml. The three frontend apps (apps/student,
+# apps/wizard, apps/teacher) are Vite dev servers during development; see
+# the notes at the bottom for running them.
 
 services:
   server:

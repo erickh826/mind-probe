@@ -364,6 +364,7 @@ def test_playback_polling_does_not_reset_exhausted_retry_budget(env):
 
 
 def test_signed_local_playback_range_expiry_and_tombstone(env, monkeypatch):
+    monkeypatch.delenv("MINDPROBE_PRESIGN_TTL_SECONDS", raising=False)
     factory, client, store = env
     take(factory, state="uploaded")
     key = storage.recording_key("TAKE")
@@ -739,7 +740,8 @@ def test_additive_migration_preserves_legacy_row(env):
         assert rec.final_sequence == 0 and rec.recording_key is None
 
 
-def test_s3_adapter_checks_metadata_and_presigns_without_network(tmp_path):
+def test_s3_adapter_checks_metadata_and_presigns_without_network(tmp_path, monkeypatch):
+    monkeypatch.delenv("MINDPROBE_PRESIGN_TTL_SECONDS", raising=False)
     from botocore.exceptions import ClientError
     class Fake:
         def __init__(self): self.objects = {}

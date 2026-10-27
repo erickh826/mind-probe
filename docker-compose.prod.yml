@@ -1,0 +1,102 @@
+# Production-shaped stack for one Lightsail host (design §12).
+#
+# Caddy terminates TLS and is the only published listener. The API container
+# is on the compose network (expose, not ports) and uvicorn trusts forwarded
+# headers from that network. Do not publish 8000 here.
+#
+# Secrets stay in a host .env (mode 600), never in this file. See .env.example.
+# A local smoke test needs no .env and no R2: storage stays on the local
+# adapter and Caddy serves https://localhost with its internal certificate.
+#
+#   docker compose -f docker-compose.prod.yml up --build
+#   curl -k https://localhost/health
+
+name: mindprobe-prod
+
+services:
+  server:
+    build:
+      context: ./server
+    image: mind-probe-server
+    restart: unless-stopped
+    expose:
+      - "8000"
+    environment:
+      MINDPROBE_ENV: production
+      MINDPROBE_AUTH_COOKIE: "false"
+      MINDPROBE_DB_URL: sqlite:////data/mindprobe.db
+      MINDPROBE_CASES_DIR: /data/cases
+      MINDPROBE_SESSIONS_DIR: /data/sessions
+      MINDPROBE_LOCAL_STORAGE_DIR: /data/objects
+      MINDPROBE_JOB_WORKER: "true"
+      MINDPROBE_STORAGE_BACKEND: ${MINDPROBE_STORAGE_BACKEND:-local}
+      MINDPROBE_S3_ENDPOINT: ${MINDPROBE_S3_ENDPOINT:-}
+      MINDPROBE_S3_REGION: ${MINDPROBE_S3_REGION:-auto}
+      MINDPROBE_S3_ACCESS_KEY_ID: ${MINDPROBE_S3_ACCESS_KEY_ID:-}
+      MINDPROBE_S3_SECRET_ACCESS_KEY: ${MINDPROBE_S3_SECRET_ACCESS_KEY:-}
+      MINDPROBE_MEDIA_BUCKET: ${MINDPROBE_MEDIA_BUCKET:-}
+      MINDPROBE_RECORDINGS_BUCKET: ${MINDPROBE_RECORDINGS_BUCKET:-}
+      MINDPROBE_MEDIA_BASE_URL: ${MINDPROBE_MEDIA_BASE_URL:-}
+      MINDPROBE_PRESIGN_TTL_SECONDS: ${MINDPROBE_PRESIGN_TTL_SECONDS:-900}
+      MINDPROBE_DISK_WARN_PCT: ${MINDPROBE_DISK_WARN_PCT:-70}
+      MINDPROBE_DISK_MIN_FREE_GB: ${MINDPROBE_DISK_MIN_FREE_GB:-5}
+      MINDPROBE_FFMPEG_THREADS: ${MINDPROBE_FFMPEG_THREADS:-2}
+      MINDPROBE_FFMPEG_PRESET: ${MINDPROBE_FFMPEG_PRESET:-veryfast}
+      MINDPROBE_FFMPEG_BIN: ffmpeg
+      MINDPROBE_WS_TOKEN_SECRET: ${MINDPROBE_WS_TOKEN_SECRET:-}
+      MINDPROBE_OPERATOR_TOKEN: ${MINDPROBE_OPERATOR_TOKEN:-}
+      MINDPROBE_CORS_ORIGINS: ${MINDPROBE_CORS_ORIGINS:-}
+      MINDPROBE_UPLOAD_GRACE_SECONDS: ${MINDPROBE_UPLOAD_GRACE_SECONDS:-600}
+      MINDPROBE_REVIEW_ACCESS_TTL: ${MINDPROBE_REVIEW_ACCESS_TTL:-1800}
+      MINDPROBE_REVIEW_REFRESH_TTL: ${MINDPROBE_REVIEW_REFRESH_TTL:-604800}
+    volumes:
+      # Case JSON only. Media for the public bucket is not in this tree.
+      - ./cases:/data/cases:ro
+      - mindprobe-data:/data
+    # 8000 is not published, so the only client is Caddy on this network.
+    # `*` stands in for design §12's --forwarded-allow-ips=<caddy>, whose
+    # container address changes. Override FORWARDED_ALLOW_IPS with a CIDR
+    # when the API port is ever reachable from somewhere else.
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --workers
+      - "1"
+      - --proxy-headers
+      - --forwarded-allow-ips
+      - "${FORWARDED_ALLOW_IPS:-*}"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      server:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      MINDPROBE_API_HOST: ${MINDPROBE_API_HOST:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  mindprobe-data:
+  caddy-data:
+  caddy-config:

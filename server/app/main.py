@@ -35,7 +35,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DBSession
 
-from . import __version__, auth, cases, models, recording, websocket, jobs, storage
+from . import __version__, auth, capacity, cases, models, recording, websocket, jobs, storage
 from .events import EventType
 from .models import get_db, init_db
 from .recording import router as recording_router
@@ -212,8 +212,18 @@ app.add_middleware(NoStoreJsonMiddleware)
 
 @app.get("/health")
 def health() -> dict:
-    """Liveness/readiness check."""
-    return {"status": "ok", "service": "mind-probe-server", "version": __version__}
+    """Liveness check. ``disk.level`` is ok, warn, critical, or unknown.
+
+    The process stays ``status: ok`` when the disk is only low, so a probe
+    does not restart the container. Callers that should stop new work read
+    ``disk.level``.
+    """
+    return {
+        "status": "ok",
+        "service": "mind-probe-server",
+        "version": __version__,
+        "disk": capacity.disk_status(),
+    }
 
 
 @app.get("/cases")
@@ -347,6 +357,16 @@ def create_session(
         raise HTTPException(
             status_code=409, detail=f"session already exists: {body.session_id}"
         )
+    disk = capacity.disk_status()
+    if disk["level"] == "critical":
+        logger.warning(
+            "refusing session %s; free disk %s GiB is below %s=%s",
+            body.session_id,
+            disk.get("free_gb"),
+            capacity.DISK_MIN_FREE_GB_ENV,
+            disk.get("min_free_gb"),
+        )
+        raise HTTPException(status_code=status.HTTP_507_INSUFFICIENT_STORAGE, detail="disk_full")
     session = models.create_session(db, body.session_id, body.case_id)
     join_codes = models.issue_join_codes(db, body.session_id)
     review_codes = models.issue_review_codes(db, body.session_id)
@@ -1066,7 +1086,7 @@ def get_session_recording(
         url = store.presign_get(rec.recording_key)
         auth.record_access_audit(db, action=auth.AUDIT_RECORDING_VIEWED, actor=actor,
                                  session_id=session_id, details={"artefact": "mp4"})
-        return JSONResponse({"session_id": session_id, "url": url, "expires_in": storage.PRESIGN_TTL,
+        return JSONResponse({"session_id": session_id, "url": url, "expires_in": storage.presign_ttl_seconds(),
                              "recording_state": rec.recording_state})
     kind = "upload" if rec.recording_state == "transcoded" else "transcode"
     latest = db.scalar(select(models.Job).where(
