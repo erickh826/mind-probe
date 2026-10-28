@@ -555,6 +555,28 @@ def test_end_session_drops_events_on_the_live_socket():
         assert _stored_events(session_id) == []
 
 
+def test_wizard_bearer_end_closes_student_with_session_ended():
+    """Wizard ``POST /end`` is the operator end: the student socket closes
+    ``session_ended`` and the server does not emit a recorder-stop of its own.
+    """
+    session_id = _fresh_session_id()
+    wizard_token = create_session_token(session_id, "wizard")
+    student_token = create_session_token(session_id, "student")
+    with (
+        _connect_subprotocol(session_id, "wizard", wizard_token) as wizard,
+        _connect_subprotocol(session_id, "student", student_token) as student,
+    ):
+        response = client.post(
+            f"/sessions/{session_id}/end",
+            headers={"Authorization": f"Bearer {wizard_token}"},
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "ended"
+        _expect_closed(wizard, reason="session_ended")
+        _expect_closed(student, reason="session_ended")
+        assert _stored_events(session_id) == []
+
+
 def test_events_after_accepted_session_ended_are_not_persisted():
     session_id = _fresh_session_id()
     with _connect(session_id, "wizard") as wizard:

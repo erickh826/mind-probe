@@ -926,8 +926,21 @@ export function useSessionSocket(
           // would hammer the server with the same rejected upgrade.
           shouldReconnectRef.current = false;
           setStatus("closed");
-          setClosedReason(event.reason || String(event.code));
-          appendLog("error", `連線被拒絕 (${event.code}): ${event.reason || "unknown"}`);
+          const reason = event.reason || String(event.code);
+          setClosedReason(reason);
+          // POST /end closes every live socket with this reason and does not
+          // broadcast a session_ended envelope first. Reflect that here so the
+          // console leaves the live state without a second end path.
+          if (reason === "session_ended") {
+            setSession((view) =>
+              view.session_state === "ended"
+                ? view
+                : { ...view, session_state: "ended" },
+            );
+            appendLog("info", "場次已結束 (session_ended)");
+          } else {
+            appendLog("error", `連線被拒絕 (${event.code}): ${reason}`);
+          }
           return;
         }
         if (!shouldReconnectRef.current) {

@@ -13,6 +13,10 @@ interface Props {
   session: SessionView;
   clock: ClockState;
   pendingCount: number;
+  /** False once the session has ended or an end request is in flight. */
+  canEndSession: boolean;
+  endSessionTitle: string;
+  onEndSession: () => void;
 }
 
 const CONNECTION_LABEL: Record<ConnectionStatus, string> = {
@@ -58,6 +62,9 @@ export default function SessionStatusHeader({
   session,
   clock,
   pendingCount,
+  canEndSession,
+  endSessionTitle,
+  onEndSession,
 }: Props) {
   return (
     <header
@@ -116,6 +123,27 @@ export default function SessionStatusHeader({
             : session.revealed_facts.join("、")}
         </div>
       </div>
+
+      <button
+        type="button"
+        onClick={onEndSession}
+        disabled={!canEndSession}
+        title={endSessionTitle}
+        aria-haspopup="dialog"
+        style={{
+          padding: "8px 14px",
+          fontFamily: "inherit",
+          fontWeight: 700,
+          color: "#fff",
+          background: canEndSession ? "#8f2d2d" : "#3a3032",
+          border: "1px solid #a04444",
+          borderRadius: 6,
+          cursor: canEndSession ? "pointer" : "not-allowed",
+          opacity: canEndSession ? 1 : 0.55,
+        }}
+      >
+        結束場次
+      </button>
     </header>
   );
 }

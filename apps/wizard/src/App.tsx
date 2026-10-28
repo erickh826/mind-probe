@@ -1,11 +1,19 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { UncoveredQuestionPayload } from "@mind-probe/shared";
 import {
   clearJoinedSession,
   readJoinedSession,
   rememberJoinedSession,
 } from "@mind-probe/shared";
-import { ApiError, fetchDecisionTree, fetchSession, findThinkingClipId, resolveClipId } from "./api";
+import {
+  ApiError,
+  endSession,
+  endSessionErrorMessage,
+  fetchDecisionTree,
+  fetchSession,
+  findThinkingClipId,
+  resolveClipId,
+} from "./api";
 import { useSessionSocket } from "./useSessionSocket";
 import {
   CATEGORY_KEYS,
@@ -26,6 +34,7 @@ import SessionStatusHeader from "./components/SessionStatusHeader";
 import DecisionTreePanel from "./components/DecisionTreePanel";
 import FallbackPanel from "./components/FallbackPanel";
 import PauseResumeModal from "./components/PauseResumeModal";
+import EndSessionDialog from "./components/EndSessionDialog";
 import UncoveredQuestionModal from "./components/UncoveredQuestionModal";
 import HotkeyCheatsheet from "./components/HotkeyCheatsheet";
 
@@ -72,6 +81,11 @@ export default function App() {
   const [selection, setSelection] = useState<StagedSelection>(EMPTY_SELECTION);
   const [pauseOpen, setPauseOpen] = useState(false);
   const [uncoveredOpen, setUncoveredOpen] = useState(false);
+  const [endOpen, setEndOpen] = useState(false);
+  const [ending, setEnding] = useState(false);
+  const [endError, setEndError] = useState<string | null>(null);
+  const [endedLocally, setEndedLocally] = useState(false);
+  const endingRef = useRef(false);
   // Local reference point for `uncovered_question.timestamp_ms`. The snapshot
   // only carries `start_at_server_ms` while the session is `starting`, so once
   // it is running there is no server-supplied origin to subtract from.
@@ -84,6 +98,9 @@ export default function App() {
       accessToken: session.accessToken,
     });
     setRestoreError(null);
+    setEndedLocally(false);
+    setEndError(null);
+    setEndOpen(false);
     setJoined(session);
   }, []);
 
@@ -162,10 +179,25 @@ export default function App() {
   }, [session.session_state]);
 
   const connected = status === "open" || status === "degraded";
-  const paused = session.session_state === "paused";
-  const ended = session.session_state === "ended";
+  const sessionEnded =
+    endedLocally ||
+    session.session_state === "ended" ||
+    socket.closedReason === "session_ended";
+  const paused = session.session_state === "paused" && !sessionEnded;
   /** Playback commands are only meaningful on a live, unpaused session. */
-  const canCommand = connected && !paused && !ended;
+  const canCommand = connected && !paused && !sessionEnded;
+  const sessionForHeader = sessionEnded
+    ? { ...session, session_state: "ended" as const }
+    : session;
+
+  useEffect(() => {
+    if (!sessionEnded) {
+      return;
+    }
+    setPauseOpen(false);
+    setUncoveredOpen(false);
+    setEndOpen(false);
+  }, [sessionEnded]);
 
   const resolvedClipId = useMemo(
     () => resolveClipId(tree, selection.category, selection.option, selection.tone),
@@ -204,6 +236,49 @@ export default function App() {
     [socket],
   );
 
+  const closeEndDialog = useCallback(() => {
+    if (endingRef.current) {
+      return;
+    }
+    setEndOpen(false);
+    setEndError(null);
+  }, []);
+
+  const openEndDialog = useCallback(() => {
+    if (endingRef.current || sessionEnded) {
+      return;
+    }
+    setEndError(null);
+    setEndOpen(true);
+  }, [sessionEnded]);
+
+  const confirmEndSession = useCallback(() => {
+    if (endingRef.current || joined === null || sessionEnded) {
+      return;
+    }
+    endingRef.current = true;
+    setEnding(true);
+    setEndError(null);
+    void endSession(joined.sessionId)
+      .then((info) => {
+        if (info.status !== "ended") {
+          setEndError("無法結束場次：伺服器未將場次標為已結束");
+          return;
+        }
+        setEndedLocally(true);
+        setEndOpen(false);
+        setPauseOpen(false);
+        setUncoveredOpen(false);
+      })
+      .catch((cause: unknown) => {
+        setEndError(endSessionErrorMessage(cause));
+      })
+      .finally(() => {
+        endingRef.current = false;
+        setEnding(false);
+      });
+  }, [joined, sessionEnded]);
+
   // 全域快捷鍵（spec §8）。輸入框聚焦時一律不攔截。
   useEffect(() => {
     if (joined === null) {
@@ -220,11 +295,13 @@ export default function App() {
 
       // While a modal is up only Escape is global; everything else belongs to
       // the dialog so the Wizard cannot fire a clip from behind it.
-      if (pauseOpen || uncoveredOpen) {
-        if (event.key === "Escape") {
+      if (pauseOpen || uncoveredOpen || endOpen) {
+        if (event.key === "Escape" && !endingRef.current) {
           event.preventDefault();
           setPauseOpen(false);
           setUncoveredOpen(false);
+          setEndOpen(false);
+          setEndError(null);
         }
         return;
       }
@@ -314,6 +391,7 @@ export default function App() {
   }, [
     canCommand,
     confirmStaged,
+    endOpen,
     joined,
     pauseOpen,
     playThinking,
@@ -358,9 +436,14 @@ export default function App() {
         caseId={joined.caseId}
         status={status}
         closedReason={socket.closedReason}
-        session={session}
+        session={sessionForHeader}
         clock={socket.clock}
         pendingCount={socket.pendingCount}
+        canEndSession={!sessionEnded && !ending}
+        endSessionTitle={
+          sessionEnded ? "場次已結束" : ending ? "結束中…" : "結束目前場次"
+        }
+        onEndSession={openEndDialog}
       />
 
       {paused && (
@@ -490,6 +573,13 @@ export default function App() {
         open={pauseOpen}
         onClose={() => setPauseOpen(false)}
         onPause={submitPause}
+      />
+      <EndSessionDialog
+        open={endOpen}
+        pending={ending}
+        error={endError}
+        onClose={closeEndDialog}
+        onConfirm={confirmEndSession}
       />
       <UncoveredQuestionModal
         open={uncoveredOpen}

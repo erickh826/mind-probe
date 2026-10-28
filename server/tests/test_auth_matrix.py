@@ -107,6 +107,37 @@ def test_roles_are_enforced_per_endpoint(client):
     assert client.get("/sessions/S-M/timeline", headers=OP).status_code == 403
 
 
+@pytest.mark.parametrize("role", ["wizard", "teacher"])
+def test_wizard_and_teacher_bearer_end_session(client, role):
+    """POST /end is the operator path. Wizard and teacher live tokens may use it.
+
+    Ending revokes that live token. A later operator call is the same idempotent
+    end, not a second lifecycle.
+    """
+    session_id = f"S-END-{role}"
+    tokens = make_session(client, session_id)
+    ended = client.post(
+        f"/sessions/{session_id}/end", headers=bearer(tokens[role])
+    )
+    assert ended.status_code == 200
+    body = ended.json()
+    assert body["status"] == "ended"
+    assert body["ended_at"]
+    assert (
+        client.post(
+            f"/sessions/{session_id}/end", headers=bearer(tokens[role])
+        ).status_code
+        == 401
+    )
+    assert (
+        client.get(f"/sessions/{session_id}", headers=bearer(tokens[role])).status_code
+        == 401
+    )
+    again = client.post(f"/sessions/{session_id}/end", headers=OP)
+    assert again.status_code == 200
+    assert again.json()["status"] == "ended"
+
+
 def test_token_bound_to_another_session_is_rejected(client):
     t = make_session(client, "S-A")
     make_session(client, "S-B")
