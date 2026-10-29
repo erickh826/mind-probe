@@ -61,9 +61,11 @@ export function CodesPanel({ sessionId, codes, onForget }: CodesPanelProps) {
       )}
       {upload && (
         <div className="code-group">
-          <h4>補傳碼（一次性，10 分鐘內有效）</h4>
+          <h4>補傳碼（一次性）</h4>
           <CopyField label="學生補傳碼" value={upload.code} />
-          <p className="hint">到期時間：{formatServerTime(upload.expiresAt)}</p>
+          <p className="hint">
+            碼的到期時間：{formatServerTime(upload.expiresAt)}。場次已結束時，補傳仍須在寬限期內完成，以右側的寬限剩餘為準。
+          </p>
         </div>
       )}
       <button type="button" className="secondary" onClick={onForget}>
