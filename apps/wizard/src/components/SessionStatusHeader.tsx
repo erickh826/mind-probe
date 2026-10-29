@@ -17,6 +17,12 @@ interface Props {
   canEndSession: boolean;
   endSessionTitle: string;
   onEndSession: () => void;
+  /** False unless the session is still `created` and the socket can send. */
+  canStartSession: boolean;
+  startSessionLabel: string;
+  startSessionTitle: string;
+  startPending: boolean;
+  onStartSession: () => void;
 }
 
 const CONNECTION_LABEL: Record<ConnectionStatus, string> = {
@@ -65,6 +71,11 @@ export default function SessionStatusHeader({
   canEndSession,
   endSessionTitle,
   onEndSession,
+  canStartSession,
+  startSessionLabel,
+  startSessionTitle,
+  startPending,
+  onStartSession,
 }: Props) {
   return (
     <header
@@ -124,26 +135,48 @@ export default function SessionStatusHeader({
         </div>
       </div>
 
-      <button
-        type="button"
-        onClick={onEndSession}
-        disabled={!canEndSession}
-        title={endSessionTitle}
-        aria-haspopup="dialog"
-        style={{
-          padding: "8px 14px",
-          fontFamily: "inherit",
-          fontWeight: 700,
-          color: "#fff",
-          background: canEndSession ? "#8f2d2d" : "#3a3032",
-          border: "1px solid #a04444",
-          borderRadius: 6,
-          cursor: canEndSession ? "pointer" : "not-allowed",
-          opacity: canEndSession ? 1 : 0.55,
-        }}
-      >
-        結束場次
-      </button>
+      <div style={{ display: "flex", gap: 8 }}>
+        <button
+          type="button"
+          onClick={onStartSession}
+          disabled={!canStartSession}
+          title={startSessionTitle}
+          aria-busy={startPending}
+          style={{
+            padding: "8px 14px",
+            fontFamily: "inherit",
+            fontWeight: 700,
+            color: "#fff",
+            background: canStartSession ? "#1f6b45" : "#2a3330",
+            border: "1px solid #2f8a5b",
+            borderRadius: 6,
+            cursor: canStartSession ? "pointer" : "not-allowed",
+            opacity: canStartSession ? 1 : 0.55,
+          }}
+        >
+          {startSessionLabel}
+        </button>
+        <button
+          type="button"
+          onClick={onEndSession}
+          disabled={!canEndSession}
+          title={endSessionTitle}
+          aria-haspopup="dialog"
+          style={{
+            padding: "8px 14px",
+            fontFamily: "inherit",
+            fontWeight: 700,
+            color: "#fff",
+            background: canEndSession ? "#8f2d2d" : "#3a3032",
+            border: "1px solid #a04444",
+            borderRadius: 6,
+            cursor: canEndSession ? "pointer" : "not-allowed",
+            opacity: canEndSession ? 1 : 0.55,
+          }}
+        >
+          結束場次
+        </button>
+      </div>
     </header>
   );
 }
