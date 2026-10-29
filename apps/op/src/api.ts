@@ -73,8 +73,13 @@ export function createOpClient({ baseUrl, token, fetchImpl }: OpClientOptions) {
     `/sessions/${encodeURIComponent(sessionId)}${suffix}`;
 
   return {
-    listSessions: (limit = 50) =>
-      request<SessionListResponse>(`/sessions?limit=${encodeURIComponent(String(limit))}`),
+    listSessions: ({ limit = 50, before }: { limit?: number; before?: string | null } = {}) => {
+      const query = new URLSearchParams({ limit: String(limit) });
+      if (before) {
+        query.set("before", before);
+      }
+      return request<SessionListResponse>(`/sessions?${query}`);
+    },
     listCases: () => request<{ cases: string[] }>("/cases"),
     createSession: (sessionId: string, caseId: string) =>
       request<CreatedSession>("/sessions", {

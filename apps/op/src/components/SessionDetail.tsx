@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 
 import { OpApiError, type OpClient } from "../api";
 import {
@@ -16,6 +16,8 @@ import type { OperatorSessionRow, RecordingStatus, ReviewCodesResponse, UploadRe
 
 interface SessionDetailProps {
   client: OpClient;
+  /** Take before a request; false afterwards means the operator signed out meanwhile. */
+  authTicket: () => () => boolean;
   row: OperatorSessionRow;
   nowMs: number;
   progress: { previous?: ProgressRead; current: ProgressRead } | undefined;
@@ -34,7 +36,15 @@ function describeError(error: unknown): string {
 
 const MISSING_PREVIEW = 20;
 
-export function SessionDetail({ client, row, nowMs, progress, onUploadCode, onReviewCodes }: SessionDetailProps) {
+export function SessionDetail({
+  client,
+  authTicket,
+  row,
+  nowMs,
+  progress,
+  onUploadCode,
+  onReviewCodes,
+}: SessionDetailProps) {
   const sessionId = row.session_id;
   const [status, setStatus] = useState<RecordingStatus | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
@@ -42,48 +52,67 @@ export function SessionDetail({ client, row, nowMs, progress, onUploadCode, onRe
   const [actionBusy, setActionBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
 
-  const loadStatus = useCallback(async () => {
+  // The list refresh is the operator's "read again"; follow it here too. A newer
+  // read cancels an older one still in flight, so the older cannot land last.
+  const readAtMs = progress?.current.readAtMs;
+  useEffect(() => {
+    let cancelled = false;
     setStatusError(null);
-    try {
-      setStatus(await client.recordingStatus(sessionId));
-    } catch (error) {
-      setStatus(null);
-      setStatusError(describeError(error));
-    }
-  }, [client, sessionId]);
+    client.recordingStatus(sessionId).then(
+      (next) => {
+        if (!cancelled) {
+          setStatus(next);
+        }
+      },
+      (error: unknown) => {
+        if (!cancelled) {
+          setStatus(null);
+          setStatusError(describeError(error));
+        }
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [client, sessionId, readAtMs]);
 
-  useEffect(() => {
-    setStatus(null);
-    setConfirming(null);
-    setActionError(null);
-  }, [sessionId]);
-
-  // The list refresh is the operator's "read again"; follow it here too.
-  useEffect(() => {
-    void loadStatus();
-  }, [loadStatus, progress?.current.readAtMs]);
-
+  // The parent keys this component by session, so a code that arrives after the
+  // operator switched away is still filed under the session it was issued for.
   async function issueUploadCode() {
+    const live = authTicket();
     setActionBusy(true);
     setActionError(null);
     try {
-      onUploadCode(sessionId, await client.reissueUploadCode(sessionId));
+      const issued = await client.reissueUploadCode(sessionId);
+      if (!live()) {
+        return;
+      }
+      onUploadCode(sessionId, issued);
       setConfirming(null);
     } catch (error) {
-      setActionError(describeError(error));
+      if (live()) {
+        setActionError(describeError(error));
+      }
     } finally {
       setActionBusy(false);
     }
   }
 
   async function regenerateReviewCodes() {
+    const live = authTicket();
     setActionBusy(true);
     setActionError(null);
     try {
-      onReviewCodes(sessionId, await client.regenerateReviewCodes(sessionId));
+      const codes = await client.regenerateReviewCodes(sessionId);
+      if (!live()) {
+        return;
+      }
+      onReviewCodes(sessionId, codes);
       setConfirming(null);
     } catch (error) {
-      setActionError(describeError(error));
+      if (live()) {
+        setActionError(describeError(error));
+      }
     } finally {
       setActionBusy(false);
     }

@@ -41,6 +41,14 @@ test("the operator token travels only in the Authorization header", async () => 
   assert.equal(call.init.referrerPolicy, "no-referrer");
 });
 
+test("older pages pass the cursor as an encoded before parameter", async () => {
+  const { client, calls } = recordingClient(() => jsonResponse(200, { sessions: [], next_cursor: null }));
+  await client.listSessions({ limit: 20, before: "WyIyMDI2Ii+=" });
+  assert.equal(calls[0].url, "https://api.example/sessions?limit=20&before=WyIyMDI2Ii%2B%3D");
+  await client.listSessions({ before: null });
+  assert.equal(calls[1].url, "https://api.example/sessions?limit=50");
+});
+
 test("create posts JSON and session paths are encoded", async () => {
   const { client, calls } = recordingClient(() => jsonResponse(201, {}));
   await client.createSession("TRIAL-1", "CASE001");

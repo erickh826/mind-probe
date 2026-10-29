@@ -118,6 +118,67 @@ export function describeProgress(previous: ProgressRead | undefined, current: Pr
   return `${elapsed} 秒內沒有新片段。`;
 }
 
+export interface ProgressReads {
+  [sessionId: string]: { previous?: ProgressRead; current: ProgressRead };
+}
+
+interface ReadableRow {
+  session_id: string;
+  stored_sequences: number;
+}
+
+/** A full re-read: every listed row's last read becomes its previous one. */
+export function nextReads(previous: ProgressReads, rows: ReadableRow[], readAtMs: number): ProgressReads {
+  const reads: ProgressReads = {};
+  for (const row of rows) {
+    reads[row.session_id] = {
+      previous: previous[row.session_id]?.current,
+      current: { storedSequences: row.stored_sequences, readAtMs },
+    };
+  }
+  return reads;
+}
+
+/** An older page: only rows not read before get a first read; the rest keep theirs. */
+export function addFirstReads(reads: ProgressReads, rows: ReadableRow[], readAtMs: number): ProgressReads {
+  const merged = { ...reads };
+  for (const row of rows) {
+    if (!(row.session_id in merged)) {
+      merged[row.session_id] = { current: { storedSequences: row.stored_sequences, readAtMs } };
+    }
+  }
+  return merged;
+}
+
+/** Append an older page, keeping the rows already shown and dropping repeats. */
+export function appendPage<T extends { session_id: string }>(rows: T[], page: T[]): T[] {
+  const seen = new Set(rows.map((row) => row.session_id));
+  return [...rows, ...page.filter((row) => !seen.has(row.session_id))];
+}
+
+/**
+ * Invalidates async work that started before the latest `advance()`.
+ * Take a ticket before an await; drop the response if the ticket is no longer valid.
+ */
+export function createGeneration() {
+  let current = 0;
+  return {
+    /** Move on, invalidating every earlier ticket; returns a ticket for the new generation. */
+    advance(): () => boolean {
+      current += 1;
+      const issued = current;
+      return () => issued === current;
+    },
+    /** A check that stays true until the next `advance()`. */
+    ticket(): () => boolean {
+      const issued = current;
+      return () => issued === current;
+    },
+  };
+}
+
+export type Generation = ReturnType<typeof createGeneration>;
+
 export interface AttentionInput {
   status: string;
   recording_state: string | null;

@@ -7,10 +7,20 @@ import { SessionDetail } from "./components/SessionDetail";
 import { SessionTable } from "./components/SessionTable";
 import { TokenGate } from "./components/TokenGate";
 import { API_BASE_URL } from "./config";
-import { errorMessage, formatServerTime, type ProgressRead } from "./opLogic";
-import type { HeldCodes, OperatorSessionRow, SessionListResponse } from "./types";
+import {
+  addFirstReads,
+  appendPage,
+  createGeneration,
+  errorMessage,
+  formatServerTime,
+  nextReads,
+  type ProgressReads,
+} from "./opLogic";
+import type { HeldCodes, OperatorSessionRow } from "./types";
 
-type Reads = Record<string, { previous?: ProgressRead; current: ProgressRead }>;
+const PAGE_SIZE = 50;
+/** A refresh re-reads at most this many pages of what the operator scrolled back through. */
+const REFRESH_MAX_PAGES = 20;
 
 function describeError(error: unknown): string {
   if (error instanceof OpApiError) {
@@ -23,17 +33,6 @@ function isAuthFailure(error: unknown): boolean {
   return error instanceof OpApiError && error.status === 401;
 }
 
-function nextReads(previous: Reads, rows: OperatorSessionRow[], readAtMs: number): Reads {
-  const reads: Reads = {};
-  for (const row of rows) {
-    reads[row.session_id] = {
-      previous: previous[row.session_id]?.current,
-      current: { storedSequences: row.stored_sequences, readAtMs },
-    };
-  }
-  return reads;
-}
-
 export default function App() {
   // The operator token lives only in React state: never in storage or a URL.
   const [token, setToken] = useState<string | null>(null);
@@ -42,11 +41,18 @@ export default function App() {
     [token],
   );
 
+  // Advanced on every sign-in and sign-out. A response whose ticket predates the
+  // advance answers a token this tab no longer holds, so it must not write state.
+  const [auth] = useState(createGeneration);
+  // Advanced per list request, so only the latest one replaces the rows.
+  const [listGen] = useState(createGeneration);
+
   const [gateBusy, setGateBusy] = useState(false);
   const [gateError, setGateError] = useState<string | null>(null);
 
   const [rows, setRows] = useState<OperatorSessionRow[]>([]);
-  const [reads, setReads] = useState<Reads>({});
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [reads, setReads] = useState<ProgressReads>({});
   const [lastReadAt, setLastReadAt] = useState<string | null>(null);
   const [listBusy, setListBusy] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
@@ -64,53 +70,135 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, []);
 
-  const signOut = useCallback((message: string | null) => {
-    setToken(null);
-    setRows([]);
-    setReads({});
-    setHeld({});
-    setSelectedId(null);
-    setCases([]);
-    setGateError(message);
-  }, []);
+  const signOut = useCallback(
+    (message: string | null) => {
+      auth.advance();
+      listGen.advance();
+      setToken(null);
+      setRows([]);
+      setNextCursor(null);
+      setReads({});
+      setLastReadAt(null);
+      setListBusy(false);
+      setListError(null);
+      setHeld({});
+      setSelectedId(null);
+      setCases([]);
+      setCreateBusy(false);
+      setCreateError(null);
+      setGateError(message);
+    },
+    [auth, listGen],
+  );
 
-  const applyList = useCallback((list: SessionListResponse) => {
-    const readAtMs = Date.now();
-    setRows(list.sessions);
-    setReads((previous) => nextReads(previous, list.sessions, readAtMs));
-    setLastReadAt(new Date(readAtMs).toISOString());
-  }, []);
-
-  const refresh = useCallback(async () => {
-    if (!client) {
-      return;
-    }
-    setListBusy(true);
-    setListError(null);
-    try {
-      applyList(await client.listSessions());
-    } catch (error) {
+  const listFailed = useCallback(
+    (error: unknown) => {
       if (isAuthFailure(error)) {
         signOut(describeError(error));
         return;
       }
       setListError(describeError(error));
-    } finally {
-      setListBusy(false);
+    },
+    [signOut],
+  );
+
+  const shownCount = rows.length;
+  const refresh = useCallback(async () => {
+    if (!client) {
+      return;
     }
-  }, [applyList, client, signOut]);
+    const live = auth.ticket();
+    const latest = listGen.advance();
+    const current = () => live() && latest();
+    setListBusy(true);
+    setListError(null);
+    try {
+      let page = await client.listSessions({ limit: PAGE_SIZE });
+      let fresh = page.sessions;
+      // Re-read as far back as the operator had loaded, so those rows stay current too.
+      for (
+        let pages = 1;
+        page.next_cursor && fresh.length < shownCount && pages < REFRESH_MAX_PAGES;
+        pages += 1
+      ) {
+        if (!current()) {
+          return;
+        }
+        page = await client.listSessions({ limit: PAGE_SIZE, before: page.next_cursor });
+        fresh = appendPage(fresh, page.sessions);
+      }
+      if (!current()) {
+        return;
+      }
+      const readAtMs = Date.now();
+      setRows(fresh);
+      setNextCursor(page.next_cursor);
+      setReads((previous) => nextReads(previous, fresh, readAtMs));
+      setLastReadAt(new Date(readAtMs).toISOString());
+    } catch (error) {
+      if (current()) {
+        listFailed(error);
+      }
+    } finally {
+      if (current()) {
+        setListBusy(false);
+      }
+    }
+  }, [auth, client, listFailed, listGen, shownCount]);
+
+  async function loadOlder() {
+    if (!client || !nextCursor) {
+      return;
+    }
+    const live = auth.ticket();
+    const latest = listGen.advance();
+    const current = () => live() && latest();
+    setListBusy(true);
+    setListError(null);
+    try {
+      const page = await client.listSessions({ limit: PAGE_SIZE, before: nextCursor });
+      if (!current()) {
+        return;
+      }
+      const readAtMs = Date.now();
+      setRows((shown) => appendPage(shown, page.sessions));
+      setReads((previous) => addFirstReads(previous, page.sessions, readAtMs));
+      setNextCursor(page.next_cursor);
+    } catch (error) {
+      if (current()) {
+        listFailed(error);
+      }
+    } finally {
+      if (current()) {
+        setListBusy(false);
+      }
+    }
+  }
 
   async function signIn(candidate: string) {
+    const live = auth.advance();
     setGateBusy(true);
     setGateError(null);
     const probe = createOpClient({ baseUrl: API_BASE_URL, token: candidate });
     try {
-      const [list, caseList] = await Promise.all([probe.listSessions(), probe.listCases()]);
-      applyList(list);
+      const [page, caseList] = await Promise.all([
+        probe.listSessions({ limit: PAGE_SIZE }),
+        probe.listCases(),
+      ]);
+      if (!live()) {
+        return;
+      }
+      const readAtMs = Date.now();
+      setRows(page.sessions);
+      setNextCursor(page.next_cursor);
+      setReads(nextReads({}, page.sessions, readAtMs));
+      setLastReadAt(new Date(readAtMs).toISOString());
       setCases(caseList.cases);
       setToken(candidate);
     } catch (error) {
-      setGateError(describeError(error));
+      if (live()) {
+        setGateError(describeError(error));
+      }
     } finally {
       setGateBusy(false);
     }
@@ -120,10 +208,16 @@ export default function App() {
     if (!client) {
       return;
     }
+    const live = auth.ticket();
     setCreateBusy(true);
     setCreateError(null);
     try {
       const created = await client.createSession(sessionId, caseId);
+      // Signed out meanwhile: the codes leave with the token instead of
+      // surfacing in the next sign-in.
+      if (!live()) {
+        return;
+      }
       setHeld((current) => ({
         ...current,
         [created.session_id]: { join: created.join_codes, review: created.review_codes },
@@ -132,13 +226,18 @@ export default function App() {
       setCreatedCount((count) => count + 1);
       await refresh();
     } catch (error) {
+      if (!live()) {
+        return;
+      }
       if (isAuthFailure(error)) {
         signOut(describeError(error));
         return;
       }
       setCreateError(describeError(error));
     } finally {
-      setCreateBusy(false);
+      if (live()) {
+        setCreateBusy(false);
+      }
     }
   }
 
@@ -197,6 +296,16 @@ export default function App() {
           heldCodeIds={heldCodeIds}
           onSelect={setSelectedId}
         />
+        <div className="row">
+          <span className="hint">
+            已顯示 {rows.length} 個場次{nextCursor ? "" : "（全部）"}
+          </span>
+          {nextCursor && (
+            <button type="button" className="secondary" onClick={loadOlder} disabled={listBusy}>
+              {listBusy ? "讀取中…" : "載入更早的場次"}
+            </button>
+          )}
+        </div>
       </section>
 
       {selectedRow && (
@@ -213,7 +322,10 @@ export default function App() {
             }
           />
           <SessionDetail
+            // A fresh instance per session, so one session's late answers never reach another.
+            key={selectedRow.session_id}
             client={client}
+            authTicket={auth.ticket}
             row={selectedRow}
             nowMs={nowMs}
             progress={reads[selectedRow.session_id]}

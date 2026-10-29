@@ -28,6 +28,8 @@ export interface OperatorSessionRow extends SessionInfo {
 
 export interface SessionListResponse {
   sessions: OperatorSessionRow[];
+  /** Pass back as `before` for the next older page; null on the last page. */
+  next_cursor: string | null;
   upload_grace_seconds: number;
 }
 

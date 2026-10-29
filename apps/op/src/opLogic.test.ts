@@ -2,13 +2,17 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  addFirstReads,
+  appendPage,
   attentionFlags,
+  createGeneration,
   defaultSessionId,
   describeProgress,
   errorMessage,
   formatSeconds,
   graceRemainingSeconds,
   labelFor,
+  nextReads,
   parseServerTime,
   RECORDING_LABELS,
   sessionIdProblem,
@@ -102,4 +106,53 @@ test("naive server timestamps are read as UTC", () => {
   assert.equal(parseServerTime("2026-10-28T17:41:05+08:00")?.toISOString(), "2026-10-28T09:41:05.000Z");
   assert.equal(parseServerTime(null), null);
   assert.equal(parseServerTime("garbage"), null);
+});
+
+test("a ticket taken before sign-out stays invalid after signing back in", () => {
+  const auth = createGeneration();
+  auth.advance(); // signed in
+  const pending = auth.ticket(); // a reissue request starts
+  assert.equal(pending(), true);
+  auth.advance(); // signed out
+  assert.equal(pending(), false);
+  const fresh = auth.advance(); // signed in again, same token
+  assert.equal(pending(), false);
+  assert.equal(fresh(), true);
+});
+
+test("only the latest list request may apply its response", () => {
+  const list = createGeneration();
+  const first = list.advance();
+  const second = list.advance();
+  assert.equal(first(), false);
+  assert.equal(second(), true);
+});
+
+test("an older page appends without repeating rows already shown", () => {
+  const shown = [{ session_id: "S-3" }, { session_id: "S-2" }];
+  const older = [{ session_id: "S-2" }, { session_id: "S-1" }];
+  assert.deepEqual(
+    appendPage(shown, older).map((row) => row.session_id),
+    ["S-3", "S-2", "S-1"],
+  );
+});
+
+test("a full re-read shifts reads; an older page only adds first reads", () => {
+  const first = nextReads({}, [{ session_id: "S-2", stored_sequences: 4 }], 1_000);
+  const reread = nextReads(first, [{ session_id: "S-2", stored_sequences: 7 }], 31_000);
+  assert.deepEqual(reread["S-2"], {
+    previous: { storedSequences: 4, readAtMs: 1_000 },
+    current: { storedSequences: 7, readAtMs: 31_000 },
+  });
+
+  const paged = addFirstReads(
+    reread,
+    [
+      { session_id: "S-2", stored_sequences: 9 },
+      { session_id: "S-1", stored_sequences: 2 },
+    ],
+    40_000,
+  );
+  assert.deepEqual(paged["S-2"], reread["S-2"]);
+  assert.deepEqual(paged["S-1"], { current: { storedSequences: 2, readAtMs: 40_000 } });
 });
