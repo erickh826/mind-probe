@@ -582,6 +582,16 @@ def get_session(db: DBSession, session_id: str) -> Session | None:
     return db.get(Session, session_id)
 
 
+def list_sessions(db: DBSession, *, limit: int) -> list[Session]:
+    """Newest sessions first, for the operator page."""
+    stmt = (
+        select(Session)
+        .order_by(Session.created_at.desc(), Session.id.desc())
+        .limit(limit)
+    )
+    return list(db.scalars(stmt))
+
+
 def hash_join_code(code: str) -> str:
     """SHA-256 hex digest of a one-time join code."""
     return hashlib.sha256(code.encode("utf-8")).hexdigest()

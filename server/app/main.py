@@ -25,7 +25,7 @@ from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.datastructures import MutableHeaders
 from starlette.middleware.cors import CORSMiddleware as StarletteCORSMiddleware
@@ -374,6 +374,54 @@ def create_session(
     payload["join_codes"] = join_codes
     payload["review_codes"] = review_codes
     return payload
+
+
+#: Upper bound for ``GET /sessions``; each row stats that session's chunk dir.
+SESSION_LIST_MAX = 200
+
+
+def _operator_session_row(db: DBSession, session: models.Session) -> dict:
+    """One ``GET /sessions`` row: the facts docs/recording-operations.md compares.
+
+    Join and review codes are stored as hashes, so they are never listed.
+    """
+    row = _session_payload(session)
+    rec = models.get_recording(db, session.id)
+    row["finalize_state"] = rec.finalize_state if rec is not None else None
+    row["incomplete_reason"] = rec.incomplete_reason if rec is not None else None
+    row["needs_operator"] = bool(rec.needs_operator) if rec is not None else False
+    try:
+        row.update(_upload_reissue_facts(session.id, db))
+    except recording.InvalidSessionId:
+        # Ids from before the recording path guard cannot hold chunks.
+        row.update(
+            recording_state=rec.recording_state if rec is not None else None,
+            stored_sequences=0,
+            seconds_since_last_chunk=None,
+        )
+    grace_ends_at = None
+    if session.status == "ended" and session.ended_at is not None:
+        grace_ends_at = (
+            auth._as_utc(session.ended_at)
+            + timedelta(seconds=auth.upload_grace_seconds())
+        ).isoformat()
+    row["upload_grace_ends_at"] = grace_ends_at
+    row["upload_reissue_refusal"] = _upload_reissue_refusal(db, session)
+    return row
+
+
+@app.get("/sessions")
+def list_sessions(
+    limit: int = Query(50, ge=1, le=SESSION_LIST_MAX),
+    _actor: auth.Actor = Depends(auth.require_operator),
+    db: DBSession = Depends(get_db),
+) -> dict:
+    """Operator-only session list, newest first (deploy design §17, Phase 2 OP page)."""
+    sessions = models.list_sessions(db, limit=limit)
+    return {
+        "sessions": [_operator_session_row(db, session) for session in sessions],
+        "upload_grace_seconds": auth.upload_grace_seconds(),
+    }
 
 
 @app.get("/sessions/{session_id}")
