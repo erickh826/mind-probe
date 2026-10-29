@@ -15,6 +15,7 @@ import {
   resolveClipId,
 } from "./api";
 import { useSessionSocket } from "./useSessionSocket";
+import { startControl } from "./sessionStart";
 import {
   CATEGORY_KEYS,
   EMPTY_SELECTION,
@@ -189,6 +190,13 @@ export default function App() {
   const sessionForHeader = sessionEnded
     ? { ...session, session_state: "ended" as const }
     : session;
+  const startUi = startControl({
+    connected,
+    sessionState: sessionForHeader.session_state,
+    sessionEnded,
+    startInFlight: socket.startInFlight,
+    blocked: endOpen || ending || pauseOpen || uncoveredOpen,
+  });
 
   useEffect(() => {
     if (!sessionEnded) {
@@ -278,6 +286,13 @@ export default function App() {
         setEnding(false);
       });
   }, [joined, sessionEnded]);
+
+  const requestStart = useCallback(() => {
+    if (!startUi.enabled) {
+      return;
+    }
+    socket.sendSessionStarted();
+  }, [socket, startUi.enabled]);
 
   // 全域快捷鍵（spec §8）。輸入框聚焦時一律不攔截。
   useEffect(() => {
@@ -444,7 +459,26 @@ export default function App() {
           sessionEnded ? "場次已結束" : ending ? "結束中…" : "結束目前場次"
         }
         onEndSession={openEndDialog}
+        canStartSession={startUi.enabled}
+        startSessionLabel={startUi.label}
+        startSessionTitle={startUi.title}
+        startPending={startUi.pending}
+        onStartSession={requestStart}
       />
+
+      {socket.startError !== null && (
+        <div
+          role="alert"
+          style={{
+            padding: "8px 16px",
+            background: "#4a2020",
+            borderBottom: "1px solid #7a3030",
+            fontSize: 13,
+          }}
+        >
+          {socket.startError}
+        </div>
+      )}
 
       {paused && (
         <div

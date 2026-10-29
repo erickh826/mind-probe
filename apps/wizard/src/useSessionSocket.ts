@@ -38,6 +38,12 @@ import type {
   UncoveredQuestionPayload,
 } from "@mind-probe/shared";
 import { WIZARD_ROLE, sessionSocketUrl } from "./config";
+import {
+  START_OFFLINE_MESSAGE,
+  authoritativeStartCheckDelayMs,
+  canDispatchSessionStart,
+  startRejectionMessage,
+} from "./sessionStart";
 import { INITIAL_SESSION_VIEW } from "./types";
 import type {
   ConnectionStatus,
@@ -66,6 +72,8 @@ const CLOCK_SYNC_SPACING_MS = 120;
 const SNAPSHOT_RESYNC_DEBOUNCE_MS = 150;
 /** Rolling activity log size. */
 const MAX_LOG_ENTRIES = 120;
+/** Don't poll the snapshot in a tight loop if a start check was early. */
+const START_CHECK_RETRY_FLOOR_MS = 200;
 /** Fallback streak at which ADR-0002 §5 asks the host to step in. */
 export const FALLBACK_THRESHOLD = 3;
 
@@ -160,6 +168,15 @@ export interface SessionSocket {
   sendClipInterrupted: (reason: string) => void;
   sendSessionPaused: (reason: PauseReason) => void;
   sendSessionResumed: () => void;
+  /**
+   * Send `session_started`. The server schedules the unified start; this does
+   * not create a session and does not revoke tokens.
+   */
+  sendSessionStarted: () => void;
+  /** True while a `session_started` envelope is waiting to be accepted. */
+  startInFlight: boolean;
+  /** Last start failure, or null once the server has left `created`. */
+  startError: string | null;
   sendRequestFallback: (
     category: FallbackCategory,
     reason?: FallbackReasonValue,
@@ -194,6 +211,8 @@ export function useSessionSocket(
   const [activeClipStartedAtMs, setActiveClipStartedAtMs] = useState<number | null>(
     null,
   );
+  const [startInFlight, setStartInFlight] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
 
   const socketRef = useRef<WebSocket | null>(null);
   const shouldReconnectRef = useRef(false);
@@ -218,6 +237,11 @@ export function useSessionSocket(
   const pendingRef = useRef(new Map<string, PendingFrame>());
   const revisionRef = useRef(0);
   const resyncTimerRef = useRef<number | null>(null);
+  /** Re-read the snapshot once a scheduled start should have become active. */
+  const startCheckTimerRef = useRef<number | null>(null);
+  const startInFlightRef = useRef(false);
+  const sessionStateRef = useRef(session.session_state);
+  sessionStateRef.current = session.session_state;
   /** Set on every socket open: the next snapshot triggers the §4 replay. */
   const replayAfterSnapshotRef = useRef(false);
   const activeClipRef = useRef<string | null>(null);
@@ -353,9 +377,9 @@ export function useSessionSocket(
       eventType: EventType,
       payload: Record<string, unknown>,
       shortLived: boolean,
-    ) => {
+    ): boolean => {
       if (sessionId === null) {
-        return;
+        return false;
       }
       const sequence = sequenceRef.current;
       const envelope: AnyEventEnvelope = {
@@ -375,7 +399,7 @@ export function useSessionSocket(
 
       if (!rawSend(envelope)) {
         appendLog("error", `連線中斷，${eventType} 未送出 (not sent: offline)`);
-        return;
+        return false;
       }
       sequenceRef.current = sequence + 1;
       trackPending({
@@ -386,6 +410,7 @@ export function useSessionSocket(
         short_lived: shortLived,
       });
       appendLog("info", `→ ${eventType}`);
+      return true;
     },
     [appendLog, rawSend, sessionId, trackPending],
   );
@@ -456,6 +481,34 @@ export function useSessionSocket(
   }, [sendEnvelope]);
 
   /**
+   * ADR-0003 §5. `session_started` is durable, like resume: a deadline would
+   * let a slow socket drop the one command that begins the interview.
+   *
+   * This sends the envelope on the live socket only. It does not call
+   * `POST /sessions`, and a revoked token never gets this far — the socket
+   * is already closed.
+   */
+  const sendSessionStarted = useCallback(() => {
+    if (
+      !canDispatchSessionStart({
+        sessionState: sessionStateRef.current,
+        sessionEnded: sessionStateRef.current === "ended",
+        startInFlight: startInFlightRef.current,
+      })
+    ) {
+      return;
+    }
+    const sent = sendEnvelope("session_started", { event_id: newId("evt") }, false);
+    if (!sent) {
+      setStartError(START_OFFLINE_MESSAGE);
+      return;
+    }
+    startInFlightRef.current = true;
+    setStartInFlight(true);
+    setStartError(null);
+  }, [sendEnvelope]);
+
+  /**
    * ADR-0002 §1/§2: the Wizard names a semantic *category* and the server
    * decides which approved clip expresses it, so this is a control message and
    * not a client-authored `fallback_used` envelope (which the server rejects
@@ -504,6 +557,38 @@ export function useSessionSocket(
 
   // --- Inbound handling ----------------------------------------------------
 
+  const clearStartCheck = useCallback(() => {
+    if (startCheckTimerRef.current !== null) {
+      window.clearTimeout(startCheckTimerRef.current);
+      startCheckTimerRef.current = null;
+    }
+  }, []);
+
+  /**
+   * Ask for the authoritative snapshot when the scheduled start should be due.
+   *
+   * The active flip is derived on the server and is not broadcast. A missing
+   * clock offset waits the 2s lead instead of marking the console active.
+   */
+  const scheduleAuthoritativeStartCheck = useCallback(
+    (startAtServerMs: number, floorMs = 0) => {
+      clearStartCheck();
+      const delay = Math.max(
+        floorMs,
+        authoritativeStartCheckDelayMs(
+          startAtServerMs,
+          Date.now(),
+          clockOffsetRef.current,
+        ),
+      );
+      startCheckTimerRef.current = window.setTimeout(() => {
+        startCheckTimerRef.current = null;
+        requestSnapshot();
+      }, delay);
+    },
+    [clearStartCheck, requestSnapshot],
+  );
+
   const applySnapshot = useCallback(
     (message: SessionSnapshotMessage) => {
       // Assign, never max(): the snapshot is authoritative, and snapshots
@@ -521,6 +606,17 @@ export function useSessionSocket(
         consecutive_fallbacks: message.consecutive_fallbacks,
         start_at_server_ms: message.start_at_server_ms ?? null,
       });
+      if (
+        message.session_state === "starting" &&
+        typeof message.start_at_server_ms === "number"
+      ) {
+        scheduleAuthoritativeStartCheck(
+          message.start_at_server_ms,
+          START_CHECK_RETRY_FLOOR_MS,
+        );
+      } else {
+        clearStartCheck();
+      }
       if (message.playback_state === "playing") {
         setActiveClip(message.active_clip, clipStartedAtRef.current ?? Date.now());
       } else {
@@ -544,7 +640,7 @@ export function useSessionSocket(
         }
       }
     },
-    [appendLog, rawSend, setActiveClip],
+    [appendLog, clearStartCheck, rawSend, scheduleAuthoritativeStartCheck, setActiveClip],
   );
 
   /**
@@ -645,6 +741,11 @@ export function useSessionSocket(
         );
       }
       if (message.status === "rejected") {
+        if (pending?.event_type === "session_started") {
+          startInFlightRef.current = false;
+          setStartInFlight(false);
+          setStartError(startRejectionMessage(message.reason ?? null));
+        }
         appendLog("warn", `✗ 伺服器拒絕 (rejected): ${message.reason ?? "unknown"}`);
         if (message.reason === "stale_snapshot_revision") {
           // Our revision was behind the server's; re-read it now so the Wizard
@@ -652,6 +753,12 @@ export function useSessionSocket(
           requestSnapshot();
         }
         return;
+      }
+      if (
+        message.status === "duplicate" &&
+        pending?.event_type === "session_started"
+      ) {
+        scheduleSnapshotResync();
       }
       if (message.status === "accepted") {
         if (pending !== undefined) {
@@ -812,6 +919,7 @@ export function useSessionSocket(
               session_state: "starting",
               start_at_server_ms: startAt,
             }));
+            scheduleAuthoritativeStartCheck(startAt);
             appendLog("info", "Session 已排定統一開始時間 (start scheduled)");
             return;
           }
@@ -851,6 +959,7 @@ export function useSessionSocket(
       handleAck,
       handleClockSyncResponse,
       handlePong,
+      scheduleAuthoritativeStartCheck,
       scheduleSnapshotResync,
     ],
   );
@@ -974,6 +1083,10 @@ export function useSessionSocket(
         window.clearTimeout(timer);
       }
       clockTimersRef.current = [];
+      if (startCheckTimerRef.current !== null) {
+        window.clearTimeout(startCheckTimerRef.current);
+        startCheckTimerRef.current = null;
+      }
       socketRef.current?.close();
       socketRef.current = null;
     };
@@ -989,6 +1102,18 @@ export function useSessionSocket(
   ]);
 
   const dismissThresholdAlert = useCallback(() => setThresholdAlert(null), []);
+
+  useEffect(() => {
+    if (session.session_state === "created") {
+      return;
+    }
+    startInFlightRef.current = false;
+    setStartInFlight(false);
+    setStartError(null);
+    if (session.session_state !== "starting") {
+      clearStartCheck();
+    }
+  }, [clearStartCheck, session.session_state]);
 
   return useMemo(
     () => ({
@@ -1007,6 +1132,9 @@ export function useSessionSocket(
       sendClipInterrupted,
       sendSessionPaused,
       sendSessionResumed,
+      sendSessionStarted,
+      startInFlight,
+      startError,
       sendRequestFallback,
       sendUncoveredQuestion,
     }),
@@ -1024,8 +1152,11 @@ export function useSessionSocket(
       sendReturnToIdle,
       sendSessionPaused,
       sendSessionResumed,
+      sendSessionStarted,
       sendUncoveredQuestion,
       session,
+      startError,
+      startInFlight,
       status,
       thresholdAlert,
     ],
