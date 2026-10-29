@@ -3,6 +3,7 @@
 > 版本：v0.5.2（2026-10-15）。**設計審閱已通過，可以開始 Phase 1 實作；這不代表部署驗收**（部署驗收要另外依 §18 完成端到端演練和量測後才算）。v0.5.2 確定了 D8–D11（recorder_lost 優先、finalize 30 秒、meta 保留 7 天、重新開始的流程）。v0.5.1：v0.5.1 修正了上傳序號、student 讀取狀態、重新整理後的規則、finalize 持久化（§6.7、§7.2、§7.5、權限表和測試）。以下是 v0.5 的說明：v0.4 審閱的 8 項 P1 意見（§6.4、§6.7、§7.2、§7.3、§8.2、權限表和測試清單）已修正，待複審後才能標記為正式通過。
 > 本文件根據唯讀檢視的程式碼撰寫：`server/app/{main,auth,websocket,recording,models,cases}.py`、`apps/*/src`、`cases/CASE001`、`docs/`。行號是約略值。
 > **範圍：Phase 1（部署和安全）**。Admin 管理頁面放在 Phase 2，見 §17。
+> **過渡 OP 頁**（2026-10-29）：完整 Admin 認證仍在 §17。在那之前，`apps/op` 用 operator token 呼叫 `GET /sessions`。分頁合約見 §5，部署檢查見 §12。這不改變 Phase 1 的範圍結論，也不是部署驗收。
 
 ## 0. 已定案決定
 
@@ -74,7 +75,7 @@ flowchart LR
 |---|---|---|---|---|---|
 | `live`（現有） | `POST /sessions/{id}/join` 加 join code | `typ=live`、`session_id`、`role`、`sub`、`jti` | 2 小時（現有設定） | `end` 時全部撤銷 | 即時 session 中的 REST 和 WS |
 | `review`（新增，§6.5） | `POST /sessions/{id}/review-login` 加 teacher review code | `typ=review`、`session_id`、`role=teacher\|observer`、`sub`、`jti` | access 30 分鐘；refresh 7 天 | 可以逐一撤銷，也可以整個 session 撤銷 | session 結束後審閱、刪除錄影 |
-| `operator`（新增，暫時方案） | 伺服器 env `MINDPROBE_OPERATOR_TOKEN`（長隨機字串） | 不是 JWT，用常數時間比對 | 手動輪替 | 改 env 就失效 | 建立 session、讀取 join code、手動觸發轉檔；Phase 2 改成 admin 登入 |
+| `operator`（新增，暫時方案） | 伺服器 env `MINDPROBE_OPERATOR_TOKEN`（長隨機字串） | 不是 JWT，用常數時間比對 | 手動輪替 | 改 env 就失效 | 建立 session、列出場次（`GET /sessions`，不含明文碼）、讀取建立當下回傳的 join code、手動觸發轉檔；Phase 2 改成 admin 登入 |
 | R2 presigned URL | `GET /sessions/{id}/recording` | — | 15 分鐘 | 不能撤銷（到期才失效） | **只用來下載影片，不是認證憑證** |
 
 所有 token 都會雜湊後寫入資料庫（沿用 `models.hash_token`），只有 hash 會進入 audit。
@@ -91,6 +92,7 @@ flowchart LR
 | `GET /cases/{case_id}/clips` | 公開 | S、W、T、O、OP（student 只拿到 clip_id、檔名和時長，**不含 text 和 reveals**） | 同上 | 同上 | ✔ | 需要確認 student app 實際用了哪些欄位 |
 | `GET /cases/{case_id}/rubric` | 公開 | T、O、OP | live/review/OP | 同上 | ✔ | |
 | `POST /sessions` | 公開，**回傳全部 join code** | OP | OP | — | — | Phase 2 改成 admin |
+| `GET /sessions` | — | **只限 OP** | OP | — | — | 過渡 OP 頁（`apps/op`）。分頁合約見下。不回傳任何碼 |
 | `GET /sessions/{id}` | 公開 | S、W、T、O、OP | live/review/OP | ✔ | ✔ | |
 | `GET /sessions/{id}/events` | 公開 | W、T、O、OP | live/review/OP | ✔ | live：ended豁免；review：一律檢查 | student 不應看到 wizard 的事件 |
 | `POST /sessions/{id}/end` | 公開 | W、T、OP | live/OP | ✔ | ✔ | 結束後會觸發 `finalizing`（§7） |
@@ -110,6 +112,25 @@ flowchart LR
 | `WS /ws/{id}/{role}` | cookie | path 上的 role 必須等於 token 的 role；S 和 W 各只能有一個連線，T 和 O 可以多個 | live（T 和 O 也可以用 review） | ✔ | ✔，ended 時拒絕 | §6.6 |
 | `GET /cases/*` StaticFiles | 公開 | 只在 local backend 時掛載 | | | | 正式環境由 R2 提供 |
 
+### `GET /sessions` 分頁合約（過渡 OP 頁，已依程式與測試實作）
+
+只接受 operator token（`require_operator`）。沒有 token、錯誤 token、live 或 review token 都是 401，帶 `before` 時也一樣。
+
+查詢參數：
+
+- `limit`：整數，預設 50，範圍 1–200（`SESSION_LIST_MAX`）。0 或大於 200 回 422。每列會 stat 該場次的 chunk 目錄，所以上限定在 200。
+- `before`：可省略。有值時必須是上一頁回應的 `next_cursor`，原樣回傳，呼叫端不要自己組。省略代表最新的一頁。長度上限 512，超過回 422（查詢驗證）。空字串或無法還原的值回 422，`detail` 為 `invalid_cursor`。
+
+排序是 `created_at` 由新到舊，同一時間再以 `id` 由新到舊。`before` 解出上一頁最後一列的 `(created_at, id)`。下一頁只含嚴格排在這個鍵之後的列：`created_at` 較小，或 `created_at` 相同且 `id` 較小。因此 `created_at` 打平時不會重複也不會漏列。兩次翻頁之間新建立、比 cursor 更新的場次不會插進較舊的那一頁，要重新讀第一頁才看得到。
+
+伺服器多取一列來判斷有沒有下一頁。超過 `limit` 時，`next_cursor` 是這一頁最後一列（回傳的 `sessions` 的最後一列，不是多探的那一列）的不透明 cursor。最後一頁，包含剛好滿頁但沒有多出來的列，`next_cursor` 為 `null`。Cursor 用寫進資料庫的 `created_at`（SQLite 上是 naive datetime）來和下一頁比對，避免時區換算讓同一列對不上。編碼是去掉 padding 的 urlsafe base64，內容為 JSON `[created_at.isoformat(), id]`。這只是伺服器的實作；呼叫端把 `next_cursor` 原樣放進下一次的 `before` 即可。
+
+回應只有三個欄位：`sessions`、`next_cursor`、`upload_grace_seconds`。沒有 `after`、`cursor`、`has_more` 或 `total`。每一列是場次欄位，加上 `recording_state`、`finalize_state`、`incomplete_reason`、`needs_operator`、`stored_sequences`、`seconds_since_last_chunk`、`upload_grace_ends_at`、`upload_reissue_refusal`。不含 `join_codes`、`review_codes` 或補傳碼。
+
+`apps/op` 每頁 `limit=50`。「載入更早的場次」把目前的 `next_cursor` 當成 `before`，接在已顯示的列後面，並去掉重複的 `session_id`；新列只記第一次讀取。「重新整理」從第一頁重讀，再沿著 `next_cursor` 繼續，直到涵蓋目前已顯示的列數，最多 20 頁。超過 20 頁的部分在重新整理後不會留在畫面上，要再按「載入更早的場次」。
+
+上線這個頁面時，後端必須已經有這個端點和上述分頁。見 §12。
+
 **測試清單（每一列都要有）**
 1. 沒有 token → 401；token 格式錯誤或簽章錯誤 → 401；token 過期 → 401 `expired`。
 2. token 綁定的 session 和路徑不同 → 401 或 403 `session_token_mismatch`。
@@ -127,6 +148,7 @@ flowchart LR
 14. **finalize 計時（D9）**：佇列已清空 → 立刻送出；佇列裡有 chunk 一直失敗 → 計時 30 秒時送出，chunk 重試不會延後這個時間；finalize 送出之後，遲到的 chunk 仍然被接收，並能讓錄影變成 complete。
 15. **meta 保留（D10）**：complete 而且確認之後 7 天才清除；pending、incomplete 和 lost 的 meta 過了 7 天仍然保留。
 16. **建立 session 權限（D11）**：wizard 呼叫 `POST /sessions` → 401/403。
+17. **OP 場次列表與分頁**：見上方 `GET /sessions` 合約。非 OP（含 live token，以及帶 `before`）→ 401；`limit` 超出 1–200 → 422；畸形 `before` → 422 `invalid_cursor`；各頁走完每場恰好一次，最後一頁 `next_cursor` 為 null；回應沒有任何碼。
 
 ## 6. 認證和程式碼改動
 
@@ -316,7 +338,7 @@ R2 CORS 只允許 GET 和 HEAD，`AllowedHeaders: Range`，並 expose `Content-R
 | `MINDPROBE_OPERATOR_TOKEN` | 長隨機字串 |
 | `MINDPROBE_REVIEW_ACCESS_TTL` / `MINDPROBE_REVIEW_REFRESH_TTL` | `1800` / `604800` |
 | `MINDPROBE_UPLOAD_GRACE_SECONDS` | `600` |
-| `MINDPROBE_CORS_ORIGINS` | 三個 `https://<app>.vercel.app` |
+| `MINDPROBE_CORS_ORIGINS` | student、wizard、teacher 的 `https://<app>.vercel.app`；部署 `apps/op` 時加上該頁的 origin（§6.3、§12） |
 | `MINDPROBE_STORAGE_BACKEND` | `s3` |
 | `MINDPROBE_S3_ENDPOINT` / `_REGION` / `_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` | R2：`https://<acct>.r2.cloudflarestorage.com`、`auto` |
 | `MINDPROBE_MEDIA_BUCKET` / `MINDPROBE_RECORDINGS_BUCKET` | |
@@ -324,7 +346,7 @@ R2 CORS 只允許 GET 和 HEAD，`AllowedHeaders: Range`，並 expose `Content-R
 | `MINDPROBE_DISK_WARN_PCT` / `MINDPROBE_DISK_MIN_FREE_GB` | `70` / `5` |
 | `MINDPROBE_FFMPEG_THREADS` / `MINDPROBE_FFMPEG_PRESET` | `2` / `veryfast` |
 | 現有 | `MINDPROBE_DB_URL=sqlite:////data/mindprobe.db`、`MINDPROBE_CASES_DIR=/data/cases`、`MINDPROBE_SESSIONS_DIR=/data/sessions` |
-| Vercel | `VITE_API_BASE_URL=https://A-B-C-D.sslip.io`、`VITE_MEDIA_BASE_URL=https://pub-<hash>.r2.dev` |
+| Vercel | `VITE_API_BASE_URL=https://A-B-C-D.sslip.io`、`VITE_MEDIA_BASE_URL=https://pub-<hash>.r2.dev`。每個前端專案都要設 `VITE_API_BASE_URL`。OP 頁不使用 `VITE_MEDIA_BASE_URL` |
 
 ## 12. Lightsail 部署步驟
 1. 建立 Instance：Hong Kong、Ubuntu 24.04、US$12（2 GB RAM、60 GB SSD、1.5 TB 流量），建立並綁定 Static IP。
@@ -344,6 +366,18 @@ R2 CORS 只允許 GET 和 HEAD，`AllowedHeaders: Range`，並 expose `Content-R
 7. 執行 `docker compose up -d --build`，然後測試 `/health`、WSS 子協定，並跑 §5 的權限測試（對正式環境做唯讀的冒煙測試）。
 8. 端到端演練（§18 第 7 步）。
 
+### 部署過渡 OP 頁（`apps/op`）
+
+上線 OP 前端時，後端必須已經包含 `GET /sessions` 和 §5 的分頁（`before`／`next_cursor`）。頁面登入會呼叫 `GET /sessions`。舊後端沒有這個路由時列表失敗，頁面不能用。只更新前端、不更新後端，不算完成部署。
+
+下列項目這份設計裡已經寫過，部署 OP 頁時照做：
+
+- **Vercel 專案**：另外一個專案，root 指到 `apps/op`，和 student、wizard、teacher 分開。
+- **`VITE_API_BASE_URL`**：見 §11。production build 沒設定會失敗。OP 頁不讀 `VITE_MEDIA_BASE_URL`。Teacher 的 Vercel Preview 若沒有 `VITE_API_BASE_URL`，那是既有的 Preview 設定（teacher 的 production build 本來就要求這個變數），不是 OP 頁這次改動造成的。
+- **CORS**：把 OP 頁的 origin 加進 `MINDPROBE_CORS_ORIGINS`（§6.3、§11 的白名單）。
+
+比對用的祕密仍是伺服器 env `MINDPROBE_OPERATOR_TOKEN`。過渡頁讓 OP 把 token 貼進瀏覽器，只放在 React state，不寫 storage、cookie 或 URL。§17 的 admin 登入仍是要換掉這個做法的項目。
+
 ## 13. 保留政策，以及要更新的 ADR 和 spec
 現有設計（ADR-0004 §4「資料保留優先順序」：原始事件 > 原始 WebM > 最終 MP4 > 自動產生報告；`docs/spec.md` 約 :189 也有相同描述）把**原始 WebM 的優先順序排在 MP4 之前**。D3「完整轉檔後刪除 raw WebM」會改變這個設計，所以要同步更新以下文件：
 - `docs/adr/0004-cross-cutting-rules.md` §4：新增「錄影完整（§7）而且 mp4 驗證通過之後，可以刪除原始 WebM；incomplete 一律保留」，並說明 R2 上的 mp4 才是長期保存的版本。建議另外寫一份 ADR-0005〈雲端部署與錄影保留〉，說明這次的變更。
@@ -361,7 +395,7 @@ R2 CORS 只允許 GET 和 HEAD，`AllowedHeaders: Range`，並 expose `Content-R
 - 監控工作佇列：`failed` 或 `incomplete` 的工作和錄影要寫入 log，並發出告警（Phase 2 在 admin 頁面顯示）。
 
 ## 15. 安全重點
-Bearer 認證；WS 用子協定傳 token；log 過濾敏感 header；CORS 白名單；token 綁定 session 和角色、設定短效期並可以撤銷；review token 採 refresh 輪替加上重複使用偵測；operator token 只放在伺服器端；recordings bucket 私有、presigned URL 15 分鐘；R2 API token 只給兩個 bucket 的權限；student 拿不到 ground truth 和決策樹；`vercel.json` 設定 CSP，降低 XSS 竊取 token 的風險。
+Bearer 認證；WS 用子協定傳 token；log 過濾敏感 header；CORS 白名單；token 綁定 session 和角色、設定短效期並可以撤銷；review token 採 refresh 輪替加上重複使用偵測；operator token 的祕密只放在伺服器 env，由伺服器比對；recordings bucket 私有、presigned URL 15 分鐘；R2 API token 只給兩個 bucket 的權限；student 拿不到 ground truth 和決策樹；`vercel.json` 設定 CSP，降低 XSS 竊取 token 的風險。過渡 OP 頁（§5、§12）在 §17 的 admin 登入之前，會讓 OP 把同一枚 token 貼進瀏覽器，而且只留在該分頁的記憶體。
 
 ## 16. 風險 / 未決問題
 1. **【正式上線的阻擋項目】自有網域**：r2.dev 只能用於內部驗證，sslip.io 依賴第三方。
@@ -376,6 +410,9 @@ Bearer 認證；WS 用子協定傳 token；log 過濾敏感 header；CORS 白名
 9. 單一機器是單點故障。
 
 ## 17. Phase 2 大綱：Admin 管理頁面（P2-7，不在本次範圍）
+
+過渡實作（完整 admin 認證之前）：`apps/op` 提供建場次、複製建立時回傳的碼、補傳碼、重新產生 review code，以及只限 OP 的 `GET /sessions`。分頁合約與「前端和後端要一起更新」的檢查在 §5、§12。這一頁不取代下面其餘項目。
+
 - **直接重新開始的捷徑（從 D11 移過來）**：讓獲授權的角色（新增明確的 `session:restart` 權限，預設只有 OP 和 admin）在錄影中斷時一鍵建立新的 session。要有確認步驟（顯示舊 session 狀態和影響），並在資料庫記錄新舊 session 的關聯（`restarted_from_session_id`、`restarted_to_session_id`），teacher 審閱時可以互相跳轉；舊 session 保持 incomplete。
 - **Admin 認證**：取代 operator token，改用帳號密碼或 OAuth 加上 admin 角色、session cookie 或 Bearer。
 - **建立案件**：上傳 7 個 JSON 檔並驗證 schema，存到伺服器（或資料庫）。

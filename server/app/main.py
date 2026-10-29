@@ -14,6 +14,8 @@ comment above ``_case_file_path`` for how auth is scoped, and the one above
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import os
@@ -22,10 +24,10 @@ import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.datastructures import MutableHeaders
 from starlette.middleware.cors import CORSMiddleware as StarletteCORSMiddleware
@@ -374,6 +376,84 @@ def create_session(
     payload["join_codes"] = join_codes
     payload["review_codes"] = review_codes
     return payload
+
+
+#: Upper bound for ``GET /sessions``; each row stats that session's chunk dir.
+SESSION_LIST_MAX = 200
+
+
+def _operator_session_row(db: DBSession, session: models.Session) -> dict:
+    """One ``GET /sessions`` row: the facts docs/recording-operations.md compares.
+
+    Join and review codes are stored as hashes, so they are never listed.
+    """
+    row = _session_payload(session)
+    rec = models.get_recording(db, session.id)
+    row["finalize_state"] = rec.finalize_state if rec is not None else None
+    row["incomplete_reason"] = rec.incomplete_reason if rec is not None else None
+    row["needs_operator"] = bool(rec.needs_operator) if rec is not None else False
+    try:
+        row.update(_upload_reissue_facts(session.id, db))
+    except recording.InvalidSessionId:
+        # Ids from before the recording path guard cannot hold chunks.
+        row.update(
+            recording_state=rec.recording_state if rec is not None else None,
+            stored_sequences=0,
+            seconds_since_last_chunk=None,
+        )
+    grace_ends_at = None
+    if session.status == "ended" and session.ended_at is not None:
+        grace_ends_at = (
+            auth._as_utc(session.ended_at)
+            + timedelta(seconds=auth.upload_grace_seconds())
+        ).isoformat()
+    row["upload_grace_ends_at"] = grace_ends_at
+    row["upload_reissue_refusal"] = _upload_reissue_refusal(db, session)
+    return row
+
+
+def _session_cursor(session: models.Session) -> str:
+    """Opaque ``GET /sessions`` page cursor: the last row's sort key.
+
+    Built from the stored ``created_at`` as loaded (naive on SQLite), so it
+    compares exactly against the column on the next page.
+    """
+    raw = json.dumps([session.created_at.isoformat(), session.id], separators=(",", ":"))
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _parse_session_cursor(cursor: str) -> tuple[datetime, str]:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+        created_at, session_id = decoded
+        if not isinstance(created_at, str) or not isinstance(session_id, str):
+            raise ValueError("cursor fields must be strings")
+        return datetime.fromisoformat(created_at), session_id
+    except (ValueError, TypeError, binascii.Error) as exc:
+        raise HTTPException(status_code=422, detail="invalid_cursor") from exc
+
+
+@app.get("/sessions")
+def list_sessions(
+    limit: int = Query(50, ge=1, le=SESSION_LIST_MAX),
+    before: str | None = Query(None, max_length=512),
+    _actor: auth.Actor = Depends(auth.require_operator),
+    db: DBSession = Depends(get_db),
+) -> dict:
+    """Operator-only session list, newest first (deploy design §17, Phase 2 OP page).
+
+    Pages by keyset: pass the previous page's ``next_cursor`` as ``before``.
+    ``next_cursor`` is null on the last page.
+    """
+    after = _parse_session_cursor(before) if before is not None else None
+    sessions = models.list_sessions(db, limit=limit + 1, before=after)
+    next_cursor = _session_cursor(sessions[limit - 1]) if len(sessions) > limit else None
+    return {
+        "sessions": [_operator_session_row(db, session) for session in sessions[:limit]],
+        "next_cursor": next_cursor,
+        "upload_grace_seconds": auth.upload_grace_seconds(),
+    }
 
 
 @app.get("/sessions/{session_id}")
