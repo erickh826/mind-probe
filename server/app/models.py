@@ -51,8 +51,10 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    and_,
     create_engine,
     inspect,
+    or_,
     select,
     update,
 )
@@ -582,13 +584,25 @@ def get_session(db: DBSession, session_id: str) -> Session | None:
     return db.get(Session, session_id)
 
 
-def list_sessions(db: DBSession, *, limit: int) -> list[Session]:
-    """Newest sessions first, for the operator page."""
-    stmt = (
-        select(Session)
-        .order_by(Session.created_at.desc(), Session.id.desc())
-        .limit(limit)
-    )
+def list_sessions(
+    db: DBSession, *, limit: int, before: tuple[datetime, str] | None = None
+) -> list[Session]:
+    """Newest sessions first, for the operator page.
+
+    ``before`` is the ``(created_at, id)`` of the last row already shown; rows
+    strictly after it in this order come next, so ties on ``created_at`` and
+    sessions created between pages neither repeat nor go missing.
+    """
+    stmt = select(Session)
+    if before is not None:
+        created_at, session_id = before
+        stmt = stmt.where(
+            or_(
+                Session.created_at < created_at,
+                and_(Session.created_at == created_at, Session.id < session_id),
+            )
+        )
+    stmt = stmt.order_by(Session.created_at.desc(), Session.id.desc()).limit(limit)
     return list(db.scalars(stmt))
 
 

@@ -167,3 +167,98 @@ def test_row_carries_recording_facts(client, db, chunk_root):
     assert row["needs_operator"] is True
     assert row["stored_sequences"] == 3
     assert isinstance(row["seconds_since_last_chunk"], int)
+
+
+def _page(client: TestClient, limit: int, before: str | None = None) -> dict:
+    params: dict[str, object] = {"limit": limit}
+    if before is not None:
+        params["before"] = before
+    resp = client.get("/sessions", params=params, headers=OP)
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def _ids(page: dict) -> list[str]:
+    return [row["session_id"] for row in page["sessions"]]
+
+
+def test_pages_walk_every_session_once_across_created_at_ties(client, db):
+    # Five sessions share one created_at, so the page boundary falls inside the tie.
+    tie = datetime(2026, 10, 28, 9, 0, 0, 123456)
+    for session_id in ("S-A", "S-B", "S-C", "S-D", "S-E"):
+        _create(client, session_id)
+        _set_created_at(db, session_id, tie)
+    _create(client, "S-OLD")
+    _set_created_at(db, "S-OLD", tie - timedelta(minutes=1))
+
+    first = _page(client, 2)
+    second = _page(client, 2, first["next_cursor"])
+    third = _page(client, 2, second["next_cursor"])
+    assert _ids(first) == ["S-E", "S-D"]
+    assert _ids(second) == ["S-C", "S-B"]
+    assert _ids(third) == ["S-A", "S-OLD"]
+    assert third["next_cursor"] is None
+    assert third["upload_grace_seconds"] > 0
+
+
+def test_a_session_created_between_pages_neither_repeats_nor_skips(client, db):
+    base = datetime(2026, 10, 28, 9, 0)
+    for offset in range(4):
+        _create(client, f"S-{offset}")
+        _set_created_at(db, f"S-{offset}", base + timedelta(minutes=offset))
+
+    first = _page(client, 2)
+    assert _ids(first) == ["S-3", "S-2"]
+    _create(client, "S-LATE")  # created now: newer than everything listed
+    second = _page(client, 2, first["next_cursor"])
+    assert _ids(second) == ["S-1", "S-0"]
+    assert second["next_cursor"] is None
+    assert _ids(_page(client, 2))[0] == "S-LATE"
+
+
+def test_last_full_page_has_no_cursor(client, db):
+    base = datetime(2026, 10, 28, 9, 0)
+    for offset in range(2):
+        _create(client, f"S-{offset}")
+        _set_created_at(db, f"S-{offset}", base + timedelta(minutes=offset))
+    page = _page(client, 2)
+    assert _ids(page) == ["S-1", "S-0"]
+    assert page["next_cursor"] is None
+    assert _page(client, 50)["next_cursor"] is None
+
+
+@pytest.mark.parametrize(
+    "cursor",
+    [
+        "",
+        "not base64 !!",
+        "bm90IGpzb24",  # "not json"
+        "WyJvbmx5LW9uZSJd",  # ["only-one"]
+        "WzEsMl0",  # [1,2]
+        "WyJub3QgYSBkYXRlIiwiUy0xIl0",  # ["not a date","S-1"]
+        "游標",
+    ],
+)
+def test_malformed_cursor_is_422(client, cursor):
+    _create(client, "S-1")
+    resp = client.get("/sessions", params={"before": cursor}, headers=OP)
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == "invalid_cursor"
+
+
+def test_oversized_cursor_is_422(client):
+    resp = client.get("/sessions", params={"before": "A" * 513}, headers=OP)
+    assert resp.status_code == 422
+
+
+def test_paging_is_still_operator_only(client, db):
+    base = datetime(2026, 10, 28, 9, 0)
+    for offset in range(2):
+        created = _create(client, f"S-{offset}")
+        _set_created_at(db, f"S-{offset}", base + timedelta(minutes=offset))
+    live = _join(client, "S-1", created["join_codes"]["wizard"])
+    cursor = _page(client, 1)["next_cursor"]
+    assert cursor is not None
+    for headers in (NO_OP, bearer(live)):
+        resp = client.get("/sessions", params={"before": cursor}, headers=headers)
+        assert resp.status_code == 401

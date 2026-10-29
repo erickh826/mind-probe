@@ -14,6 +14,8 @@ comment above ``_case_file_path`` for how auth is scoped, and the one above
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import os
@@ -22,7 +24,7 @@ import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -410,16 +412,46 @@ def _operator_session_row(db: DBSession, session: models.Session) -> dict:
     return row
 
 
+def _session_cursor(session: models.Session) -> str:
+    """Opaque ``GET /sessions`` page cursor: the last row's sort key.
+
+    Built from the stored ``created_at`` as loaded (naive on SQLite), so it
+    compares exactly against the column on the next page.
+    """
+    raw = json.dumps([session.created_at.isoformat(), session.id], separators=(",", ":"))
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _parse_session_cursor(cursor: str) -> tuple[datetime, str]:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+        created_at, session_id = decoded
+        if not isinstance(created_at, str) or not isinstance(session_id, str):
+            raise ValueError("cursor fields must be strings")
+        return datetime.fromisoformat(created_at), session_id
+    except (ValueError, TypeError, binascii.Error) as exc:
+        raise HTTPException(status_code=422, detail="invalid_cursor") from exc
+
+
 @app.get("/sessions")
 def list_sessions(
     limit: int = Query(50, ge=1, le=SESSION_LIST_MAX),
+    before: str | None = Query(None, max_length=512),
     _actor: auth.Actor = Depends(auth.require_operator),
     db: DBSession = Depends(get_db),
 ) -> dict:
-    """Operator-only session list, newest first (deploy design §17, Phase 2 OP page)."""
-    sessions = models.list_sessions(db, limit=limit)
+    """Operator-only session list, newest first (deploy design §17, Phase 2 OP page).
+
+    Pages by keyset: pass the previous page's ``next_cursor`` as ``before``.
+    ``next_cursor`` is null on the last page.
+    """
+    after = _parse_session_cursor(before) if before is not None else None
+    sessions = models.list_sessions(db, limit=limit + 1, before=after)
+    next_cursor = _session_cursor(sessions[limit - 1]) if len(sessions) > limit else None
     return {
-        "sessions": [_operator_session_row(db, session) for session in sessions],
+        "sessions": [_operator_session_row(db, session) for session in sessions[:limit]],
+        "next_cursor": next_cursor,
         "upload_grace_seconds": auth.upload_grace_seconds(),
     }
 
