@@ -38,6 +38,14 @@ export interface CreatedSession extends SessionInfo {
   review_codes: Record<ReviewCodeRole, string>;
 }
 
+/** `POST /sessions/{id}/join-codes`: only the roles that were reissued. */
+export interface JoinCodesResponse {
+  session_id: string;
+  join_codes: Partial<Record<JoinCodeRole, string>>;
+  revoke_live: boolean;
+  revoked_tokens: number;
+}
+
 export interface ReviewCodesResponse {
   session_id: string;
   review_codes: Record<ReviewCodeRole, string>;

@@ -1,5 +1,7 @@
 import type {
   CreatedSession,
+  JoinCodeRole,
+  JoinCodesResponse,
   RecordingStatus,
   ReviewCodesResponse,
   SessionListResponse,
@@ -90,6 +92,11 @@ export function createOpClient({ baseUrl, token, fetchImpl }: OpClientOptions) {
       request<RecordingStatus>(sessionPath(sessionId, "/recording/status")),
     reissueUploadCode: (sessionId: string) =>
       request<UploadReissueResponse>(sessionPath(sessionId, "/upload-reissue"), { method: "POST" }),
+    reissueJoinCodes: (sessionId: string, roles: JoinCodeRole[], revokeLive: boolean) =>
+      request<JoinCodesResponse>(sessionPath(sessionId, "/join-codes"), {
+        method: "POST",
+        body: JSON.stringify({ roles, revoke_live: revokeLive }),
+      }),
     regenerateReviewCodes: (sessionId: string) =>
       request<ReviewCodesResponse>(sessionPath(sessionId, "/review-codes"), { method: "POST" }),
   };

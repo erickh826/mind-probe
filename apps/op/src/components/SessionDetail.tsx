@@ -7,12 +7,20 @@ import {
   formatSeconds,
   formatServerTime,
   graceRemainingSeconds,
+  joinReissueNotes,
   labelFor,
   RECORDING_LABELS,
   STATUS_LABELS,
   type ProgressRead,
 } from "../opLogic";
-import type { OperatorSessionRow, RecordingStatus, ReviewCodesResponse, UploadReissueResponse } from "../types";
+import type {
+  JoinCodeRole,
+  JoinCodesResponse,
+  OperatorSessionRow,
+  RecordingStatus,
+  ReviewCodesResponse,
+  UploadReissueResponse,
+} from "../types";
 
 interface SessionDetailProps {
   client: OpClient;
@@ -23,9 +31,17 @@ interface SessionDetailProps {
   progress: { previous?: ProgressRead; current: ProgressRead } | undefined;
   onUploadCode: (sessionId: string, issued: UploadReissueResponse) => void;
   onReviewCodes: (sessionId: string, codes: ReviewCodesResponse) => void;
+  onJoinCodes: (sessionId: string, codes: JoinCodesResponse) => void;
 }
 
-type Confirming = "upload" | "review" | null;
+type Confirming = "upload" | "review" | "join" | null;
+
+const JOIN_ROLE_LABELS: { role: JoinCodeRole; label: string }[] = [
+  { role: "student", label: "學生" },
+  { role: "wizard", label: "Wizard" },
+  { role: "teacher", label: "老師（即時）" },
+];
+const ALL_JOIN_ROLES = JOIN_ROLE_LABELS.map(({ role }) => role);
 
 function describeError(error: unknown): string {
   if (error instanceof OpApiError) {
@@ -44,6 +60,7 @@ export function SessionDetail({
   progress,
   onUploadCode,
   onReviewCodes,
+  onJoinCodes,
 }: SessionDetailProps) {
   const sessionId = row.session_id;
   const [status, setStatus] = useState<RecordingStatus | null>(null);
@@ -51,6 +68,9 @@ export function SessionDetail({
   const [confirming, setConfirming] = useState<Confirming>(null);
   const [actionBusy, setActionBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
+  const [joinRoles, setJoinRoles] = useState<JoinCodeRole[]>(ALL_JOIN_ROLES);
+  const [revokeLive, setRevokeLive] = useState(false);
 
   // The list refresh is the operator's "read again"; follow it here too. A newer
   // read cancels an older one still in flight, so the older cannot land last.
@@ -89,6 +109,47 @@ export function SessionDetail({
       }
       onUploadCode(sessionId, issued);
       setConfirming(null);
+    } catch (error) {
+      if (live()) {
+        setActionError(describeError(error));
+      }
+    } finally {
+      setActionBusy(false);
+    }
+  }
+
+  function startJoinReissue() {
+    setJoinRoles(ALL_JOIN_ROLES);
+    setRevokeLive(false);
+    setActionNotice(null);
+    setConfirming("join");
+  }
+
+  function toggleJoinRole(role: JoinCodeRole) {
+    setJoinRoles((current) =>
+      current.includes(role)
+        ? current.filter((each) => each !== role)
+        : ALL_JOIN_ROLES.filter((each) => each === role || current.includes(each)),
+    );
+  }
+
+  async function reissueJoinCodes() {
+    const live = authTicket();
+    setActionBusy(true);
+    setActionError(null);
+    setActionNotice(null);
+    try {
+      const codes = await client.reissueJoinCodes(sessionId, joinRoles, revokeLive);
+      if (!live()) {
+        return;
+      }
+      onJoinCodes(sessionId, codes);
+      setConfirming(null);
+      setActionNotice(
+        codes.revoke_live
+          ? `已換 join code，並中斷 ${codes.revoked_tokens} 個舊 token 的連線。新碼在左側。`
+          : "已換 join code，新碼在左側。已入場的人不受影響。",
+      );
     } catch (error) {
       if (live()) {
         setActionError(describeError(error));
@@ -194,6 +255,56 @@ export function SessionDetail({
           </button>
         )}
 
+        <h4>Join code</h4>
+        {row.status === "ended" ? (
+          <p className="hint">場次已結束，不能換 join code。</p>
+        ) : confirming === "join" ? (
+          <div className="confirm">
+            <fieldset className="choices">
+              <legend>要換的角色</legend>
+              {JOIN_ROLE_LABELS.map(({ role, label }) => (
+                <label key={role}>
+                  <input
+                    type="checkbox"
+                    checked={joinRoles.includes(role)}
+                    disabled={actionBusy}
+                    onChange={() => toggleJoinRole(role)}
+                  />
+                  {label}
+                </label>
+              ))}
+            </fieldset>
+            <label>
+              <input
+                type="checkbox"
+                checked={revokeLive}
+                disabled={actionBusy}
+                onChange={(event) => setRevokeLive(event.currentTarget.checked)}
+              />
+              同時中斷舊連線（撤銷所選角色目前的 live token）
+            </label>
+            <ul className={revokeLive ? "notes warning" : "notes"}>
+              {joinReissueNotes(joinRoles, revokeLive).map((note) => (
+                <li key={note}>{note}</li>
+              ))}
+            </ul>
+            <button
+              type="button"
+              disabled={actionBusy || joinRoles.length === 0}
+              onClick={reissueJoinCodes}
+            >
+              {actionBusy ? "換碼中…" : revokeLive ? "確定換碼並中斷連線" : "確定換 join code"}
+            </button>
+            <button type="button" className="secondary" disabled={actionBusy} onClick={() => setConfirming(null)}>
+              取消
+            </button>
+          </div>
+        ) : (
+          <button type="button" onClick={startJoinReissue}>
+            重新產生 join code
+          </button>
+        )}
+
         <h4>Review code</h4>
         {confirming === "review" ? (
           <div className="confirm">
@@ -210,6 +321,7 @@ export function SessionDetail({
             重新產生 review code
           </button>
         )}
+        {actionNotice && <p className="hint">{actionNotice}</p>}
         {actionError && <p className="error">{actionError}</p>}
       </div>
     </section>

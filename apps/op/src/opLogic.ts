@@ -1,5 +1,7 @@
 // Pure helpers for the OP page. No DOM, no fetch, so node --test can run them.
 
+import type { JoinCodeRole } from "./types";
+
 /** Mirrors `recording.SESSION_ID_RE`; ids outside it cannot hold a recording. */
 const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
@@ -11,6 +13,7 @@ const ERROR_COPY: Record<string, string> = {
   upload_grace_expired: "場次結束後的補傳寬限期已過，不能再發補傳碼。保留資料並另行處理。",
   upload_reissue_refused: "目前的場次狀態不能發補傳碼。",
   recording_deleted: "此場次的錄影已刪除。",
+  session_ended: "場次已結束，不能再換 join code（結束後也不能用 join code 入場）。",
 };
 
 export function errorMessage(status: number, detail: string): string {
@@ -178,6 +181,28 @@ export function createGeneration() {
 }
 
 export type Generation = ReturnType<typeof createGeneration>;
+
+/** The confirm-step copy for a join-code reissue, in display order. */
+export function joinReissueNotes(roles: JoinCodeRole[], revokeLive: boolean): string[] {
+  const notes = ["所選角色的舊 join code，不論用過與否，都會立即失效。"];
+  const singleConnection = roles.includes("student") || roles.includes("wizard");
+  if (!revokeLive) {
+    notes.push("已入場的人不受影響，可以繼續。");
+    if (singleConnection) {
+      notes.push(
+        "學生和 Wizard 各只能有一個連線：舊裝置 30 秒內仍有心跳時，用新碼的新裝置會被拒絕。舊裝置還連著時要換裝置，請勾選「同時中斷舊連線」。",
+      );
+    }
+    return notes;
+  }
+  notes.push("會立即中斷所選角色目前的連線，舊 token 不能再使用。Review code 和補傳碼不受影響。");
+  if (roles.includes("student")) {
+    notes.push(
+      "撤銷學生連線會中斷錄影。已保存的片段仍可在權限及期限允許時補傳，但錄影可能維持 incomplete；如需重新錄影，請建立新場次。",
+    );
+  }
+  return notes;
+}
 
 export interface AttentionInput {
   status: string;

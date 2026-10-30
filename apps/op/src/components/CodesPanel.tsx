@@ -29,8 +29,8 @@ export function CodesPanel({ sessionId, codes, onForget }: CodesPanelProps) {
       <section className="panel codes">
         <h3>角色碼</h3>
         <p className="hint">
-          這個分頁沒有 {sessionId} 的明文碼。伺服器只存雜湊值，join code 只在建立場次時顯示一次，
-          之後無法再取得。review code 可在下方重新產生；補傳碼可在錄影狀態區發出。
+          這個分頁沒有 {sessionId} 的明文碼。伺服器只存雜湊值，舊碼無法再取得。join code 和
+          review code 可在錄影狀態區重新產生（舊碼隨即失效）；補傳碼也在那裡發出。
         </p>
       </section>
     );

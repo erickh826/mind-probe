@@ -11,6 +11,7 @@ import {
   errorMessage,
   formatSeconds,
   graceRemainingSeconds,
+  joinReissueNotes,
   labelFor,
   nextReads,
   parseServerTime,
@@ -92,6 +93,24 @@ test("server reasons map to operator copy, unknown ones pass through", () => {
   assert.equal(errorMessage(500, "boom"), "boom（HTTP 500）");
   assert.equal(errorMessage(502, ""), "HTTP 502");
   assert.match(errorMessage(0, ""), /連不上伺服器/);
+});
+
+test("join reissue copy warns about live conflicts, and about recording when cutting the student", () => {
+  const keep = joinReissueNotes(["student", "wizard", "teacher"], false);
+  assert.ok(keep.some((note) => /新裝置會被拒絕/.test(note)));
+  assert.ok(!keep.some((note) => /中斷錄影/.test(note)));
+  assert.ok(!joinReissueNotes(["teacher"], false).some((note) => /新裝置會被拒絕/.test(note)));
+
+  const cut = joinReissueNotes(["student"], true);
+  assert.ok(cut.includes(
+    "撤銷學生連線會中斷錄影。已保存的片段仍可在權限及期限允許時補傳，但錄影可能維持 incomplete；如需重新錄影，請建立新場次。",
+  ));
+  assert.ok(cut.some((note) => /Review code 和補傳碼不受影響/.test(note)));
+  assert.ok(!joinReissueNotes(["wizard"], true).some((note) => /中斷錄影/.test(note)));
+});
+
+test("ended sessions get operator copy for a refused reissue", () => {
+  assert.match(errorMessage(409, "session_ended"), /場次已結束/);
 });
 
 test("labels fall back to the raw value", () => {

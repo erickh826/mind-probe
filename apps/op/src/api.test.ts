@@ -64,6 +64,16 @@ test("create posts JSON and session paths are encoded", async () => {
   assert.equal(calls[3].url, "https://api.example/sessions/S1/recording/status");
 });
 
+test("join-code reissue posts the chosen roles and revoke flag", async () => {
+  const { client, calls } = recordingClient(() =>
+    jsonResponse(200, { session_id: "S 1", join_codes: {}, revoke_live: true, revoked_tokens: 1 }),
+  );
+  await client.reissueJoinCodes("S 1", ["student"], true);
+  assert.equal(calls[0].url, "https://api.example/sessions/S%201/join-codes");
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(calls[0].init.body, JSON.stringify({ roles: ["student"], revoke_live: true }));
+});
+
 test("errors carry the server detail, including the 410 object form", async () => {
   const conflict = recordingClient(() => jsonResponse(409, { detail: "upload_grace_expired" }));
   await assert.rejects(conflict.client.reissueUploadCode("S1"), (error: unknown) => {
