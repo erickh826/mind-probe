@@ -8,7 +8,7 @@ const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const ERROR_COPY: Record<string, string> = {
   invalid_operator_token: "Operator token 不正確，或伺服器沒有設定 MINDPROBE_OPERATOR_TOKEN。",
   disk_full: "伺服器磁碟空間不足，已拒絕建立場次。",
-  rate_limited: "操作太頻繁，請稍候一分鐘再試。",
+  rate_limited: "操作太頻繁，請稍候幾分鐘再試。",
   upload_security_revoked: "此場次的上傳權限已因安全原因撤銷，不能發補傳碼。",
   upload_grace_expired: "場次結束後的補傳寬限期已過，不能再發補傳碼。保留資料並另行處理。",
   upload_reissue_refused: "目前的場次狀態不能發補傳碼。",

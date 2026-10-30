@@ -10,6 +10,7 @@ import {
   clearUnauthorizedUploadBlock,
   closeBanner,
   emptyMeta,
+  persistInterrupted,
   persistRecorderLost,
   showUploadCodeEntry,
   uploadWorkChunkCount,
@@ -296,4 +297,40 @@ test("upload code entry is the unfinished take, including finalize with no chunk
     1,
   );
   assert.equal(showUploadCodeEntry(settled, uploadWorkChunkCount([{ terminal: true, terminal_reason: "sequence_conflict" }])), false);
+});
+
+test("a revoked take is lost, keeps its auth block, and stretches over slices stored after the mark", () => {
+  const recording = { ...emptyMeta("S", 0), next_sequence: 2, last_chunk_end_ms: 4_000 };
+  const blocked = notePermanentFailure(recording, "unauthorized");
+  const marked = persistInterrupted(blocked, 10);
+  assert.equal(marked.recorder_state, "lost");
+  assert.equal(marked.finalize_payload?.reason, "recorder_lost");
+  assert.equal(marked.final_sequence, 1);
+  assert.equal(marked.upload_block, "unauthorized");
+  assert.equal(marked.finalize_pending, false, "the auth block must keep finalize stopped");
+  assert.equal(marked.needs_operator, true);
+  assert.equal(persistInterrupted(marked, 20), marked, "nothing new to cover");
+
+  const flushed = { ...marked, next_sequence: 3, last_chunk_end_ms: 6_000 };
+  const stretched = persistInterrupted(flushed, 30);
+  assert.equal(stretched.final_sequence, 2);
+  assert.equal(stretched.finalize_payload?.total_chunks, 3);
+  assert.equal(stretched.finalize_persisted_at, 10, "the finalize clock does not move");
+  assert.equal(stretched.finalize_pending, false);
+
+  // An upload code later lifts only the auth block; the take stays recorder_lost.
+  const reopened = clearUnauthorizedUploadBlock(stretched, 40);
+  assert.equal(reopened.finalize_pending, true);
+  assert.equal(reopened.finalize_payload?.reason, "recorder_lost");
+});
+
+test("a revocation leaves a normal stop and a server-closed take alone", () => {
+  const stopped = persistStop({ ...emptyMeta("S", 0), next_sequence: 2 }, 5);
+  assert.equal(persistInterrupted(stopped, 10), stopped);
+  const closed = {
+    ...persistRecorderLost(emptyMeta("S", 0), 5),
+    next_sequence: 4,
+    server_finalize_state: "incomplete" as const,
+  };
+  assert.equal(persistInterrupted(closed, 10), closed);
 });

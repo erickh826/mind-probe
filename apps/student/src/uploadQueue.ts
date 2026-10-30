@@ -232,6 +232,28 @@ export function persistRecorderLost(meta: RecordingMeta, now: number): Recording
   };
 }
 
+/**
+ * Declare the take lost because its live credential was revoked.
+ *
+ * Applied before the recorder stops and again after its last slice is stored,
+ * so `final_sequence` covers that slice. A normal stop that already landed, or
+ * a recording the server has closed, is left alone. An auth block that stopped
+ * finalize stays in force until an upload code lifts it.
+ */
+export function persistInterrupted(meta: RecordingMeta, now: number): RecordingMeta {
+  if (meta.recorder_state === "stopped" || meta.finalize_confirmed) {
+    return meta;
+  }
+  if (meta.server_finalize_state === "complete" || meta.server_finalize_state === "incomplete") {
+    return meta;
+  }
+  if (meta.recorder_state === "lost" && meta.final_sequence === meta.next_sequence - 1) {
+    return meta;
+  }
+  const lost = { ...persistRecorderLost(meta, now), needs_operator: true };
+  return meta.upload_block ? notePermanentFailure(lost, meta.upload_block) : lost;
+}
+
 /** Reload resumes uploads or declares the take lost. It never starts a recorder. */
 export function planReload(meta: RecordingMeta | null): ReloadPlan {
   if (meta === null) {

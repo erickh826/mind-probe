@@ -27,6 +27,7 @@ import {
   notePermanentFailure,
   permanentBlockMessage,
   permanentUploadBlock,
+  persistInterrupted,
   persistRecorderLost,
   persistStop,
   planReload,
@@ -36,6 +37,7 @@ import {
   type FinalizePayload,
   type RecordingMeta,
   type ServerUploadStatus,
+  type UploadBlock,
 } from "./uploadQueue.ts";
 import type { RecorderStatus } from "./types";
 
@@ -130,6 +132,11 @@ const inFlight = new Set<number>();
 let chunkUploaded: ((sequence: number, timestampMs: number) => void) | null = null;
 let persistChain: Promise<void> = Promise.resolve();
 let stopPromise: Promise<void> = Promise.resolve();
+/** Sessions whose live credential was revoked in this tab. No recorder starts for them again. */
+const revokedSessions = new Set<string>();
+
+const REVOKED_MESSAGE =
+  "此裝置的連線已被撤銷，錄影已停止。已保存的片段仍可在權限及期限允許時用補傳碼上傳，但這段錄影會標記為不完整。";
 
 function db(): Promise<IDBDatabase> {
   databasePromise ??= openRecordingDb();
@@ -146,7 +153,7 @@ function view(): RecordingView {
     pendingCount,
     banner: closeBanner(meta, pendingCount),
     storageWarning: warning,
-    canStart,
+    canStart: canStart && !(boundSession !== null && revokedSessions.has(boundSession)),
   };
 }
 
@@ -511,6 +518,10 @@ function attachRecorder(sessionId: string, recorder: MediaRecorder, stream: Medi
 
 export async function startRecording(sessionId: string): Promise<void> {
   cancelRelease();
+  if (revokedSessions.has(sessionId)) {
+    emit();
+    return;
+  }
   if (active && active.sessionId === sessionId && active.recorder.state !== "inactive") {
     status = "recording";
     emit();
@@ -539,6 +550,13 @@ export async function startRecording(sessionId: string): Promise<void> {
   let stream: MediaStream | null = null;
   try {
     stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    if (revokedSessions.has(sessionId)) {
+      // Revoked while the permission prompt was open: never start capturing.
+      stream.getTracks().forEach((track) => track.stop());
+      status = "idle";
+      emit();
+      return;
+    }
     const again = await readMeta(database, sessionId);
     if (again !== null) {
       stream.getTracks().forEach((track) => track.stop());
@@ -557,12 +575,72 @@ export async function startRecording(sessionId: string): Promise<void> {
     recorder.start(2_000);
     status = "recording";
     ensurePump(sessionId);
+    if (revokedSessions.has(sessionId)) {
+      // Revoked during the meta write above: stop the take that just began.
+      await interruptRecording(sessionId);
+      return;
+    }
   } catch (cause) {
     stream?.getTracks().forEach((track) => track.stop());
     const described = describeMediaError(cause);
     rememberHeldFailure(described.message);
     retryable = described.retryable;
     status = "error";
+  }
+  emit();
+}
+
+/** A 401 that no retry with this live token can get past (ADR-0004 §3). */
+export function isRevokedCredential(cause: unknown): boolean {
+  return cause instanceof ApiError && cause.status === 401 && cause.code === "revoked_session_token";
+}
+
+/**
+ * The socket close reason for a revoked token, at upgrade or mid-session.
+ * `session_ended` is not one: grace uploads continue after a normal end.
+ */
+export function isRevokedCloseReason(reason: string | null): boolean {
+  return reason === "token_revoked";
+}
+
+function blockMessage(sessionId: string, block: UploadBlock): string {
+  return block === "unauthorized" && revokedSessions.has(sessionId)
+    ? REVOKED_MESSAGE
+    : permanentBlockMessage(block);
+}
+
+/**
+ * Stop this tab's take because its live credential was revoked, for example
+ * by an OP join-code reissue with revoke_live. Safe to call more than once.
+ *
+ * The take is written as lost before the recorder stops, so a hung onstop or
+ * a closed tab still reports recorder_lost. onstop extends the declaration
+ * over the last slice. Stored slices and their auth blocks stay as they are,
+ * so an upload code can still send them. A recorder already stopping
+ * normally is left to finish its normal stop.
+ */
+export async function interruptRecording(sessionId: string): Promise<void> {
+  revokedSessions.add(sessionId);
+  retryable = false;
+  const current = active?.sessionId === sessionId ? active : null;
+  if (current && current.recorder.state !== "inactive") {
+    const database = await db();
+    const updated = await updateMeta(database, sessionId, (latest) =>
+      persistInterrupted(latest, Date.now()),
+    );
+    if (updated) {
+      meta = updated;
+    }
+    status = "stopping";
+    try {
+      current.recorder.stop();
+    } catch {
+      // Already stopping. onstop still sees the lost row.
+    }
+    current.stream?.getTracks().forEach((track) => track.stop());
+  }
+  if (boundSession === sessionId) {
+    rememberHeldFailure(REVOKED_MESSAGE);
   }
   emit();
 }
@@ -687,7 +765,11 @@ async function uploadNextChunk(sessionId: string): Promise<void> {
       if (updated) {
         meta = updated;
       }
-      rememberHeldFailure(permanentBlockMessage(block));
+      rememberHeldFailure(blockMessage(sessionId, block));
+      if (isRevokedCredential(cause) && active?.sessionId === sessionId) {
+        // Awaited, so the lost declaration is on disk when this upload returns.
+        await interruptRecording(sessionId);
+      }
     } else {
       const attempts = next.attempts + 1;
       await writeChunk(database, {
@@ -764,7 +846,7 @@ async function sendFinalizeIfDue(sessionId: string): Promise<void> {
     }
     rememberHeldFailure(
       block
-        ? permanentBlockMessage(block)
+        ? blockMessage(sessionId, block)
         : `結束標記送出失敗：${cause instanceof Error ? cause.message : String(cause)}`,
     );
   }
@@ -791,7 +873,9 @@ export async function commitRecorderStop(
   const database = await db();
   const updated = await updateMeta(database, sessionId, (latest) => {
     if (latest.recorder_state === "lost") {
-      return chunkPersistLost ? { ...latest, needs_operator: true } : latest;
+      // A revocation declared the take lost before the recorder flushed its last slice.
+      const kept = revokedSessions.has(sessionId) ? persistInterrupted(latest, now) : latest;
+      return chunkPersistLost ? { ...kept, needs_operator: true } : kept;
     }
     if (lost) {
       const marked = persistRecorderLost(latest, now);
@@ -906,6 +990,7 @@ export async function resetRecordingControllerForTests(
   inFlight.clear();
   persistChain = Promise.resolve();
   stopPromise = Promise.resolve();
+  revokedSessions.clear();
 }
 
 if (typeof window !== "undefined") {

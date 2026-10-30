@@ -10,7 +10,11 @@ import { restoreStudentSession, UNAVAILABLE_RESTORE_MESSAGE } from "./restoreSes
 import { mediaUrl } from "./config";
 import { JoinSessionModal } from "./components/JoinSessionModal";
 import { UploadCodeForm } from "./components/UploadCodeForm";
-import { resumeUnauthorizedUploads } from "./recordingController";
+import {
+  interruptRecording,
+  isRevokedCloseReason,
+  resumeUnauthorizedUploads,
+} from "./recordingController";
 import { findUnfinishedUploadSessions, type UploadRecovery } from "./uploadRecovery";
 import { StudentOverlay } from "./components/StudentOverlay";
 import { SuspectVideoPlayer } from "./components/SuspectVideoPlayer";
@@ -242,6 +246,19 @@ export default function App() {
     autoRecordingAttemptedRef.current = true;
     void recorder.start();
   }, [joined, recorder.start, socket.status]);
+
+  // A revoked live token must stop the camera, not only the reconnects.
+  const liveSessionId = joined && !joined.uploadOnly ? joined.sessionId : null;
+  useEffect(() => {
+    if (
+      liveSessionId === null ||
+      socket.status !== "closed" ||
+      !isRevokedCloseReason(socket.closedReason)
+    ) {
+      return;
+    }
+    void interruptRecording(liveSessionId);
+  }, [liveSessionId, socket.closedReason, socket.status]);
 
   useEffect(() => {
     const previous = previousRecorderStatusRef.current;

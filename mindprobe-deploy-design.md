@@ -151,6 +151,7 @@ Request body 可省略：`{"roles"?: [...], "revoke_live"?: false}`。
 - `revoke_live=true`：只撤銷選定角色經 `/join` 發出的 live token（`token_issued` 審計裡的那些），撤銷原因是 `join_codes_reissued`。這個原因在所有入口都不豁免：REST 回 401 `revoked_session_token`；chunk、finalize 不適用 §7.3 寬限；WS 拒絕升級，既有連線以 4401 `token_revoked` 關閉。同一個 token 之後即使再有 `session_ended` 紀錄，仍以較嚴格的原因為準。**不撤銷** review grant、`typ=upload` token，也**不設定** `upload_grants.security_revoked_at`，所以場次仍符合條件時 OP 可以照常發補傳碼。
 - 原子性：換 hash、清 `consumed_at`、`token_revoked` 紀錄、`join_codes_reissued` 審計在同一個 DB transaction。提交成功後，才依被撤銷的 token hash 逐一關閉連線，因此用新碼加入的連線不會被誤關。join 端在宣告使用某列時，也要求該列仍是這組碼的 hash，所以換碼和 join 同時發生時，舊碼不會搶到新列。
 - 技術暫停：場次進行中時，學生或 Wizard 的連線被切斷超過 `DISCONNECT_GRACE_MS`（2 秒）會照 ADR-0002 §8 自動暫停（`network_failure`），新裝置連上後由 Wizard 手動繼續。
+- 學生端停錄：舊裝置收到 WS 4401 `token_revoked`，或上傳收到 401 `revoked_session_token` 時，會停止 MediaRecorder 和攝影機，把這段錄影在本機標成 `recorder_lost`（停止時最後一段也算進 `final_sequence`），而且這個分頁不再開始錄影，包括撤銷時還在等攝影機權限的情況。已存片段保留，補傳碼仍可上傳，但 finalize 一律帶 `recorder_lost`。`session_ended` 關閉、寬限期內的上傳和其他 401（例如 `upload_grace_expired`）不觸發停錄。
 - 錄影：撤銷學生連線會中斷那台裝置的錄影。已保存的片段仍可在權限和期限允許時用補傳碼補交，但錄影可能維持 `incomplete`，`recorder_lost` 不會因補傳變回 `complete`。需要重新錄影就建立新場次。Phase 1 是一場一段錄影，錄影開始後換學生裝置不是同場繼續錄影的功能（不論是否 `revoke_live`）：新裝置從 sequence 0 開始的片段會和已存片段衝突（409 `sequence_conflict`）。OP 頁在錄影已開始、又選了學生時，一律顯示這項提醒。
 
 回應：`{"session_id", "join_codes": {角色: 明文}, "revoke_live", "revoked_tokens"}`。`join_codes` 只含這次換掉的角色，格式和 `POST /sessions` 相同。明文只回這一次，不進任何 log。
@@ -179,7 +180,7 @@ Token 唯一性：每次 `/join` 發出的 live token 都帶隨機 `jti`，所�
 15. **meta 保留（D10）**：complete 而且確認之後 7 天才清除；pending、incomplete 和 lost 的 meta 過了 7 天仍然保留。
 16. **建立 session 權限（D11）**：wizard 呼叫 `POST /sessions` → 401/403。
 17. **OP 場次列表與分頁**：見上方 `GET /sessions` 合約。非 OP（含 live token，以及帶 `before`）→ 401；`limit` 超出 1–200 → 422；畸形 `before` → 422 `invalid_cursor`；各頁走完每場恰好一次，最後一頁 `next_cursor` 為 null；回應沒有任何碼。
-18. **OP 換 join code**：見上方 `POST /sessions/{id}/join-codes` 合約。非 OP → 401；ended → 409 `session_ended`；壞 body → 422；第 6 次 → 429，且不佔補傳碼額度；舊碼（用過或沒用過）→ 403 `invalid join code`；預設不撤銷，舊 live token 照常可用；`revoke_live` 之後舊 live token 的 REST、chunk → 401、WS 升級拒絕、既有 WS 以 4401 關閉，其他角色、review grant、upload token 不受影響，`security_revoked_at` 仍為空、仍可發補傳碼；新碼加入的連線不被關閉；join 讀到舊碼後、寫入前被換碼 → 403；換碼讀到列之後、寫入之前舊碼的 join 先提交 → 新碼仍未使用且只能用一次（student、wizard 都要測）；同一角色、同一 `client_id`、同一秒重新加入 → 新 token 不同於已撤銷的 token，可用，連線不會被舊 token 的關閉通知波及，舊 token 仍 401；審計只有 hash。
+18. **OP 換 join code**：見上方 `POST /sessions/{id}/join-codes` 合約。非 OP → 401；ended → 409 `session_ended`；壞 body → 422；第 6 次 → 429，且不佔補傳碼額度；舊碼（用過或沒用過）→ 403 `invalid join code`；預設不撤銷，舊 live token 照常可用；`revoke_live` 之後舊 live token 的 REST、chunk → 401、WS 升級拒絕、既有 WS 以 4401 關閉，其他角色、review grant、upload token 不受影響，`security_revoked_at` 仍為空、仍可發補傳碼；新碼加入的連線不被關閉；錄影中撤銷學生 → 舊裝置停錄、本機標成 `recorder_lost`，補傳後仍是 incomplete；join 讀到舊碼後、寫入前被換碼 → 403；換碼讀到列之後、寫入之前舊碼的 join 先提交 → 新碼仍未使用且只能用一次（student、wizard 都要測）；同一角色、同一 `client_id`、同一秒重新加入 → 新 token 不同於已撤銷的 token，可用，連線不會被舊 token 的關閉通知波及，舊 token 仍 401；審計只有 hash。
 
 ## 6. 認證和程式碼改動
 
@@ -400,6 +401,8 @@ R2 CORS 只允許 GET 和 HEAD，`AllowedHeaders: Range`，並 expose `Content-R
 ### 部署過渡 OP 頁（`apps/op`）
 
 上線 OP 前端時，後端必須已經包含 `GET /sessions` 和 §5 的分頁（`before`／`next_cursor`）。頁面登入會呼叫 `GET /sessions`。舊後端沒有這個路由時列表失敗，頁面不能用。只更新前端、不更新後端，不算完成部署。
+
+OP 頁的「重新產生 join code」要後端已有 `POST /sessions/{id}/join-codes`。學生端也要一起更新：舊版學生端被 `revoke_live` 撤銷後只停止重連，錄影器會繼續錄。順序是後端、學生端，再上 OP 頁。
 
 下列項目這份設計裡已經寫過，部署 OP 頁時照做：
 
