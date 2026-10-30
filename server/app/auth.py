@@ -53,6 +53,9 @@ UPLOAD_TOKEN_TTL_SECONDS = 15 * 60
 UPLOAD_ISSUE_LIMIT = 5
 UPLOAD_ISSUE_WINDOW_SECONDS = 10 * 60
 UPLOAD_REDEEM_LIMIT = 5
+#: Join-code reissue has its own budget at the upload-reissue rate.
+JOIN_ISSUE_LIMIT = UPLOAD_ISSUE_LIMIT
+JOIN_ISSUE_WINDOW_SECONDS = UPLOAD_ISSUE_WINDOW_SECONDS
 UPLOAD_REDEEM_WINDOW_SECONDS = 60
 
 
@@ -91,11 +94,13 @@ class SlidingWindowLimiter:
 upload_issue_limiter = SlidingWindowLimiter()
 upload_redeem_limiter = SlidingWindowLimiter()
 review_login_limiter = SlidingWindowLimiter()
+join_issue_limiter = SlidingWindowLimiter()
 
 
 def reset_upload_rate_limits() -> None:
     upload_issue_limiter.reset()
     upload_redeem_limiter.reset()
+    join_issue_limiter.reset()
 
 
 def review_rate_now() -> float:
