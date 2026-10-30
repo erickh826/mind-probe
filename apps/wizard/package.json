@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node --experimental-strip-types --test --test-concurrency=1 src/sessionStart.test.ts"
   },
   "dependencies": {
     "@mind-probe/shared": "file:../../packages/shared",

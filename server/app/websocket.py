@@ -1576,6 +1576,13 @@ async def _handle_message(
         await _send_rejected_ack(websocket, dedup_key, "uncovered_question_requires_wizard")
         return
 
+    if envelope.event_type is EventType.SESSION_STARTED and role != Source.WIZARD.value:
+        # The synchronized start is the Wizard's control. Student and review
+        # roles must not schedule it, create another session, or touch tokens.
+        # Reject before persistence so a refused start leaves no event row.
+        await _send_rejected_ack(websocket, dedup_key, "session_start_requires_wizard")
+        return
+
     start_at_server_ms: int | None = None
     if envelope.event_type is EventType.SESSION_STARTED:
         start_at_server_ms = _monotonic_ms() + 2000
