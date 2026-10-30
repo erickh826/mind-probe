@@ -9,6 +9,7 @@ audit. Review grants, upload tokens and the upload grant are untouched.
 from __future__ import annotations
 
 import json
+import time
 from uuid import uuid4
 
 import pytest
@@ -18,7 +19,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from starlette.websockets import WebSocketDisconnect
 
-from app import auth, models, recording
+from app import auth, models, recording, websocket
 from app.main import app
 from app.models import Base
 from app.websocket import WS_PROTOCOL
@@ -83,8 +84,6 @@ def _join(session_id: str, code: str, client_id: str = "test"):
 
 
 def _token(session_id: str, code: str, client_id: str = "test") -> str:
-    # Live tokens carry no nonce: the same role and client_id in the same
-    # second mint the same token. A new device has its own client_id.
     joined = _join(session_id, code, client_id)
     assert joined.status_code == 200, joined.text
     return joined.json()["access_token"]
@@ -352,9 +351,13 @@ def test_a_join_that_read_the_old_code_cannot_claim_the_reissued_row(monkeypatch
 
     fresh: dict[str, str] = {}
     real_update = models.update
+    started = False
 
     def reissue_in_between(*args, **kwargs):
-        if not fresh:
+        nonlocal started
+        if not started:
+            started = True
+            monkeypatch.setattr(models, "update", real_update)
             other = file_db()
             codes, _revoked = models.reissue_join_codes(
                 other, "S-RACE", (role,), revoke_live=False
@@ -381,3 +384,78 @@ def test_a_join_that_read_the_old_code_cannot_claim_the_reissued_row(monkeypatch
     assert row.consumed_at is None
     assert models.consume_join_code(check, "S-RACE", fresh[role]).role == role
     check.close()
+
+
+@pytest.mark.parametrize("role", ["student", "wizard"])
+def test_an_old_join_that_commits_after_the_reissue_read_does_not_consume_the_new_code(
+    monkeypatch, file_db, role
+):
+    """The other ordering: reissue reads first, the old code's join commits, then reissue writes."""
+    setup = file_db()
+    models.create_session(setup, "S-RACE2", "CASE001")
+    old = models.issue_join_codes(setup, "S-RACE2")
+    setup.close()
+
+    real_update = models.update
+    joined = False
+
+    def join_in_between(*args, **kwargs):
+        nonlocal joined
+        if not joined:
+            joined = True
+            other = file_db()
+            models.consume_join_code(other, "S-RACE2", old[role])
+            other.close()
+        return real_update(*args, **kwargs)
+
+    monkeypatch.setattr(models, "update", join_in_between)
+    issuer = file_db()
+    fresh, _revoked = models.reissue_join_codes(issuer, "S-RACE2", (role,), revoke_live=True)
+    issuer.commit()
+    issuer.close()
+    monkeypatch.setattr(models, "update", real_update)
+    assert joined
+
+    check = file_db()
+    row = check.scalars(
+        select(models.JoinCode)
+        .where(models.JoinCode.session_id == "S-RACE2")
+        .where(models.JoinCode.role == role)
+    ).one()
+    assert row.consumed_at is None, "the new code inherited the old join's consumed_at"
+    assert models.consume_join_code(check, "S-RACE2", fresh[role]).role == role
+    with pytest.raises(models.JoinCodeConsumed):
+        models.consume_join_code(check, "S-RACE2", fresh[role])
+    check.close()
+
+
+def test_same_client_same_second_rejoin_gets_a_fresh_working_token(monkeypatch):
+    fixed = time.time()
+    monkeypatch.setattr(websocket.time, "time", lambda: fixed)
+    session_id, created = _create()
+    wizard = _token(session_id, created["join_codes"]["wizard"], "same-client")
+    old = _token(session_id, created["join_codes"]["student"], "same-client")
+    response = _reissue(session_id, {"roles": ["student"], "revoke_live": True})
+    assert response.status_code == 200, response.text
+    fresh = _token(session_id, response.json()["join_codes"]["student"], "same-client")
+
+    assert models.hash_token(fresh) != models.hash_token(old)
+    assert auth.decode_session_token(fresh)["jti"] != auth.decode_session_token(old)["jti"]
+    assert client.get(f"/sessions/{session_id}", headers=_bearer(old)).status_code == 401
+    assert client.get(f"/sessions/{session_id}", headers=_bearer(fresh)).status_code == 200
+
+    with (
+        client.websocket_connect(f"/ws/{session_id}/wizard", subprotocols=_subprotocols(wizard)) as wiz,
+        client.websocket_connect(f"/ws/{session_id}/student", subprotocols=_subprotocols(fresh)) as new,
+    ):
+        # Re-sending the old token's close notification must not reach the new socket.
+        models.notify_revocations(session_id, [models.hash_token(old)])
+        _ping(new, "fresh-still-up")
+        _ping(wiz, "wizard-still-up")
+
+
+def test_tokens_issued_before_live_jti_still_verify():
+    session_id, _created = _create()
+    legacy = websocket.create_session_token(session_id, "student", client_id="legacy")
+    assert "jti" not in auth.decode_session_token(legacy)
+    assert client.get(f"/sessions/{session_id}", headers=_bearer(legacy)).status_code == 200

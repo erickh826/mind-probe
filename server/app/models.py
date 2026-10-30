@@ -699,6 +699,46 @@ def consume_join_code(
     return join_code
 
 
+_JOIN_CODE_REPLACE_ATTEMPTS = 3
+
+
+def _replace_join_code(
+    db: DBSession, session_id: str, role: str, code_hash: str, now: datetime
+) -> str | None:
+    """Swap one role's code hash in place and return the hash it replaced.
+
+    The UPDATE names every column it resets. An ORM assignment of
+    ``consumed_at = None`` would be dropped when the loaded value was already
+    None, keeping the timestamp of a join that committed after the read, and
+    the new code would start out consumed. The UPDATE is also guarded on the
+    hash it read, so a concurrent reissue makes this retry instead of
+    recording the wrong old hash.
+    """
+    for _ in range(_JOIN_CODE_REPLACE_ATTEMPTS):
+        current = db.execute(
+            select(JoinCode.id, JoinCode.code_hash)
+            .where(JoinCode.session_id == session_id)
+            .where(JoinCode.role == role)
+            .with_for_update()
+        ).first()
+        if current is None:
+            # Sessions from before join codes were stored per role.
+            db.add(
+                JoinCode(session_id=session_id, role=role, code_hash=code_hash, created_at=now)
+            )
+            return None
+        result = db.execute(
+            update(JoinCode)
+            .where(JoinCode.id == current.id)
+            .where(JoinCode.code_hash == current.code_hash)
+            .values(code_hash=code_hash, consumed_at=None, created_at=now)
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount == 1:
+            return current.code_hash
+    raise RuntimeError(f"join code for {role} kept changing during reissue")
+
+
 def reissue_join_codes(
     db: DBSession,
     session_id: str,
@@ -729,27 +769,10 @@ def reissue_join_codes(
             raise ValueError(f"invalid join-code role: {role}")
         raw_code = secrets.token_urlsafe(24)
         code_hash = hash_join_code(raw_code)
-        row = db.scalars(
-            select(JoinCode)
-            .where(JoinCode.session_id == session_id)
-            .where(JoinCode.role == role)
-            .with_for_update()
-        ).first()
-        if row is None:
-            db.add(
-                JoinCode(
-                    session_id=session_id, role=role, code_hash=code_hash, created_at=now
-                )
-            )
-            old_hashes[role] = None
-        else:
-            old_hashes[role] = row.code_hash
-            row.code_hash = code_hash
-            row.consumed_at = None
-            row.created_at = now
+        old_hashes[role] = _replace_join_code(db, session_id, role, code_hash, now)
         codes[role] = raw_code
         new_hashes[role] = code_hash
-    # Write the new hashes before reading issued tokens, so a join that
+    # The new hashes are written before issued tokens are read, so a join that
     # committed first is seen and one that commits later finds its code gone.
     db.flush()
 

@@ -559,10 +559,13 @@ def join_session(
         join_code = models.consume_join_code(
             db, session_id, body.join_code, commit=False
         )
+        # A random jti makes every issuance distinct, so a join in the same
+        # second as a revocation never mints the digest that was just revoked.
         token = websocket.create_session_token(
             session_id=session_id,
             role=join_code.role,
             client_id=body.client_id or "temporary-client-id",
+            jti=str(uuid.uuid4()),
         )
         models.record_audit(
             db,

@@ -157,7 +157,9 @@ Request body 可省略：`{"roles"?: [...], "revoke_live"?: false}`。
 
 審計 `join_codes_reissued`（`actor_role=operator`）：`roles`、`old_code_hashes`、`new_code_hashes`、`revoke_live`、`revoked_tokens`，只存 hash。
 
-已知限制：live token 沒有 nonce，同一角色、同一 `client_id` 在同一秒發出的 token 完全相同。換碼加撤銷之後，新裝置若在同一秒、用同一個 `client_id` 加入，拿到的 token 會等於已撤銷的那個。實際操作不會在一秒內完成這三步。
+Token 唯一性：每次 `/join` 發出的 live token 都帶隨機 `jti`，所以同一角色、同一 `client_id`、同一秒的兩次加入也會拿到不同的 token；換碼撤銷的是舊 token 的 hash，不會波及新 token 或它的連線。這次改動之前發出、沒有 `jti` 的 live token 仍照常驗證，直到過期。live token 的 `jti` 只用來區分 token，不像 review token 那樣對應資料表。
+
+換碼的寫入：`join_codes` 以明確的 SQL UPDATE 一次寫入新 hash、`consumed_at = NULL` 和建立時間，並以讀到的舊 hash 為條件（並行換碼時重讀重試）。不論是「join 先讀、換碼先提交」還是「換碼先讀、舊碼的 join 先提交」，新碼都只能被用一次，而且不會繼承舊碼的使用時間。
 
 **測試清單（每一列都要有）**
 1. 沒有 token → 401；token 格式錯誤或簽章錯誤 → 401；token 過期 → 401 `expired`。
@@ -177,7 +179,7 @@ Request body 可省略：`{"roles"?: [...], "revoke_live"?: false}`。
 15. **meta 保留（D10）**：complete 而且確認之後 7 天才清除；pending、incomplete 和 lost 的 meta 過了 7 天仍然保留。
 16. **建立 session 權限（D11）**：wizard 呼叫 `POST /sessions` → 401/403。
 17. **OP 場次列表與分頁**：見上方 `GET /sessions` 合約。非 OP（含 live token，以及帶 `before`）→ 401；`limit` 超出 1–200 → 422；畸形 `before` → 422 `invalid_cursor`；各頁走完每場恰好一次，最後一頁 `next_cursor` 為 null；回應沒有任何碼。
-18. **OP 換 join code**：見上方 `POST /sessions/{id}/join-codes` 合約。非 OP → 401；ended → 409 `session_ended`；壞 body → 422；第 6 次 → 429，且不佔補傳碼額度；舊碼（用過或沒用過）→ 403 `invalid join code`；預設不撤銷，舊 live token 照常可用；`revoke_live` 之後舊 live token 的 REST、chunk → 401、WS 升級拒絕、既有 WS 以 4401 關閉，其他角色、review grant、upload token 不受影響，`security_revoked_at` 仍為空、仍可發補傳碼；新碼加入的連線不被關閉；join 讀到舊碼後、寫入前被換碼 → 403；審計只有 hash。
+18. **OP 換 join code**：見上方 `POST /sessions/{id}/join-codes` 合約。非 OP → 401；ended → 409 `session_ended`；壞 body → 422；第 6 次 → 429，且不佔補傳碼額度；舊碼（用過或沒用過）→ 403 `invalid join code`；預設不撤銷，舊 live token 照常可用；`revoke_live` 之後舊 live token 的 REST、chunk → 401、WS 升級拒絕、既有 WS 以 4401 關閉，其他角色、review grant、upload token 不受影響，`security_revoked_at` 仍為空、仍可發補傳碼；新碼加入的連線不被關閉；join 讀到舊碼後、寫入前被換碼 → 403；換碼讀到列之後、寫入之前舊碼的 join 先提交 → 新碼仍未使用且只能用一次（student、wizard 都要測）；同一角色、同一 `client_id`、同一秒重新加入 → 新 token 不同於已撤銷的 token，可用，連線不會被舊 token 的關閉通知波及，舊 token 仍 401；審計只有 hash。
 
 ## 6. 認證和程式碼改動
 
