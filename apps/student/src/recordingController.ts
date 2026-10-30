@@ -136,7 +136,7 @@ let stopPromise: Promise<void> = Promise.resolve();
 const revokedSessions = new Set<string>();
 
 const REVOKED_MESSAGE =
-  "此裝置的連線已被撤銷，錄影已停止。已保存的片段仍可在權限及期限允許時用補傳碼上傳，但這段錄影會標記為不完整。";
+  "此裝置的連線已被撤銷，錄影已停止。已保存的片段仍可在權限及期限允許時補傳：重新整理頁面，再輸入老師或管理員提供的補傳碼。這段錄影會標記為不完整。";
 
 function db(): Promise<IDBDatabase> {
   databasePromise ??= openRecordingDb();
@@ -582,10 +582,15 @@ export async function startRecording(sessionId: string): Promise<void> {
     }
   } catch (cause) {
     stream?.getTracks().forEach((track) => track.stop());
-    const described = describeMediaError(cause);
-    rememberHeldFailure(described.message);
-    retryable = described.retryable;
-    status = "error";
+    if (revokedSessions.has(sessionId)) {
+      // The prompt failed after the revocation. Keep the revocation in view, no retry.
+      status = "idle";
+    } else {
+      const described = describeMediaError(cause);
+      rememberHeldFailure(described.message);
+      retryable = described.retryable;
+      status = "error";
+    }
   }
   emit();
 }

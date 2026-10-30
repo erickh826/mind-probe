@@ -428,9 +428,10 @@ export function uploadWorkChunkCount(
 /**
  * Show the upload-code form only when something can still be sent.
  *
- * A pending finalize with an empty chunk list counts. A retained
- * `incomplete` / `recorder_lost` take with nothing left to send does not.
- * The row itself stays in IndexedDB.
+ * A pending finalize with an empty chunk list counts, and so does one that
+ * only an auth failure stopped: the upload code is what lets it be sent. A
+ * retained `incomplete` / `recorder_lost` take with nothing left to send does
+ * not. The row itself stays in IndexedDB.
  */
 export function showUploadCodeEntry(
   meta: RecordingMeta | null,
@@ -442,7 +443,12 @@ export function showUploadCodeEntry(
   if (meta.finalize_confirmed && meta.server_finalize_state === "complete") {
     return false;
   }
-  return meta.finalize_pending || pendingChunkCount > 0;
+  const finalizeHeldByAuth =
+    meta.upload_block === "unauthorized" &&
+    meta.finalize_payload != null &&
+    meta.server_finalize_state !== "complete" &&
+    meta.server_finalize_state !== "incomplete";
+  return meta.finalize_pending || finalizeHeldByAuth || pendingChunkCount > 0;
 }
 
 export function notePermanentFailure(meta: RecordingMeta, block: UploadBlock): RecordingMeta {
