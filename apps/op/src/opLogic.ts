@@ -182,10 +182,18 @@ export function createGeneration() {
 
 export type Generation = ReturnType<typeof createGeneration>;
 
-/** The confirm-step copy for a join-code reissue, in display order. */
-export function joinReissueNotes(roles: JoinCodeRole[], revokeLive: boolean): string[] {
+/**
+ * The confirm-step copy for a join-code reissue, in display order.
+ * `recordingStarted`: the session already has a recording row or stored chunks.
+ */
+export function joinReissueNotes(
+  roles: JoinCodeRole[],
+  revokeLive: boolean,
+  recordingStarted: boolean,
+): string[] {
   const notes = ["所選角色的舊 join code，不論用過與否，都會立即失效。"];
-  const singleConnection = roles.includes("student") || roles.includes("wizard");
+  const student = roles.includes("student");
+  const singleConnection = student || roles.includes("wizard");
   if (!revokeLive) {
     notes.push("已入場的人不受影響，可以繼續。");
     if (singleConnection) {
@@ -193,12 +201,22 @@ export function joinReissueNotes(roles: JoinCodeRole[], revokeLive: boolean): st
         "學生和 Wizard 各只能有一個連線：舊裝置 30 秒內仍有心跳時，用新碼的新裝置會被拒絕。舊裝置還連著時要換裝置，請勾選「同時中斷舊連線」。",
       );
     }
-    return notes;
+  } else {
+    notes.push("會立即中斷所選角色目前的連線，舊 token 不能再使用。Review code 和補傳碼不受影響。");
+    if (singleConnection) {
+      notes.push("場次進行中時，學生或 Wizard 斷線超過 2 秒會自動暫停（network_failure）；新裝置連上後要由 Wizard 繼續。");
+    }
+    if (student) {
+      notes.push(
+        "撤銷學生連線會中斷錄影。已保存的片段仍可在權限及期限允許時補傳，但錄影可能維持 incomplete；如需重新錄影，請建立新場次。",
+      );
+    }
   }
-  notes.push("會立即中斷所選角色目前的連線，舊 token 不能再使用。Review code 和補傳碼不受影響。");
-  if (roles.includes("student")) {
+  if (student && recordingStarted) {
     notes.push(
-      "撤銷學生連線會中斷錄影。已保存的片段仍可在權限及期限允許時補傳，但錄影可能維持 incomplete；如需重新錄影，請建立新場次。",
+      revokeLive
+        ? "錄影已開始：學生換裝置不會接續同一段錄影（Phase 1 一場一段錄影）。"
+        : "錄影已開始：學生換裝置不會接續同一段錄影（Phase 1 一場一段錄影）。如需重新錄影，請建立新場次。",
     );
   }
   return notes;

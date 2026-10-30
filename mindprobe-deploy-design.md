@@ -150,7 +150,8 @@ Request body 可省略：`{"roles"?: [...], "revoke_live"?: false}`。
 - **限制（ADR-0001 單一連線）**：student、wizard 的舊連線 30 秒內仍有心跳時，新裝置的 WebSocket 會被拒絕；舊連線超過 30 秒沒有心跳，新連線才會接管（`connection_takeover` 審計，並通知 `role_connection_replaced`）。舊裝置還連著時，要換裝置就必須 `revoke_live`。
 - `revoke_live=true`：只撤銷選定角色經 `/join` 發出的 live token（`token_issued` 審計裡的那些），撤銷原因是 `join_codes_reissued`。這個原因在所有入口都不豁免：REST 回 401 `revoked_session_token`；chunk、finalize 不適用 §7.3 寬限；WS 拒絕升級，既有連線以 4401 `token_revoked` 關閉。同一個 token 之後即使再有 `session_ended` 紀錄，仍以較嚴格的原因為準。**不撤銷** review grant、`typ=upload` token，也**不設定** `upload_grants.security_revoked_at`，所以場次仍符合條件時 OP 可以照常發補傳碼。
 - 原子性：換 hash、清 `consumed_at`、`token_revoked` 紀錄、`join_codes_reissued` 審計在同一個 DB transaction。提交成功後，才依被撤銷的 token hash 逐一關閉連線，因此用新碼加入的連線不會被誤關。join 端在宣告使用某列時，也要求該列仍是這組碼的 hash，所以換碼和 join 同時發生時，舊碼不會搶到新列。
-- 錄影：撤銷學生連線會中斷那台裝置的錄影。已保存的片段仍可在權限和期限允許時用補傳碼補交，但錄影可能維持 `incomplete`，`recorder_lost` 不會因補傳變回 `complete`。需要重新錄影就建立新場次。Phase 1 是一場一段錄影，錄影開始後換學生裝置不是同場繼續錄影的功能。
+- 技術暫停：場次進行中時，學生或 Wizard 的連線被切斷超過 `DISCONNECT_GRACE_MS`（2 秒）會照 ADR-0002 §8 自動暫停（`network_failure`），新裝置連上後由 Wizard 手動繼續。
+- 錄影：撤銷學生連線會中斷那台裝置的錄影。已保存的片段仍可在權限和期限允許時用補傳碼補交，但錄影可能維持 `incomplete`，`recorder_lost` 不會因補傳變回 `complete`。需要重新錄影就建立新場次。Phase 1 是一場一段錄影，錄影開始後換學生裝置不是同場繼續錄影的功能（不論是否 `revoke_live`）：新裝置從 sequence 0 開始的片段會和已存片段衝突（409 `sequence_conflict`）。OP 頁在錄影已開始、又選了學生時，一律顯示這項提醒。
 
 回應：`{"session_id", "join_codes": {角色: 明文}, "revoke_live", "revoked_tokens"}`。`join_codes` 只含這次換掉的角色，格式和 `POST /sessions` 相同。明文只回這一次，不進任何 log。
 

@@ -180,6 +180,7 @@ export function SessionDetail({
   }
 
   const grace = graceRemainingSeconds(row.upload_grace_ends_at, nowMs);
+  const recordingStarted = row.recording_state !== null || row.stored_sequences > 0;
   const missing = status?.missing_sequences ?? [];
 
   return (
@@ -284,7 +285,7 @@ export function SessionDetail({
               同時中斷舊連線（撤銷所選角色目前的 live token）
             </label>
             <ul className={revokeLive ? "notes warning" : "notes"}>
-              {joinReissueNotes(joinRoles, revokeLive).map((note) => (
+              {joinReissueNotes(joinRoles, revokeLive, recordingStarted).map((note) => (
                 <li key={note}>{note}</li>
               ))}
             </ul>

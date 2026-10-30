@@ -96,17 +96,28 @@ test("server reasons map to operator copy, unknown ones pass through", () => {
 });
 
 test("join reissue copy warns about live conflicts, and about recording when cutting the student", () => {
-  const keep = joinReissueNotes(["student", "wizard", "teacher"], false);
+  const keep = joinReissueNotes(["student", "wizard", "teacher"], false, false);
   assert.ok(keep.some((note) => /新裝置會被拒絕/.test(note)));
-  assert.ok(!keep.some((note) => /中斷錄影/.test(note)));
-  assert.ok(!joinReissueNotes(["teacher"], false).some((note) => /新裝置會被拒絕/.test(note)));
+  assert.ok(!keep.some((note) => /中斷錄影|自動暫停|錄影已開始/.test(note)));
+  assert.ok(!joinReissueNotes(["teacher"], false, false).some((note) => /新裝置會被拒絕/.test(note)));
 
-  const cut = joinReissueNotes(["student"], true);
+  const cut = joinReissueNotes(["student"], true, false);
   assert.ok(cut.includes(
     "撤銷學生連線會中斷錄影。已保存的片段仍可在權限及期限允許時補傳，但錄影可能維持 incomplete；如需重新錄影，請建立新場次。",
   ));
   assert.ok(cut.some((note) => /Review code 和補傳碼不受影響/.test(note)));
-  assert.ok(!joinReissueNotes(["wizard"], true).some((note) => /中斷錄影/.test(note)));
+  assert.ok(cut.some((note) => /自動暫停/.test(note)));
+  assert.ok(!joinReissueNotes(["wizard"], true, false).some((note) => /中斷錄影/.test(note)));
+  assert.ok(!joinReissueNotes(["teacher"], true, false).some((note) => /自動暫停/.test(note)));
+});
+
+test("once recording has started, a student device switch is never sold as the same recording", () => {
+  for (const revokeLive of [false, true]) {
+    const notes = joinReissueNotes(["student"], revokeLive, true);
+    assert.ok(notes.some((note) => /不會接續同一段錄影/.test(note)));
+    assert.ok(notes.some((note) => /請建立新場次/.test(note)));
+  }
+  assert.ok(!joinReissueNotes(["wizard"], false, true).some((note) => /不會接續/.test(note)));
 });
 
 test("ended sessions get operator copy for a refused reissue", () => {
