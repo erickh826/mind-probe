@@ -9,6 +9,8 @@ import {
   applyServerStatus,
   emptyMeta,
   persistRecorderLost,
+  notePermanentFailure,
+  persistInterrupted,
   persistStop,
   type RecordingMeta,
 } from "./uploadQueue.ts";
@@ -82,4 +84,13 @@ test("a retained incomplete take with nothing left to send does not force the up
 
   await save(persistStop(emptyMeta("S-newer", 4_000), 5_000));
   assert.deepEqual(await findUnfinishedUploadSessions(), [{ sessionId: "S-newer" }]);
+});
+
+test("a revoked take whose only remaining work is its blocked finalize is an upload-code entry", async () => {
+  // Every slice reached the server; the recorder_lost finalize got 401 and stopped.
+  const lost = persistInterrupted({ ...emptyMeta("S-revoked-finalize", 1_000), next_sequence: 2 }, 2_000);
+  const blocked = notePermanentFailure(lost, "unauthorized");
+  assert.equal(blocked.finalize_pending, false);
+  await save(blocked);
+  assert.deepEqual(await findUnfinishedUploadSessions(), [{ sessionId: "S-revoked-finalize" }]);
 });

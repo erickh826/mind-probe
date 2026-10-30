@@ -158,8 +158,9 @@ test("a confirmed take still restores after /end", async () => {
   assert.equal(restored.kind, "upload-only");
 });
 
-test("grace expiry and security revocation both drop the saved credential", async () => {
-  for (const label of ["grace-expired", "security-revocation"]) {
+test("grace expiry and every revocation drop the saved credential", async () => {
+  // join-codes-reissued: an OP reissue with revoke_live looks the same to this device.
+  for (const label of ["grace-expired", "security-revocation", "join-codes-reissued"]) {
     const sink = probes({
       fetchSession: async () => {
         throw new ApiError(401, "revoked", "revoked_session_token");

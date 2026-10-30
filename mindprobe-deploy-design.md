@@ -73,9 +73,9 @@ flowchart LR
 
 | Token 類型 | 取得方式 | claims | TTL | 可撤銷 | 用途 |
 |---|---|---|---|---|---|
-| `live`（現有） | `POST /sessions/{id}/join` 加 join code | `typ=live`、`session_id`、`role`、`sub`、`jti` | 2 小時（現有設定） | `end` 時全部撤銷 | 即時 session 中的 REST 和 WS |
+| `live`（現有） | `POST /sessions/{id}/join` 加 join code | `typ=live`、`session_id`、`role`、`sub`、`jti` | 2 小時（現有設定） | `end` 時全部撤銷；OP 換 join code 且 `revoke_live` 時撤銷該角色（§5） | 即時 session 中的 REST 和 WS |
 | `review`（新增，§6.5） | `POST /sessions/{id}/review-login` 加 teacher review code | `typ=review`、`session_id`、`role=teacher\|observer`、`sub`、`jti` | access 30 分鐘；refresh 7 天 | 可以逐一撤銷，也可以整個 session 撤銷 | session 結束後審閱、刪除錄影 |
-| `operator`（新增，暫時方案） | 伺服器 env `MINDPROBE_OPERATOR_TOKEN`（長隨機字串） | 不是 JWT，用常數時間比對 | 手動輪替 | 改 env 就失效 | 建立 session、列出場次（`GET /sessions`，不含明文碼）、讀取建立當下回傳的 join code、手動觸發轉檔；Phase 2 改成 admin 登入 |
+| `operator`（新增，暫時方案） | 伺服器 env `MINDPROBE_OPERATOR_TOKEN`（長隨機字串） | 不是 JWT，用常數時間比對 | 手動輪替 | 改 env 就失效 | 建立 session、列出場次（`GET /sessions`，不含明文碼）、換 join code（`POST /sessions/{id}/join-codes`，可選撤銷該角色的 live token）、讀取建立當下回傳的 join code、手動觸發轉檔；Phase 2 改成 admin 登入 |
 | R2 presigned URL | `GET /sessions/{id}/recording` | — | 15 分鐘 | 不能撤銷（到期才失效） | **只用來下載影片，不是認證憑證** |
 
 所有 token 都會雜湊後寫入資料庫（沿用 `models.hash_token`），只有 hash 會進入 audit。
@@ -93,6 +93,7 @@ flowchart LR
 | `GET /cases/{case_id}/rubric` | 公開 | T、O、OP | live/review/OP | 同上 | ✔ | |
 | `POST /sessions` | 公開，**回傳全部 join code** | OP | OP | — | — | Phase 2 改成 admin |
 | `GET /sessions` | — | **只限 OP** | OP | — | — | 過渡 OP 頁（`apps/op`）。分頁合約見下。不回傳任何碼 |
+| `POST /sessions/{id}/join-codes`（新增） | — | **只限 OP** | OP | — | — | 換 join code，可選撤銷舊 live token。合約見下 |
 | `GET /sessions/{id}` | 公開 | S、W、T、O、OP | live/review/OP | ✔ | ✔ | |
 | `GET /sessions/{id}/events` | 公開 | W、T、O、OP | live/review/OP | ✔ | live：ended豁免；review：一律檢查 | student 不應看到 wizard 的事件 |
 | `POST /sessions/{id}/end` | 公開 | W、T、OP | live/OP | ✔ | ✔ | 結束後會觸發 `finalizing`（§7） |
@@ -131,6 +132,36 @@ flowchart LR
 
 上線這個頁面時，後端必須已經有這個端點和上述分頁。見 §12。
 
+### `POST /sessions/{id}/join-codes` 換碼合約（已依程式與測試實作）
+
+只接受 operator token。沒有 token、錯誤 token、live 或 review token 都是 401；場次不存在是 404。
+
+Request body 可省略：`{"roles"?: [...], "revoke_live"?: false}`。
+
+- `roles`：`student`、`wizard`、`teacher` 的子集，重複的自動去重。省略代表三個都換。空陣列、其他角色（含 `observer`）或多餘欄位回 422。
+- `revoke_live`：預設 `false`。
+
+規則：
+
+- 場次已 ended → 409 `session_ended`（join 本身在 ended 時就拒絕，換碼沒有意義）。
+- 限流：每個場次 10 分鐘 5 次，和補傳碼的額度分開計算，超過回 429 `rate_limited`。
+- 選定角色的 join code 在原列換新 hash、清掉 `consumed_at`；舊場次缺列就補建。舊明文不論用過沒有，立刻得到現有的 403 `invalid join code`。
+- `revoke_live=false`：已發出的 live token 不受影響，已經入場的人繼續。新碼給還沒入場或要換裝置的人。
+- **限制（ADR-0001 單一連線）**：student、wizard 的舊連線 30 秒內仍有心跳時，新裝置的 WebSocket 會被拒絕；舊連線超過 30 秒沒有心跳，新連線才會接管（`connection_takeover` 審計，並通知 `role_connection_replaced`）。舊裝置還連著時，要換裝置就必須 `revoke_live`。
+- `revoke_live=true`：只撤銷選定角色經 `/join` 發出的 live token（`token_issued` 審計裡的那些），撤銷原因是 `join_codes_reissued`。這個原因在所有入口都不豁免：REST 回 401 `revoked_session_token`；chunk、finalize 不適用 §7.3 寬限；WS 拒絕升級，既有連線以 4401 `token_revoked` 關閉。同一個 token 之後即使再有 `session_ended` 紀錄，仍以較嚴格的原因為準。**不撤銷** review grant、`typ=upload` token，也**不設定** `upload_grants.security_revoked_at`，所以場次仍符合條件時 OP 可以照常發補傳碼。
+- 原子性：換 hash、清 `consumed_at`、`token_revoked` 紀錄、`join_codes_reissued` 審計在同一個 DB transaction。提交成功後，才依被撤銷的 token hash 逐一關閉連線，因此用新碼加入的連線不會被誤關。join 端在宣告使用某列時，也要求該列仍是這組碼的 hash，所以換碼和 join 同時發生時，舊碼不會搶到新列。
+- 技術暫停：場次進行中時，學生或 Wizard 的連線被切斷超過 `DISCONNECT_GRACE_MS`（2 秒）會照 ADR-0002 §8 自動暫停（`network_failure`），新裝置連上後由 Wizard 手動繼續。
+- 學生端停錄：舊裝置收到 WS 4401 `token_revoked`，或上傳收到 401 `revoked_session_token` 時，會停止 MediaRecorder 和攝影機，把這段錄影在本機標成 `recorder_lost`（停止時最後一段也算進 `final_sequence`），而且這個分頁不再開始錄影，包括撤銷時還在等攝影機權限的情況。已存片段保留，補傳碼仍可上傳，但 finalize 一律帶 `recorder_lost`。`session_ended` 關閉、寬限期內的上傳和其他 401（例如 `upload_grace_expired`）不觸發停錄。
+- 錄影：撤銷學生連線會中斷那台裝置的錄影。已保存的片段仍可在權限和期限允許時用補傳碼補交，但錄影可能維持 `incomplete`，`recorder_lost` 不會因補傳變回 `complete`。需要重新錄影就建立新場次。Phase 1 是一場一段錄影，錄影開始後換學生裝置不是同場繼續錄影的功能（不論是否 `revoke_live`）：新裝置從 sequence 0 開始的片段會和已存片段衝突（409 `sequence_conflict`）。OP 頁在錄影已開始、又選了學生時，一律顯示這項提醒。
+
+回應：`{"session_id", "join_codes": {角色: 明文}, "revoke_live", "revoked_tokens"}`。`join_codes` 只含這次換掉的角色，格式和 `POST /sessions` 相同。明文只回這一次，不進任何 log。
+
+審計 `join_codes_reissued`（`actor_role=operator`）：`roles`、`old_code_hashes`、`new_code_hashes`、`revoke_live`、`revoked_tokens`，只存 hash。
+
+Token 唯一性：每次 `/join` 發出的 live token 都帶隨機 `jti`，所以同一角色、同一 `client_id`、同一秒的兩次加入也會拿到不同的 token；換碼撤銷的是舊 token 的 hash，不會波及新 token 或它的連線。這次改動之前發出、沒有 `jti` 的 live token 仍照常驗證，直到過期。live token 的 `jti` 只用來區分 token，不像 review token 那樣對應資料表。
+
+換碼的寫入：`join_codes` 以明確的 SQL UPDATE 一次寫入新 hash、`consumed_at = NULL` 和建立時間，並以讀到的舊 hash 為條件（並行換碼時重讀重試）。不論是「join 先讀、換碼先提交」還是「換碼先讀、舊碼的 join 先提交」，新碼都只能被用一次，而且不會繼承舊碼的使用時間。
+
 **測試清單（每一列都要有）**
 1. 沒有 token → 401；token 格式錯誤或簽章錯誤 → 401；token 過期 → 401 `expired`。
 2. token 綁定的 session 和路徑不同 → 401 或 403 `session_token_mismatch`。
@@ -149,6 +180,7 @@ flowchart LR
 15. **meta 保留（D10）**：complete 而且確認之後 7 天才清除；pending、incomplete 和 lost 的 meta 過了 7 天仍然保留。
 16. **建立 session 權限（D11）**：wizard 呼叫 `POST /sessions` → 401/403。
 17. **OP 場次列表與分頁**：見上方 `GET /sessions` 合約。非 OP（含 live token，以及帶 `before`）→ 401；`limit` 超出 1–200 → 422；畸形 `before` → 422 `invalid_cursor`；各頁走完每場恰好一次，最後一頁 `next_cursor` 為 null；回應沒有任何碼。
+18. **OP 換 join code**：見上方 `POST /sessions/{id}/join-codes` 合約。非 OP → 401；ended → 409 `session_ended`；壞 body → 422；第 6 次 → 429，且不佔補傳碼額度；舊碼（用過或沒用過）→ 403 `invalid join code`；預設不撤銷，舊 live token 照常可用；`revoke_live` 之後舊 live token 的 REST、chunk → 401、WS 升級拒絕、既有 WS 以 4401 關閉，其他角色、review grant、upload token 不受影響，`security_revoked_at` 仍為空、仍可發補傳碼；新碼加入的連線不被關閉；錄影中撤銷學生 → 舊裝置停錄、本機標成 `recorder_lost`，補傳後仍是 incomplete；join 讀到舊碼後、寫入前被換碼 → 403；換碼讀到列之後、寫入之前舊碼的 join 先提交 → 新碼仍未使用且只能用一次（student、wizard 都要測）；同一角色、同一 `client_id`、同一秒重新加入 → 新 token 不同於已撤銷的 token，可用，連線不會被舊 token 的關閉通知波及，舊 token 仍 401；審計只有 hash。
 
 ## 6. 認證和程式碼改動
 
@@ -369,6 +401,8 @@ R2 CORS 只允許 GET 和 HEAD，`AllowedHeaders: Range`，並 expose `Content-R
 ### 部署過渡 OP 頁（`apps/op`）
 
 上線 OP 前端時，後端必須已經包含 `GET /sessions` 和 §5 的分頁（`before`／`next_cursor`）。頁面登入會呼叫 `GET /sessions`。舊後端沒有這個路由時列表失敗，頁面不能用。只更新前端、不更新後端，不算完成部署。
+
+OP 頁的「重新產生 join code」要後端已有 `POST /sessions/{id}/join-codes`。學生端也要一起更新：舊版學生端被 `revoke_live` 撤銷後只停止重連，錄影器會繼續錄。順序是後端、學生端，再上 OP 頁。
 
 下列項目這份設計裡已經寫過，部署 OP 頁時照做：
 

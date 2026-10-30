@@ -338,6 +338,15 @@ export default function App() {
                 },
               }))
             }
+            onJoinCodes={(sessionId, codes) =>
+              setHeld((current) => ({
+                ...current,
+                [sessionId]: {
+                  ...current[sessionId],
+                  join: { ...current[sessionId]?.join, ...codes.join_codes },
+                },
+              }))
+            }
             onReviewCodes={(sessionId, codes) =>
               setHeld((current) => ({
                 ...current,

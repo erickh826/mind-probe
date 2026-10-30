@@ -1,16 +1,19 @@
 // Pure helpers for the OP page. No DOM, no fetch, so node --test can run them.
 
+import type { JoinCodeRole } from "./types";
+
 /** Mirrors `recording.SESSION_ID_RE`; ids outside it cannot hold a recording. */
 const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 const ERROR_COPY: Record<string, string> = {
   invalid_operator_token: "Operator token 不正確，或伺服器沒有設定 MINDPROBE_OPERATOR_TOKEN。",
   disk_full: "伺服器磁碟空間不足，已拒絕建立場次。",
-  rate_limited: "操作太頻繁，請稍候一分鐘再試。",
+  rate_limited: "操作太頻繁，請稍候幾分鐘再試。",
   upload_security_revoked: "此場次的上傳權限已因安全原因撤銷，不能發補傳碼。",
   upload_grace_expired: "場次結束後的補傳寬限期已過，不能再發補傳碼。保留資料並另行處理。",
   upload_reissue_refused: "目前的場次狀態不能發補傳碼。",
   recording_deleted: "此場次的錄影已刪除。",
+  session_ended: "場次已結束，不能再換 join code（結束後也不能用 join code 入場）。",
 };
 
 export function errorMessage(status: number, detail: string): string {
@@ -178,6 +181,46 @@ export function createGeneration() {
 }
 
 export type Generation = ReturnType<typeof createGeneration>;
+
+/**
+ * The confirm-step copy for a join-code reissue, in display order.
+ * `recordingStarted`: the session already has a recording row or stored chunks.
+ */
+export function joinReissueNotes(
+  roles: JoinCodeRole[],
+  revokeLive: boolean,
+  recordingStarted: boolean,
+): string[] {
+  const notes = ["所選角色的舊 join code，不論用過與否，都會立即失效。"];
+  const student = roles.includes("student");
+  const singleConnection = student || roles.includes("wizard");
+  if (!revokeLive) {
+    notes.push("已入場的人不受影響，可以繼續。");
+    if (singleConnection) {
+      notes.push(
+        "學生和 Wizard 各只能有一個連線：舊裝置 30 秒內仍有心跳時，用新碼的新裝置會被拒絕。舊裝置還連著時要換裝置，請勾選「同時中斷舊連線」。",
+      );
+    }
+  } else {
+    notes.push("會立即中斷所選角色目前的連線，舊 token 不能再使用。Review code 和補傳碼不受影響。");
+    if (singleConnection) {
+      notes.push("場次進行中時，學生或 Wizard 斷線超過 2 秒會自動暫停（network_failure）；新裝置連上後要由 Wizard 繼續。");
+    }
+    if (student) {
+      notes.push(
+        "撤銷學生連線會中斷錄影。已保存的片段仍可在權限及期限允許時補傳，但錄影可能維持 incomplete；如需重新錄影，請建立新場次。",
+      );
+    }
+  }
+  if (student && recordingStarted) {
+    notes.push(
+      revokeLive
+        ? "錄影已開始：學生換裝置不會接續同一段錄影（Phase 1 一場一段錄影）。"
+        : "錄影已開始：學生換裝置不會接續同一段錄影（Phase 1 一場一段錄影）。如需重新錄影，請建立新場次。",
+    );
+  }
+  return notes;
+}
 
 export interface AttentionInput {
   status: string;

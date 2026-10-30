@@ -232,6 +232,28 @@ export function persistRecorderLost(meta: RecordingMeta, now: number): Recording
   };
 }
 
+/**
+ * Declare the take lost because its live credential was revoked.
+ *
+ * Applied before the recorder stops and again after its last slice is stored,
+ * so `final_sequence` covers that slice. A normal stop that already landed, or
+ * a recording the server has closed, is left alone. An auth block that stopped
+ * finalize stays in force until an upload code lifts it.
+ */
+export function persistInterrupted(meta: RecordingMeta, now: number): RecordingMeta {
+  if (meta.recorder_state === "stopped" || meta.finalize_confirmed) {
+    return meta;
+  }
+  if (meta.server_finalize_state === "complete" || meta.server_finalize_state === "incomplete") {
+    return meta;
+  }
+  if (meta.recorder_state === "lost" && meta.final_sequence === meta.next_sequence - 1) {
+    return meta;
+  }
+  const lost = { ...persistRecorderLost(meta, now), needs_operator: true };
+  return meta.upload_block ? notePermanentFailure(lost, meta.upload_block) : lost;
+}
+
 /** Reload resumes uploads or declares the take lost. It never starts a recorder. */
 export function planReload(meta: RecordingMeta | null): ReloadPlan {
   if (meta === null) {
@@ -406,9 +428,10 @@ export function uploadWorkChunkCount(
 /**
  * Show the upload-code form only when something can still be sent.
  *
- * A pending finalize with an empty chunk list counts. A retained
- * `incomplete` / `recorder_lost` take with nothing left to send does not.
- * The row itself stays in IndexedDB.
+ * A pending finalize with an empty chunk list counts, and so does one that
+ * only an auth failure stopped: the upload code is what lets it be sent. A
+ * retained `incomplete` / `recorder_lost` take with nothing left to send does
+ * not. The row itself stays in IndexedDB.
  */
 export function showUploadCodeEntry(
   meta: RecordingMeta | null,
@@ -420,7 +443,12 @@ export function showUploadCodeEntry(
   if (meta.finalize_confirmed && meta.server_finalize_state === "complete") {
     return false;
   }
-  return meta.finalize_pending || pendingChunkCount > 0;
+  const finalizeHeldByAuth =
+    meta.upload_block === "unauthorized" &&
+    meta.finalize_payload != null &&
+    meta.server_finalize_state !== "complete" &&
+    meta.server_finalize_state !== "incomplete";
+  return meta.finalize_pending || finalizeHeldByAuth || pendingChunkCount > 0;
 }
 
 export function notePermanentFailure(meta: RecordingMeta, block: UploadBlock): RecordingMeta {

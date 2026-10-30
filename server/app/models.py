@@ -151,6 +151,7 @@ JOIN_CODE_ALLOWED_ROLES = frozenset({*JOIN_CODE_ROLES, "observer"})
 # --- Audit actions (ADR-0004 §3) --------------------------------------------
 AUDIT_TOKEN_ISSUED = "token_issued"
 AUDIT_TOKEN_REVOKED = "token_revoked"
+AUDIT_JOIN_CODES_REISSUED = "join_codes_reissued"
 AUDIT_SESSION_PAUSED = "session_paused"
 AUDIT_CONNECTION_TAKEOVER = "connection_takeover"
 AUDIT_UPLOAD_CODE_ISSUED = "upload_code_issued"
@@ -661,19 +662,34 @@ def consume_join_code(
     ).first()
     if join_code is None:
         raise JoinCodeInvalid("invalid join code")
-    if join_code.consumed_at is not None:
-        if join_code.role in ("teacher", "observer"):
-            return join_code
+    reusable = join_code.role in ("teacher", "observer")
+    if join_code.consumed_at is not None and not reusable:
         raise JoinCodeConsumed("join code already consumed")
-    consumed_at = _utcnow()
-    result = db.execute(
+    # Every claim, including a reusable code's repeat use, is an UPDATE that
+    # still matches this code's hash. A concurrent ``reissue_join_codes`` that
+    # replaced the hash after the SELECT above turns the claim into an invalid
+    # code instead of letting the old code claim the new row.
+    claim = (
         update(JoinCode)
         .where(JoinCode.id == join_code.id)
-        .where(JoinCode.consumed_at.is_(None))
-        .values(consumed_at=consumed_at)
+        .where(JoinCode.code_hash == code_hash)
     )
+    if join_code.consumed_at is None:
+        consumed_at = _utcnow()
+        claim = claim.where(JoinCode.consumed_at.is_(None)).values(consumed_at=consumed_at)
+    else:
+        consumed_at = join_code.consumed_at
+        claim = claim.values(consumed_at=JoinCode.consumed_at)
+    result = db.execute(claim)
     if result.rowcount != 1:
         db.rollback()
+        still_valid = db.scalars(
+            select(JoinCode.id)
+            .where(JoinCode.session_id == session_id)
+            .where(JoinCode.code_hash == code_hash)
+        ).first()
+        if still_valid is None:
+            raise JoinCodeInvalid("invalid join code")
         raise JoinCodeConsumed("join code already consumed")
     join_code.consumed_at = consumed_at
     if commit:
@@ -681,6 +697,117 @@ def consume_join_code(
     else:
         db.flush()
     return join_code
+
+
+_JOIN_CODE_REPLACE_ATTEMPTS = 3
+
+
+def _replace_join_code(
+    db: DBSession, session_id: str, role: str, code_hash: str, now: datetime
+) -> str | None:
+    """Swap one role's code hash in place and return the hash it replaced.
+
+    The UPDATE names every column it resets. An ORM assignment of
+    ``consumed_at = None`` would be dropped when the loaded value was already
+    None, keeping the timestamp of a join that committed after the read, and
+    the new code would start out consumed. The UPDATE is also guarded on the
+    hash it read, so a concurrent reissue makes this retry instead of
+    recording the wrong old hash.
+    """
+    for _ in range(_JOIN_CODE_REPLACE_ATTEMPTS):
+        current = db.execute(
+            select(JoinCode.id, JoinCode.code_hash)
+            .where(JoinCode.session_id == session_id)
+            .where(JoinCode.role == role)
+            .with_for_update()
+        ).first()
+        if current is None:
+            # Sessions from before join codes were stored per role.
+            db.add(
+                JoinCode(session_id=session_id, role=role, code_hash=code_hash, created_at=now)
+            )
+            return None
+        result = db.execute(
+            update(JoinCode)
+            .where(JoinCode.id == current.id)
+            .where(JoinCode.code_hash == current.code_hash)
+            .values(code_hash=code_hash, consumed_at=None, created_at=now)
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount == 1:
+            return current.code_hash
+    raise RuntimeError(f"join code for {role} kept changing during reissue")
+
+
+def reissue_join_codes(
+    db: DBSession,
+    session_id: str,
+    roles: tuple[str, ...],
+    *,
+    revoke_live: bool,
+) -> tuple[dict[str, str], list[str]]:
+    """Replace the join codes for ``roles``; with ``revoke_live``, revoke their live tokens.
+
+    Enlists in the caller's transaction and does not commit. The new hashes,
+    the cleared ``consumed_at``, every ``token_revoked`` row and the
+    ``join_codes_reissued`` audit land together or not at all. Returns the raw
+    codes, shown to the operator once, and the revoked token digests. The
+    caller closes those sockets only after its commit succeeds.
+
+    Revocation covers only live tokens that ``/join`` issued for these roles
+    (their ``token_issued`` audits). Review grants, upload tokens and the
+    session's upload grant are untouched, and the reason is never
+    ``security``, so upload recovery stays available.
+    """
+    _require_session(db, session_id)
+    now = _utcnow()
+    codes: dict[str, str] = {}
+    old_hashes: dict[str, str | None] = {}
+    new_hashes: dict[str, str] = {}
+    for role in roles:
+        if role not in JOIN_CODE_ROLES:
+            raise ValueError(f"invalid join-code role: {role}")
+        raw_code = secrets.token_urlsafe(24)
+        code_hash = hash_join_code(raw_code)
+        old_hashes[role] = _replace_join_code(db, session_id, role, code_hash, now)
+        codes[role] = raw_code
+        new_hashes[role] = code_hash
+    # The new hashes are written before issued tokens are read, so a join that
+    # committed first is seen and one that commits later finds its code gone.
+    db.flush()
+
+    revoked: list[str] = []
+    if revoke_live:
+        already = revoked_token_hashes(db, session_id)
+        for token_hash in issued_token_hashes(db, session_id, roles=roles):
+            if token_hash in already:
+                continue
+            record_audit(
+                db,
+                action=AUDIT_TOKEN_REVOKED,
+                actor_role="operator",
+                session_id=session_id,
+                token_hash=token_hash,
+                details={"reason": REVOKE_REASON_JOIN_CODES_REISSUED},
+                commit=False,
+            )
+            already.add(token_hash)
+            revoked.append(token_hash)
+    record_audit(
+        db,
+        action=AUDIT_JOIN_CODES_REISSUED,
+        actor_role="operator",
+        session_id=session_id,
+        details={
+            "roles": list(roles),
+            "old_code_hashes": old_hashes,
+            "new_code_hashes": new_hashes,
+            "revoke_live": revoke_live,
+            "revoked_tokens": len(revoked),
+        },
+        commit=False,
+    )
+    return codes, revoked
 
 
 def upload_security_revoked(db: DBSession, session_id: str) -> bool:
@@ -1171,17 +1298,24 @@ def record_audit(
     return entry
 
 
-def issued_token_hashes(db: DBSession, session_id: str) -> list[str]:
-    """Return token digests issued for a session, preserving issue order."""
+def issued_token_hashes(
+    db: DBSession, session_id: str, *, roles: tuple[str, ...] | None = None
+) -> list[str]:
+    """Return live token digests issued for a session, preserving issue order.
+
+    ``roles`` narrows to the tokens ``/join`` issued for those roles.
+    """
     seen: set[str] = set()
     hashes: list[str] = []
-    rows = db.scalars(
+    stmt = (
         select(AuditLog.token_hash)
         .where(AuditLog.session_id == session_id)
         .where(AuditLog.action == AUDIT_TOKEN_ISSUED)
         .where(AuditLog.token_hash.is_not(None))
-        .order_by(AuditLog.id)
-    ).all()
+    )
+    if roles is not None:
+        stmt = stmt.where(AuditLog.actor_role.in_(roles))
+    rows = db.scalars(stmt.order_by(AuditLog.id)).all()
     for token_hash in rows:
         if token_hash is not None and token_hash not in seen:
             seen.add(token_hash)
@@ -1249,6 +1383,9 @@ def revoke_session_tokens(
 
 REVOKE_REASON_SESSION_ENDED = "session_ended"
 REVOKE_REASON_SECURITY = "security"
+#: OP replaced a role's join code and chose to cut that role's live tokens.
+#: Exempt nowhere: no ended exemption and no grace upload.
+REVOKE_REASON_JOIN_CODES_REISSUED = "join_codes_reissued"
 
 
 def token_revocation_reason(
@@ -1264,11 +1401,20 @@ def token_revocation_reason(
     ).all()
     if not rows:
         return None
-    # Any security revocation wins over a later session_ended one.
+    # Any security revocation wins, and any other non-ended reason wins over
+    # session_ended, so a stricter revocation never inherits the ended exemption.
     reasons = {(row.details or {}).get("reason") for row in rows}
     if REVOKE_REASON_SECURITY in reasons:
         return REVOKE_REASON_SECURITY
-    return REVOKE_REASON_SESSION_ENDED if REVOKE_REASON_SESSION_ENDED in reasons else str(next(iter(reasons)))
+    stricter = sorted(str(reason) for reason in reasons if reason != REVOKE_REASON_SESSION_ENDED)
+    return stricter[0] if stricter else REVOKE_REASON_SESSION_ENDED
+
+
+def notify_revocations(session_id: str, token_hashes: list[str]) -> None:
+    """Close the sockets of exactly these token digests. Call after the commit."""
+    for token_hash in token_hashes:
+        # Close reason is the wire code, not the audit detail.
+        _notify_revocation(session_id, token_hash, "token_revoked")
 
 
 def revoke_token_hash(

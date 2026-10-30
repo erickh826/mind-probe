@@ -26,6 +26,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse
@@ -289,6 +290,20 @@ class JoinSessionRequest(BaseModel):
     )
 
 
+class JoinCodeReissueRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    roles: list[Literal["student", "wizard", "teacher"]] | None = Field(
+        default=None,
+        min_length=1,
+        description="Roles to reissue; omitted means student, wizard and teacher.",
+    )
+    revoke_live: bool = Field(
+        default=False,
+        description="Also revoke these roles' live tokens and close their sockets.",
+    )
+
+
 class UploadLoginRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -544,10 +559,13 @@ def join_session(
         join_code = models.consume_join_code(
             db, session_id, body.join_code, commit=False
         )
+        # A random jti makes every issuance distinct, so a join in the same
+        # second as a revocation never mints the digest that was just revoked.
         token = websocket.create_session_token(
             session_id=session_id,
             role=join_code.role,
             client_id=body.client_id or "temporary-client-id",
+            jti=str(uuid.uuid4()),
         )
         models.record_audit(
             db,
@@ -691,6 +709,49 @@ def upload_reissue(
     payload["upload_code"] = raw_code
     payload["expires_at"] = expires_at.isoformat()
     return payload
+
+
+@app.post("/sessions/{session_id}/join-codes")
+def reissue_join_codes(
+    session_id: str,
+    body: JoinCodeReissueRequest | None = None,
+    _actor: auth.Actor = Depends(auth.require_operator),
+    db: DBSession = Depends(get_db),
+) -> dict:
+    """Replace join codes. Operator token only; plaintext is returned once.
+
+    Old codes for these roles stop working at once (403 ``invalid join code``),
+    used or not. Live tokens are kept unless ``revoke_live``. With it, the
+    roles' live tokens are revoked in the same transaction as the new codes
+    and the audit, and only those tokens' sockets close, after the commit.
+    """
+    request = body or JoinCodeReissueRequest()
+    roles = tuple(dict.fromkeys(request.roles)) if request.roles else models.JOIN_CODE_ROLES
+    session = _load_session_or_404(db, session_id)
+    if session.status == "ended":
+        raise HTTPException(status_code=409, detail="session_ended")
+    if not auth.join_issue_limiter.allow(
+        session_id,
+        limit=auth.JOIN_ISSUE_LIMIT,
+        window_s=auth.JOIN_ISSUE_WINDOW_SECONDS,
+        now=auth.upload_rate_now(),
+    ):
+        raise HTTPException(status_code=429, detail="rate_limited")
+    try:
+        codes, revoked = models.reissue_join_codes(
+            db, session_id, roles, revoke_live=request.revoke_live
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    models.notify_revocations(session_id, revoked)
+    return {
+        "session_id": session_id,
+        "join_codes": codes,
+        "revoke_live": request.revoke_live,
+        "revoked_tokens": len(revoked),
+    }
 
 
 @app.post("/sessions/{session_id}/upload-login")
