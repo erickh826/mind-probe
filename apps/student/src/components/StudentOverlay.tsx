@@ -17,6 +17,23 @@ function statusLabel(value: string): string {
   return value.replace(/_/g, " ");
 }
 
+/** What the student should know about the connection, if anything. */
+function connectionNotice(socket: StudentSocket): string | null {
+  if (socket.admitted) {
+    return null;
+  }
+  switch (socket.notice) {
+    case "occupied":
+      return "此場次的學生端已有另一個裝置連線中，約 30 秒後自動再試。這段期間不能開始錄影。";
+    case "unavailable":
+      return "伺服器暫時無法確認場次狀態，稍後自動再試。";
+    case "ended":
+      return "場次已結束。";
+    default:
+      return null;
+  }
+}
+
 export function StudentOverlay({
   socket,
   recorder,
@@ -53,6 +70,7 @@ export function StudentOverlay({
           <p className="eyebrow">Session</p>
           <strong>{socket.session.session_state}</strong>
           {socket.closedReason ? <span>{socket.closedReason}</span> : null}
+          {connectionNotice(socket) ? <span>{connectionNotice(socket)}</span> : null}
         </div>
         <div>
           <p className="eyebrow">Playback</p>

@@ -1,17 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ADMISSION_TIMEOUT_MS,
   controlMessageType,
   isEventEnvelope,
   isWebSocketControlMessage,
   readAccessToken,
+  SocketLifecycle,
   websocketSubprotocols,
 } from "@mind-probe/shared";
 import type {
   AnyEventEnvelope,
   BaseEventPayload,
+  CloseKind,
   EventAckMessage,
   EventType,
   SessionSnapshotMessage,
+  SocketEffects,
 } from "@mind-probe/shared";
 import { sessionSocketUrl } from "./config";
 import { INITIAL_SESSION_VIEW, STUDENT_ROLE } from "./types";
@@ -26,12 +30,10 @@ import type {
 const PING_INTERVAL_MS = 10_000;
 const PONG_WAIT_MS = 5_000;
 const MAX_MISSED_HEARTBEATS = 3;
-const BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
 const CLOCK_SYNC_SAMPLES = 9;
 const CLOCK_SYNC_KEEP_LOWEST = 5;
 const CLOCK_SYNC_SPACING_MS = 120;
 const MAX_LOG_ENTRIES = 80;
-const TERMINAL_CLOSE_CODES = new Set([4400, 4401, 4403, 4404, 4409]);
 
 const REVISION_BUMPING_EVENTS = new Set<EventType>([
   "session_started",
@@ -66,6 +68,14 @@ export interface AckView {
 
 export interface StudentSocket {
   status: ConnectionStatus;
+  /**
+   * The server admitted this tab: its first snapshot arrived on the current
+   * socket. An open transport alone is not enough -- refusals (4429, 1013)
+   * are accepted and then closed. Recording may start only while this holds.
+   */
+  admitted: boolean;
+  /** Why the tab is not admitted, or why it was closed for good. */
+  notice: CloseKind | null;
   closedReason: string | null;
   session: SessionView;
   clock: ClockState;
@@ -110,6 +120,7 @@ export function useStudentSocket(
 ): StudentSocket {
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [closedReason, setClosedReason] = useState<string | null>(null);
+  const [notice, setNotice] = useState<CloseKind | null>(null);
   const [session, setSession] = useState<SessionView>(INITIAL_SESSION_VIEW);
   const [clock, setClock] = useState<ClockState>({
     offset_ms: null,
@@ -122,10 +133,12 @@ export function useStudentSocket(
   const [log, setLog] = useState<ConsoleLogEntry[]>([]);
 
   const socketRef = useRef<WebSocket | null>(null);
-  const shouldReconnectRef = useRef(false);
-  const reconnectAttemptRef = useRef(0);
   const reconnectTimerRef = useRef<number | null>(null);
-  const hasConnectedOnceRef = useRef(false);
+  const admissionTimerRef = useRef<number | null>(null);
+  /** Set while the current socket is admitted; events are sent only then. */
+  const admittedRef = useRef(false);
+  /** Called with the id of the socket a `session_snapshot` arrived on. */
+  const admitRef = useRef<((socketId: number) => void) | null>(null);
 
   const pingTimerRef = useRef<number | null>(null);
   const pongTimersRef = useRef(new Map<string, number>());
@@ -204,7 +217,7 @@ export function useStudentSocket(
           ? eventPayload.event_id
           : `${sessionId}:${STUDENT_ROLE}:${sequence}`;
 
-      if (!rawSend(envelope)) {
+      if (!admittedRef.current || !rawSend(envelope)) {
         appendLog("warn", `${eventType} not sent: socket is offline.`);
         return;
       }
@@ -510,7 +523,7 @@ export function useStudentSocket(
     pongTimersRef.current.clear();
   }, []);
 
-  const startHeartbeat = useCallback(() => {
+  const startHeartbeat = useCallback((onTimeout: () => void) => {
     clearHeartbeat();
     missedPongsRef.current = 0;
     pingTimerRef.current = window.setInterval(() => {
@@ -523,7 +536,8 @@ export function useStudentSocket(
         missedPongsRef.current += 1;
         if (missedPongsRef.current >= MAX_MISSED_HEARTBEATS) {
           appendLog("error", "Heartbeat timeout; reconnecting.");
-          socketRef.current?.close();
+          // Do not wait for onclose: on a silent network it can come very late.
+          onTimeout();
         } else {
           setStatus("degraded");
         }
@@ -545,7 +559,7 @@ export function useStudentSocket(
   }, []);
 
   const handleMessage = useCallback(
-    (raw: string) => {
+    (raw: string, socketId: number) => {
       let parsed: unknown;
       try {
         parsed = JSON.parse(raw);
@@ -564,6 +578,8 @@ export function useStudentSocket(
             handleAck(parsed as EventAckMessage);
             return;
           case "session_snapshot":
+            // The first snapshot on a socket is its admission.
+            admitRef.current?.(socketId);
             applySnapshot(parsed as SessionSnapshotMessage);
             return;
           case "clock_sync_response":
@@ -624,10 +640,9 @@ export function useStudentSocket(
       return;
     }
 
-    shouldReconnectRef.current = true;
-    reconnectAttemptRef.current = 0;
-    hasConnectedOnceRef.current = false;
     let disposed = false;
+    const lifecycle = new SocketLifecycle();
+    admittedRef.current = false;
 
     const token = accessToken ?? readAccessToken(sessionId);
     if (!token) {
@@ -636,34 +651,99 @@ export function useStudentSocket(
       return;
     }
 
+    const clearAdmissionTimer = () => {
+      if (admissionTimerRef.current !== null) {
+        window.clearTimeout(admissionTimerRef.current);
+        admissionTimerRef.current = null;
+      }
+    };
+
+    const apply = (socket: WebSocket, socketId: number, effects: SocketEffects) => {
+      if (effects.status !== undefined) {
+        setStatus(effects.status);
+      }
+      if (effects.closedReason !== undefined) {
+        setClosedReason(effects.closedReason);
+      }
+      if (effects.notice !== undefined) {
+        setNotice(effects.notice);
+      }
+      if (effects.sendHello) {
+        requestSnapshot();
+      }
+      if (effects.admitted) {
+        clearAdmissionTimer();
+        admittedRef.current = true;
+        replayAfterSnapshotRef.current = true;
+        appendLog("info", "WebSocket admitted.");
+        startClockSync();
+        startHeartbeat(() => apply(socket, socketId, lifecycle.timedOut(socketId)));
+      }
+      if (effects.detach || effects.reconnectInMs !== undefined || effects.stop) {
+        clearHeartbeat();
+        clearAdmissionTimer();
+        admittedRef.current = false;
+      }
+      if (effects.detach) {
+        socket.onopen = null;
+        socket.onmessage = null;
+        socket.onerror = null;
+        socket.onclose = null;
+        socket.close();
+        if (socketRef.current === socket) {
+          socketRef.current = null;
+        }
+      }
+      if (effects.reconnectInMs !== undefined) {
+        const delay = effects.reconnectInMs;
+        appendLog(
+          "warn",
+          effects.notice === "occupied"
+            ? `Another device holds the student role; retrying in ${delay / 1000}s.`
+            : `Connection lost; retrying in ${delay / 1000}s.`,
+        );
+        reconnectTimerRef.current = window.setTimeout(connect, delay);
+      }
+      if (effects.stop) {
+        appendLog("error", `Connection closed: ${effects.closedReason ?? "unknown"}.`);
+      }
+    };
+
     const connect = () => {
-      if (disposed || !shouldReconnectRef.current) {
+      reconnectTimerRef.current = null;
+      if (disposed) {
         return;
       }
-      setStatus(hasConnectedOnceRef.current ? "reconnecting" : "connecting");
+      const { id: socketId, status: nextStatus } = lifecycle.begin();
+      setStatus(nextStatus);
       const socket = new WebSocket(sessionSocketUrl(sessionId), websocketSubprotocols(token));
       socketRef.current = socket;
 
+      admitRef.current = (admittedId: number) => {
+        if (admittedId === socketId) {
+          apply(socket, socketId, lifecycle.snapshot(socketId));
+        }
+      };
+
       socket.onopen = () => {
-        if (disposed) {
+        if (disposed || !lifecycle.isCurrent(socketId)) {
           socket.close();
           return;
         }
-        hasConnectedOnceRef.current = true;
-        reconnectAttemptRef.current = 0;
-        setStatus("open");
-        setClosedReason(null);
-        replayAfterSnapshotRef.current = true;
-        appendLog("info", "WebSocket connected.");
-        requestSnapshot();
-        startClockSync();
-        startHeartbeat();
+        // Not admitted yet: a refusal is accepted too, then closed at once.
+        appendLog("info", "WebSocket open; waiting for the session snapshot.");
+        admissionTimerRef.current = window.setTimeout(() => {
+          admissionTimerRef.current = null;
+          apply(socket, socketId, lifecycle.timedOut(socketId));
+        }, ADMISSION_TIMEOUT_MS);
+        apply(socket, socketId, lifecycle.opened(socketId));
       };
 
       socket.onmessage = (event) => {
-        if (typeof event.data === "string") {
-          handleMessage(event.data);
+        if (!lifecycle.isCurrent(socketId) || typeof event.data !== "string") {
+          return;
         }
+        handleMessage(event.data, socketId);
       };
 
       socket.onerror = () => {
@@ -671,28 +751,13 @@ export function useStudentSocket(
       };
 
       socket.onclose = (event) => {
-        clearHeartbeat();
-        socketRef.current = null;
-        if (disposed) {
+        if (disposed || !lifecycle.isCurrent(socketId)) {
           return;
         }
-        if (TERMINAL_CLOSE_CODES.has(event.code)) {
-          shouldReconnectRef.current = false;
-          setStatus("closed");
-          setClosedReason(event.reason || String(event.code));
-          appendLog("error", `Connection refused (${event.code}): ${event.reason || "unknown"}.`);
-          return;
+        if (socketRef.current === socket) {
+          socketRef.current = null;
         }
-        if (!shouldReconnectRef.current) {
-          setStatus("closed");
-          return;
-        }
-        const attempt = reconnectAttemptRef.current;
-        const delay = BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)];
-        reconnectAttemptRef.current = attempt + 1;
-        setStatus("reconnecting");
-        appendLog("warn", `Connection lost; retrying in ${delay / 1000}s.`);
-        reconnectTimerRef.current = window.setTimeout(connect, delay);
+        apply(socket, socketId, lifecycle.closed(socketId, event.code, event.reason));
       };
     };
 
@@ -700,8 +765,11 @@ export function useStudentSocket(
 
     return () => {
       disposed = true;
-      shouldReconnectRef.current = false;
+      lifecycle.dispose();
+      admittedRef.current = false;
+      admitRef.current = null;
       clearHeartbeat();
+      clearAdmissionTimer();
       if (reconnectTimerRef.current !== null) {
         window.clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
@@ -731,6 +799,8 @@ export function useStudentSocket(
   return useMemo(
     () => ({
       status,
+      admitted: status === "open" || status === "degraded",
+      notice,
       closedReason,
       session,
       clock,
@@ -750,6 +820,7 @@ export function useStudentSocket(
       currentClipId,
       lastAck,
       log,
+      notice,
       pendingCount,
       sendChunkUploaded,
       sendClipEnded,

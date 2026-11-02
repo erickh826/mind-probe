@@ -62,6 +62,21 @@ export interface ServerUploadStatus {
   finalize_state: ServerFinalizeState;
   recording_state: string;
   received_sequences: number[];
+  /** The session already has its one take, maybe before any chunk (D3). */
+  take_claimed?: boolean;
+}
+
+/**
+ * Whether the session's single take already exists on the server. A server
+ * from before claims reports no `take_claimed`; a chunk or a finalize still
+ * proves a take.
+ */
+export function takeAlreadyStarted(status: ServerUploadStatus): boolean {
+  return (
+    status.take_claimed === true ||
+    status.received_sequences.length > 0 ||
+    status.finalize_state !== "none"
+  );
 }
 
 export type ReloadPlan =
@@ -252,6 +267,27 @@ export function persistInterrupted(meta: RecordingMeta, now: number): RecordingM
   }
   const lost = { ...persistRecorderLost(meta, now), needs_operator: true };
   return meta.upload_block ? notePermanentFailure(lost, meta.upload_block) : lost;
+}
+
+/**
+ * Declare the take lost because another device took the student role over
+ * (close 4409 role_connection_replaced).
+ *
+ * Same guards as `persistInterrupted`, but the live token is still valid: no
+ * operator flag and no upload block, so the stored slices keep uploading and
+ * the finalize goes out with `recorder_lost` on its own.
+ */
+export function persistReplaced(meta: RecordingMeta, now: number): RecordingMeta {
+  if (meta.recorder_state === "stopped" || meta.finalize_confirmed) {
+    return meta;
+  }
+  if (meta.server_finalize_state === "complete" || meta.server_finalize_state === "incomplete") {
+    return meta;
+  }
+  if (meta.recorder_state === "lost" && meta.final_sequence === meta.next_sequence - 1) {
+    return meta;
+  }
+  return persistRecorderLost(meta, now);
 }
 
 /** Reload resumes uploads or declares the take lost. It never starts a recorder. */

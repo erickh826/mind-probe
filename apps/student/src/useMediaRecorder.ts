@@ -10,6 +10,7 @@ import {
   stopRecording,
   subscribe,
   type RecordingView,
+  type TakeState,
 } from "./recordingController";
 import type { RecorderStatus } from "./types";
 import type { CloseBanner } from "./uploadQueue";
@@ -29,6 +30,8 @@ export interface StudentRecorder {
   banner: CloseBanner;
   storageWarning: string | null;
   canStart: boolean;
+  /** Whether the server says this session's take is free; only `free` auto-starts. */
+  takeCheck: TakeState;
   start: () => Promise<void>;
   stop: () => void;
   retryFailed: () => void;
@@ -85,6 +88,7 @@ export function useMediaRecorder({
     banner: view.banner,
     storageWarning: view.storageWarning,
     canStart: view.canStart,
+    takeCheck: view.takeCheck,
     start,
     stop: stopRecording,
     retryFailed: () => {

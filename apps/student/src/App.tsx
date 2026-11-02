@@ -14,6 +14,8 @@ import {
   interruptRecording,
   isRevokedCloseReason,
   resumeUnauthorizedUploads,
+  setSocketAdmitted,
+  stopReplacedRecording,
 } from "./recordingController";
 import { findUnfinishedUploadSessions, type UploadRecovery } from "./uploadRecovery";
 import { StudentOverlay } from "./components/StudentOverlay";
@@ -234,21 +236,45 @@ export default function App() {
     };
   }, [restorePending, joined]);
 
+  const liveSessionId = joined && !joined.uploadOnly ? joined.sessionId : null;
+
+  // Only an admitted socket may start a take: an open transport is not
+  // admission, and neither is holding a live token. The controller checks
+  // this itself, so its camera retry loop is gated too.
+  useEffect(() => {
+    if (liveSessionId === null) {
+      return;
+    }
+    setSocketAdmitted(liveSessionId, socket.admitted);
+    return () => setSocketAdmitted(liveSessionId, false);
+  }, [liveSessionId, socket.admitted]);
+
+  // Auto-start once, and only when every gate holds. The attempt is not used
+  // up while the socket is unadmitted or the take check has not answered.
   useEffect(() => {
     if (
       joined === null ||
       joined.restoredFromStorage ||
-      socket.status !== "open" ||
+      !socket.admitted ||
+      recorder.takeCheck !== "free" ||
+      !recorder.canStart ||
       autoRecordingAttemptedRef.current
     ) {
       return;
     }
     autoRecordingAttemptedRef.current = true;
     void recorder.start();
-  }, [joined, recorder.start, socket.status]);
+  }, [joined, recorder.canStart, recorder.start, recorder.takeCheck, socket.admitted]);
+
+  // Another device took the student role over: stop this take, keep uploading.
+  useEffect(() => {
+    if (liveSessionId === null || socket.status !== "closed" || socket.notice !== "replaced") {
+      return;
+    }
+    void stopReplacedRecording(liveSessionId);
+  }, [liveSessionId, socket.notice, socket.status]);
 
   // A revoked live token must stop the camera, not only the reconnects.
-  const liveSessionId = joined && !joined.uploadOnly ? joined.sessionId : null;
   useEffect(() => {
     if (
       liveSessionId === null ||
@@ -357,7 +383,9 @@ export default function App() {
           void recorder.start();
         }}
         onStopRecording={recorder.stop}
-        allowStartRecording={!joined.restoredFromStorage && recorder.canStart}
+        allowStartRecording={
+          !joined.restoredFromStorage && recorder.canStart && socket.admitted
+        }
       />
     </div>
   );
