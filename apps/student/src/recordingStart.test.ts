@@ -475,3 +475,72 @@ test("a replaced tab stops as recorder_lost and keeps uploading with its live to
   await startRecording(sessionId);
   assert.equal(env.prompts, 1, "the replaced tab never records again");
 });
+
+async function holdLockElsewhere(sessionId: string): Promise<() => void> {
+  let release: () => void = () => {};
+  const held = new Promise<void>((granted) => {
+    void navigator.locks.request(`mindprobe-recorder:${sessionId}`, () => {
+      granted();
+      return new Promise<void>((done) => (release = done));
+    });
+  });
+  await held;
+  return () => release();
+}
+
+async function heldLocks(): Promise<string[]> {
+  const snapshot = await navigator.locks.query();
+  return (snapshot.held ?? []).map((lock) => lock.name ?? "");
+}
+
+test("a duplicated tab does not declare another tab's live take lost", async () => {
+  install();
+  const sessionId = "S-dup-tab";
+  const database = await openRecordingDb();
+  try {
+    const { emptyMeta } = await import("./uploadQueue.ts");
+    const { writeMeta } = await import("./recordingDb.ts");
+    await writeMeta(database, emptyMeta(sessionId, 1));
+  } finally {
+    database.close();
+  }
+  const release = await holdLockElsewhere(sessionId);
+  await bindSession(sessionId);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal((await load(sessionId))?.recorder_state, "recording", "still the other tab's live take");
+  assert.match(recordingView().error ?? "", /另一個分頁錄影/);
+  assert.equal(recordingView().canStart, false);
+
+  // The other tab is gone without a stop: now the take really is lost.
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 3_300));
+  assert.equal((await load(sessionId))?.recorder_state, "lost");
+});
+
+test("a start while another tab holds the take never writes or records", async () => {
+  const env = install();
+  const sessionId = "S-dup-start";
+  const release = await holdLockElsewhere(sessionId);
+  try {
+    await admitted(sessionId);
+    await startRecording(sessionId);
+    assert.equal(FakeRecorder.instances.length, 0);
+    assert.equal(env.tracks[0].stopped, true);
+    assert.equal(await load(sessionId), null);
+    assert.match(recordingView().error ?? "", /另一個分頁錄影/);
+  } finally {
+    release();
+  }
+});
+
+test("the recording tab holds the lock until its take is declared", async () => {
+  install();
+  const sessionId = "S-lock-held";
+  await admitted(sessionId);
+  await startRecording(sessionId);
+  assert.ok((await heldLocks()).includes(`mindprobe-recorder:${sessionId}`));
+  FakeRecorder.instances[0].stop();
+  await recorderStopPromiseForTests();
+  assert.ok(!(await heldLocks()).includes(`mindprobe-recorder:${sessionId}`));
+  assert.equal((await load(sessionId))?.recorder_state, "stopped");
+});

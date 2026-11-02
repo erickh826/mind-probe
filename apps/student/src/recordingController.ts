@@ -166,6 +166,14 @@ let startTask: Promise<void> | null = null;
 let takeCheck: { sessionId: string; state: TakeState } | null = null;
 const CLAIM_ATTEMPTS = 3;
 const CLAIM_RETRY_MS = 500;
+/**
+ * Held by the tab whose recorder owns a session's take, for as long as it may
+ * write it. Tabs share IndexedDB: without this a duplicated tab reconciling
+ * the same meta would declare the live take lost and finalize it.
+ */
+const RECORDER_LOCK_PREFIX = "mindprobe-recorder:";
+const OTHER_TAB_RECHECK_MS = 3_000;
+let releaseRecorderLock: (() => void) | null = null;
 
 const REVOKED_MESSAGE =
   "此裝置的連線已被撤銷，錄影已停止。已保存的片段仍可在權限及期限允許時補傳：重新整理頁面，再輸入老師或管理員提供的補傳碼。這段錄影會標記為不完整。";
@@ -179,6 +187,53 @@ const SESSION_ENDED_MESSAGE = "場次已結束，無法開始錄影。";
 const UNAUTHORIZED_MESSAGE = "此裝置的登入已失效，無法開始錄影。請重新加入場次。";
 const CLAIM_FAILED_MESSAGE = "無法向伺服器確認開始錄影，請再按一次 Start REC。";
 const START_FAILED_MESSAGE = "錄影器無法啟動，請再按一次 Start REC";
+const OTHER_TAB_MESSAGE = "此場次正在另一個分頁錄影。請回到那個分頁，不要在這裡重新開始。";
+
+function webLocks(): LockManager | null {
+  return typeof navigator !== "undefined" && navigator.locks ? navigator.locks : null;
+}
+
+/** Take the recorder lock for this tab. False when another tab holds it. */
+function holdRecorderLock(sessionId: string): Promise<boolean> {
+  const locks = webLocks();
+  if (locks === null) {
+    return Promise.resolve(true);
+  }
+  dropRecorderLock();
+  return new Promise<boolean>((resolve) => {
+    void locks
+      .request(RECORDER_LOCK_PREFIX + sessionId, { ifAvailable: true }, (lock) => {
+        if (lock === null) {
+          resolve(false);
+          return undefined;
+        }
+        resolve(true);
+        return new Promise<void>((release) => {
+          releaseRecorderLock = release;
+        });
+      })
+      .catch(() => resolve(true));
+  });
+}
+
+function dropRecorderLock(): void {
+  releaseRecorderLock?.();
+  releaseRecorderLock = null;
+}
+
+/** Whether another tab's recorder holds this session's take right now. */
+async function recorderHeldElsewhere(sessionId: string): Promise<boolean> {
+  const locks = webLocks();
+  if (locks === null) {
+    return false;
+  }
+  try {
+    const snapshot = await locks.query();
+    return (snapshot.held ?? []).some((lock) => lock.name === RECORDER_LOCK_PREFIX + sessionId);
+  } catch {
+    return false;
+  }
+}
 
 function newTakeId(): string {
   return typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
@@ -238,9 +293,25 @@ export function setSocketAdmitted(sessionId: string, admitted: boolean): void {
     meta === null &&
     currentTakeState() === "unknown"
   ) {
-    void checkTake(sessionId).then(() => emit());
+    void checkTake(sessionId).then(() => {
+      showClaimedElsewhere(sessionId);
+      emit();
+    });
   }
   emit();
+}
+
+/** A fresh tab learned the take exists: say so, rather than just hiding Start REC. */
+function showClaimedElsewhere(sessionId: string): void {
+  if (
+    boundSession === sessionId &&
+    meta === null &&
+    pendingTake?.sessionId !== sessionId &&
+    takeCheck?.sessionId === sessionId &&
+    takeCheck.state === "claimed"
+  ) {
+    lockAlreadyClaimed(sessionId);
+  }
 }
 
 function emit(): void {
@@ -426,12 +497,29 @@ async function reconcile(sessionId: string, now: number): Promise<void> {
     canStart = true;
     if (admittedSessions.has(sessionId) && currentTakeState() === "unknown") {
       await checkTake(sessionId);
+      showClaimedElsewhere(sessionId);
       emit();
     }
     return;
   }
-  const recorderStillHere =
-    active?.sessionId === sessionId && active.recorder.state !== "inactive";
+  const recorderHere = active?.sessionId === sessionId && active.recorder.state !== "inactive";
+  // A duplicated tab shares this meta. While the tab that records it holds
+  // the lock, its take is alive, not lost; look again once the lock is free.
+  const recordingElsewhere =
+    !recorderHere && current.recorder_state === "recording" && (await recorderHeldElsewhere(sessionId));
+  if (recordingElsewhere) {
+    meta = current;
+    canStart = false;
+    status = "idle";
+    rememberHeldFailure(OTHER_TAB_MESSAGE);
+    setTimeout(() => {
+      if (boundSession === sessionId) {
+        void reconcile(sessionId, Date.now()).then(() => emit());
+      }
+    }, OTHER_TAB_RECHECK_MS);
+    return;
+  }
+  const recorderStillHere = recorderHere;
   try {
     const serverStatus = await transport.fetchUploadStatus(sessionId);
     const chunks = await listChunks(database, sessionId);
@@ -753,6 +841,14 @@ async function startRecordingOnce(sessionId: string): Promise<void> {
     return;
   }
   takeCheck = { sessionId, state: "claimed" };
+  if (!(await holdRecorderLock(sessionId))) {
+    // Another tab of this browser is recording this take already.
+    stopTracks(stream);
+    canStart = false;
+    holdStartRefusal(OTHER_TAB_MESSAGE);
+    emit();
+    return;
+  }
 
   let recorder: MediaRecorder;
   let created: RecordingMeta;
@@ -763,6 +859,7 @@ async function startRecordingOnce(sessionId: string): Promise<void> {
     await writeMeta(database, created);
   } catch (cause) {
     // Nothing was captured. The claim is kept and this tab may retry it.
+    dropRecorderLock();
     stopTracks(stream);
     rememberHeldFailure(`${START_FAILED_MESSAGE}（${String(cause)}）`);
     status = "error";
@@ -816,6 +913,7 @@ async function abandonUnstartedRecorder(
     active = null;
   }
   await persistChain.catch(() => undefined);
+  dropRecorderLock();
   const database = await db();
   const removed = await deleteUnstartedMeta(
     database,
@@ -1298,6 +1396,8 @@ export function handleRecorderStop(sessionId: string, stream: MediaStream | null
       rememberHeldFailure(`無法保存結束標記：${String(cause)}`);
     })
     .finally(() => {
+      // The take is declared; another tab may now judge it.
+      dropRecorderLock();
       emit();
     });
 }
@@ -1378,6 +1478,7 @@ export async function resetRecordingControllerForTests(
   pendingTake = null;
   startTask = null;
   takeCheck = null;
+  dropRecorderLock();
 }
 
 if (typeof window !== "undefined") {
