@@ -379,6 +379,17 @@ class ConnectionManager:
         self._disconnected_since[session_id].pop(role, None)
         return replaced
 
+    def holds_role(self, session_id: str, role: str, token_hash: str) -> bool:
+        """Whether a socket admitted with this token holds ``role`` right now.
+
+        A live token alone does not prove the device is the admitted one: a
+        replaced device keeps a valid token, and so does one refused 4429.
+        """
+        return any(
+            info.token_hash == token_hash
+            for info in self._connections.get(session_id, {}).get(role, [])
+        )
+
     def disconnect(self, session_id: str, role: str, ws: WebSocket) -> None:
         conns = self._connections.get(session_id, {}).get(role, [])
         remaining = [c for c in conns if c.websocket is not ws]

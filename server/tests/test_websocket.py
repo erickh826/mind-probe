@@ -1016,6 +1016,37 @@ def test_database_failure_at_upgrade_is_retryable_1013(monkeypatch):
     )
 
 
+def test_database_failure_on_a_live_socket_closes_1013_without_applying_the_frame(
+    monkeypatch,
+):
+    # The per-frame recheck fails closed: no ACK, nothing stored, and the
+    # client may come back once the database answers again.
+    session_id = _fresh_session_id()
+    token = create_session_token(session_id, "wizard")
+    real_get_session = models.get_session
+
+    def broken(*_args, **_kwargs):
+        raise SQLAlchemyError("database is locked")
+
+    with _connect_subprotocol(session_id, "wizard", token) as wizard:
+        wizard.send_json({"type": "ping", "ping_id": "admitted", "client_timestamp_ms": 0})
+        assert wizard.receive_json()["ping_id"] == "admitted"
+        monkeypatch.setattr(models, "get_session", broken)
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            wizard.send_json(_note(1, "evt-during-outage"))
+            wizard.receive_json()
+        assert exc_info.value.code == 1013
+        assert exc_info.value.reason == "session_state_unavailable"
+
+    monkeypatch.setattr(models, "get_session", real_get_session)
+    assert _stored_events(session_id) == []
+    with _connect_subprotocol(session_id, "wizard", token) as again:
+        again.send_json(_note(2, "evt-after-outage"))
+        ack = again.receive_json()
+        assert ack["status"] == "accepted"
+        assert ack["event_id"] == "evt-after-outage"
+
+
 def test_accepted_event_is_persisted_to_sqlite():
     session_id = _fresh_session_id()
     with _connect(session_id, "wizard") as wizard:

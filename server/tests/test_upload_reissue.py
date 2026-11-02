@@ -232,6 +232,7 @@ def test_upload_routes_accept_live_and_upload_tokens(client, chunk_root):
         "final_sequence",
         "finalize_state",
         "recording_state",
+        "take_claimed",
     }
     stored = _upload(client, session_id, upload, 0, EBML)
     assert stored.status_code == 200, stored.text

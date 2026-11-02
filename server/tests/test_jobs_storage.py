@@ -731,13 +731,18 @@ def test_additive_migration_preserves_legacy_row(env):
     take(factory)
     # Simulate the actual predecessor schema by removing only this batch's columns.
     with models.engine.begin() as conn:
-        for column in ("recording_key", "recording_sha256", "manifest", "deleted_by", "deleted_at"):
+        for column in (
+            "recording_key", "recording_sha256", "manifest", "deleted_by", "deleted_at",
+            "take_id", "claimed_at",
+        ):
             conn.exec_driver_sql(f"ALTER TABLE recordings DROP COLUMN {column}")
     models.init_db()
     models.init_db()  # idempotent startup
     with factory() as db:
         rec = models.get_recording(db, "TAKE")
         assert rec.final_sequence == 0 and rec.recording_key is None
+        # A take started before claims existed has no take id; it still counts.
+        assert rec.take_id is None and rec.claimed_at is None
 
 
 def test_s3_adapter_checks_metadata_and_presigns_without_network(tmp_path, monkeypatch):

@@ -16,6 +16,7 @@ from uuid import uuid4
 import pytest
 import uvicorn
 from sqlalchemy import create_engine
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from websockets.exceptions import ConnectionClosed
@@ -104,3 +105,48 @@ def test_revoked_token_reaches_the_browser_as_4401_token_revoked(base_url):
     with models.session_scope() as db:
         models.revoke_token_hash(db, session_id, models.hash_token(token))
     assert _refusal(base_url, session_id, "student", token) == (4401, "token_revoked")
+
+
+def _broken(*_args, **_kwargs):
+    raise SQLAlchemyError("database is locked")
+
+
+def test_database_failure_reaches_the_browser_as_retryable_1013(base_url, monkeypatch):
+    session_id = _session_id()
+    token = create_session_token(session_id, "wizard")
+    real_get_session = models.get_session
+
+    # Live socket: the frame that hits the outage is closed, not applied.
+    with _open(base_url, session_id, "wizard", token) as ws:
+        ws.send('{"type": "ping", "ping_id": "admitted", "client_timestamp_ms": 0}')
+        assert "admitted" in ws.recv(timeout=5)
+        monkeypatch.setattr(models, "get_session", _broken)
+        ws.send(
+            '{"sequence": 1, "client_timestamp_ms": 0, "event_type": "observer_note",'
+            ' "payload": {"event_id": "evt-during-outage", "note": "x"}}'
+        )
+        with pytest.raises(ConnectionClosed) as closed:
+            ws.recv(timeout=5)
+    assert closed.value.rcvd is not None
+    assert (closed.value.rcvd.code, closed.value.rcvd.reason) == (
+        1013,
+        "session_state_unavailable",
+    )
+
+    # Upgrade during the outage: still a visible, retryable refusal.
+    assert _refusal(base_url, session_id, "wizard", token) == (
+        1013,
+        "session_state_unavailable",
+    )
+
+    # The outage ends: the same token is admitted again.
+    monkeypatch.setattr(models, "get_session", real_get_session)
+    with _open(base_url, session_id, "wizard", token) as ws:
+        ws.send(
+            '{"sequence": 2, "client_timestamp_ms": 0, "event_type": "observer_note",'
+            ' "payload": {"event_id": "evt-after-outage", "note": "x"}}'
+        )
+        assert '"accepted"' in ws.recv(timeout=5)
+    with models.session_scope() as db:
+        stored = [e.payload.get("event_id") for e in models.load_events(db, session_id)]
+    assert stored == ["evt-after-outage"]

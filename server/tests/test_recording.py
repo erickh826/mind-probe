@@ -656,6 +656,7 @@ def test_status_endpoint_reports_completeness(client, db, chunk_root):
         "final_sequence",
         "finalize_state",
         "recording_state",
+        "take_claimed",
     }
     assert body["received_sequences"] == [0, 1, 3]
     assert body["next_expected_sequence"] == 2

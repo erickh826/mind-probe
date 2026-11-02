@@ -938,6 +938,51 @@ class FinalizeRequest(BaseModel):
         return self
 
 
+class ClaimRequest(BaseModel):
+    """A new take's id, made up by the tab that wants to start recording."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    take_id: str = Field(pattern=r"^[A-Za-z0-9_-]{8,64}$")
+
+
+@router.post("/{session_id}/claim")
+def claim_recording(
+    session_id: str,
+    body: ClaimRequest,
+    actor: auth.Actor = Depends(
+        auth.require_roles("student", ended_exempt=True, allowed_typs=("live",))
+    ),
+    db: DBSession = Depends(get_db),
+) -> dict:
+    """Claim the session's one take before the recorder starts (D3).
+
+    Called after the camera is granted and before ``MediaRecorder.start()``,
+    so a refused camera never uses up the take. Errors, in order:
+
+    - 401 ``revoked_session_token`` (and the other token failures) from auth;
+      an ended session's token passes auth only to be told 409 below.
+    - 409 ``session_ended``: nothing more may be recorded.
+    - 409 ``role_not_admitted``: this token does not hold the student socket
+      (refused 4429, replaced 4409, or not connected). Nothing is written.
+    - 409 ``recording_already_claimed``: the take exists already.
+    """
+    from . import websocket
+
+    try:
+        validate_session_id(session_id)
+    except InvalidSessionId as exc:
+        raise _invalid_session_id_response(exc) from exc
+    session = models.get_session(db, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="unknown session")
+    if session.status == "ended":
+        raise HTTPException(status_code=409, detail="session_ended")
+    if not websocket.manager.holds_role(session_id, "student", actor.token_hash):
+        raise HTTPException(status_code=409, detail="role_not_admitted")
+    return recording_integrity.claim_take(db, session_id, body.take_id)
+
+
 @router.get("/{session_id}/status")
 def recording_status(
     session_id: str,
@@ -950,7 +995,10 @@ def recording_status(
     ),
     db: DBSession = Depends(get_db),
 ) -> dict:
-    """Student upload progress. Five fields, no paths or checksums (ADR-0005 §5).
+    """Student upload progress. Six fields, no paths or checksums (ADR-0005 §5).
+
+    ``take_claimed`` says the session already has its one take, even before
+    a first chunk; a fresh device must not start another (D3).
 
     Teachers, observers, and operators use ``GET /sessions/{id}/recording/status``.
     """

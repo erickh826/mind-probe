@@ -418,6 +418,12 @@ class Recording(Base):
     manifest: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     deleted_by: Mapped[str | None] = mapped_column(String, nullable=True)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    #: Set by ``POST /recording/{id}/claim`` before the recorder starts, so a
+    #: second device sees the take even before its first chunk arrives. The
+    #: id only makes a lost-response retry idempotent; it is not a credential.
+    #: Rows written by older clients (first chunk, finalize, /end) leave it NULL.
+    take_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class Job(Base):
@@ -480,6 +486,7 @@ def init_db() -> None:
         additions = {
             "recording_key": "TEXT", "recording_sha256": "TEXT", "manifest": "JSON",
             "deleted_by": "TEXT", "deleted_at": "DATETIME",
+            "take_id": "TEXT", "claimed_at": "DATETIME",
         }
         with engine.begin() as conn:
             columns = {c["name"] for c in inspect(conn).get_columns("recordings")}
