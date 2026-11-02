@@ -1,9 +1,9 @@
 // REST calls the Wizard console makes against the Session Server.
 //
 // Exchange a join code for a Bearer token (ADR-0005), read which case a
-// session runs, and load that case's three-tier decision tree
-// (spec §12, `wizard_decision_tree.json`). The token from `/join` is stored
-// in memory and sessionStorage and sent as `Authorization: Bearer`.
+// session runs, end that session, and load that case's three-tier decision
+// tree (spec §12, `wizard_decision_tree.json`). The token from `/join` is
+// stored in memory and sessionStorage and sent as `Authorization: Bearer`.
 
 import type { Role } from "@mind-probe/shared";
 import { currentAccessToken, rememberAccessToken } from "@mind-probe/shared";
@@ -114,9 +114,7 @@ export interface SessionInfo {
   status: string;
 }
 
-/** `GET /sessions/{id}` — used to discover which case the session runs. */
-export async function fetchSession(sessionId: string): Promise<SessionInfo> {
-  const body = await request(`/sessions/${encodeURIComponent(sessionId)}`);
+function parseSessionInfo(body: unknown, sessionId: string): SessionInfo {
   if (!isRecord(body)) {
     throw new ApiError(500, "session 回應格式不正確");
   }
@@ -125,6 +123,46 @@ export async function fetchSession(sessionId: string): Promise<SessionInfo> {
     case_id: String(body.case_id ?? ""),
     status: String(body.status ?? "unknown"),
   };
+}
+
+/** `GET /sessions/{id}` — used to discover which case the session runs. */
+export async function fetchSession(sessionId: string): Promise<SessionInfo> {
+  const body = await request(`/sessions/${encodeURIComponent(sessionId)}`);
+  return parseSessionInfo(body, sessionId);
+}
+
+/**
+ * `POST /sessions/{id}/end` — the operator / wizard / teacher end route.
+ *
+ * Uses the Wizard join Bearer token already attached by {@link request}.
+ * The server ends the session, revokes live tokens, and closes sockets with
+ * `session_ended`. It does not stop the student's recorder.
+ */
+export async function endSession(sessionId: string): Promise<SessionInfo> {
+  const body = await request(`/sessions/${encodeURIComponent(sessionId)}/end`, {
+    method: "POST",
+  });
+  return parseSessionInfo(body, sessionId);
+}
+
+/** Traditional Chinese message for a failed {@link endSession} call. */
+export function endSessionErrorMessage(cause: unknown): string {
+  if (!(cause instanceof ApiError)) {
+    return `無法結束場次：${String(cause)}`;
+  }
+  if (cause.status === 0) {
+    return cause.message;
+  }
+  if (cause.status === 401) {
+    return "無法結束場次：憑證已失效或場次已結束";
+  }
+  if (cause.status === 403) {
+    return "無法結束場次：此角色不能結束場次";
+  }
+  if (cause.status === 404) {
+    return "無法結束場次：找不到場次";
+  }
+  return `無法結束場次：${cause.message}`;
 }
 
 /**

@@ -96,7 +96,9 @@ Copy `.env.example` to `.env` (mode 600) on the host before a real deploy. `.env
 
 ### Vercel
 
-Each frontend (`apps/student`, `apps/wizard`, `apps/teacher`) has a `vercel.json` with the SPA rewrite, Content-Security-Policy, and Permissions-Policy from the deploy design. Point the Vercel project root at that app directory and leave `"@mind-probe/shared": "file:../../packages/shared"` unchanged. Set `VITE_API_BASE_URL` and `VITE_MEDIA_BASE_URL` on the project (placeholders are in `.env.example`). The CSP allows the trial hosts `*.sslip.io`, `*.r2.dev`, and `*.r2.cloudflarestorage.com` (path-style presigned URLs). Add the real origin to those directives before moving the API or media onto a custom domain.
+Each frontend (`apps/student`, `apps/wizard`, `apps/teacher`, `apps/op`) has a `vercel.json` with the SPA rewrite, Content-Security-Policy, and Permissions-Policy from the deploy design. Point the Vercel project root at that app directory and leave `"@mind-probe/shared": "file:../../packages/shared"` unchanged. Set `VITE_API_BASE_URL` and `VITE_MEDIA_BASE_URL` on the project (placeholders are in `.env.example`). The OP app does not read `VITE_MEDIA_BASE_URL`; its production build still fails when `VITE_API_BASE_URL` is unset. The CSP allows the trial hosts `*.sslip.io`, `*.r2.dev`, and `*.r2.cloudflarestorage.com` (path-style presigned URLs). Add the real origin to those directives before moving the API or media onto a custom domain.
+
+Deploying `apps/op` requires a backend that already serves operator-only `GET /sessions` with the `before` / `next_cursor` pagination in [`mindprobe-deploy-design.md`](mindprobe-deploy-design.md) §5. An older backend makes that list fail. Add the OP origin to `MINDPROBE_CORS_ORIGINS`. The Vercel project, CORS allowlist, and `VITE_API_BASE_URL` are the same kinds of settings §11 and §12 already call for. A Teacher Preview that was never given `VITE_API_BASE_URL` is existing Preview configuration, not something the OP page introduces.
 
 ## 架構決策記錄（ADR）
 

@@ -60,7 +60,7 @@ from sqlalchemy.pool import StaticPool
 
 os.environ.setdefault("MINDPROBE_WS_TOKEN_SECRET", "test-m1-e2e-secret")
 
-from app import cases, models, recording, websocket as websocket_module
+from app import auth, cases, models, recording, websocket as websocket_module
 from app.main import app
 from app.models import Base
 from app.websocket import (
@@ -1295,3 +1295,79 @@ def test_session_replay_and_audit_trail_back_the_teacher_timeline(client):
         assert row.token_hash is not None
         assert len(row.token_hash) == 64
         assert "." not in row.token_hash
+
+
+def _upload_chunk(client, session_id: str, sequence: int, headers: dict[str, str]) -> None:
+    resp = client.post(
+        f"/recording/{session_id}/chunk",
+        data={"sequence": sequence},
+        files={"chunk": (f"{sequence}.webm", f"webm-{sequence}".encode(), "video/webm")},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["sequence"] == sequence
+
+
+def test_wizard_start_leaves_pending_uploads_open_without_starting_grace(
+    client, chunk_root
+):
+    """開始場次 does not create a session, revoke tokens, or open upload grace.
+
+    A chunk queued before start still uploads while the session is `starting`.
+    Grace begins only after the existing end route sets `ended_at`, and a
+    chunk still pending then is accepted on that same path.
+    """
+    session_id = _new_session_id()
+    headers = _join_roles(client, session_id, "wizard", "student")
+    wizard_token = headers["wizard"]["cookie"].split("=", 1)[1]
+    student_token = headers["student"]["cookie"].split("=", 1)[1]
+
+    for token in (wizard_token, student_token):
+        created = client.post(
+            "/sessions",
+            json={"session_id": f"{session_id}-copy", "case_id": "CASE001"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert created.status_code == 401
+        assert "join_codes" not in created.text
+    with models.session_scope() as db:
+        assert models.get_session(db, f"{session_id}-copy") is None
+
+    _upload_chunk(client, session_id, 0, headers["student"])
+
+    with (
+        _socket(client, session_id, "wizard", headers["wizard"]) as wizard,
+        _socket(client, session_id, "student", headers["student"]) as student,
+    ):
+        student.send_json(
+            {
+                "sequence": 1,
+                "client_timestamp_ms": 0,
+                "event_type": "session_started",
+                "payload": {"event_id": "evt-student-start"},
+            }
+        )
+        refused = student.receive_json()
+        assert refused["status"] == "rejected"
+        assert refused["reason"] == "session_start_requires_wizard"
+        _assert_pong(wizard, "wizard-not-started")
+
+        _start_session(wizard)
+        _drain_start(student)
+
+        row = _session_row(session_id)
+        assert row.status == "starting"
+        assert row.ended_at is None
+        assert auth.session_upload_grace_open(row) is False
+        _upload_chunk(client, session_id, 1, headers["student"])
+
+    ended = client.post(f"/sessions/{session_id}/end", headers=headers["wizard"])
+    assert ended.status_code == 200, ended.text
+    assert ended.json()["status"] == "ended"
+    assert ended.json()["ended_at"]
+    row = _session_row(session_id)
+    assert auth.session_upload_grace_open(row) is True
+    _upload_chunk(client, session_id, 2, headers["student"])
+
+    stored = {sequence for sequence, _path in recording.stored_chunks(session_id)}
+    assert stored == {0, 1, 2}

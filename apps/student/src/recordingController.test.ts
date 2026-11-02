@@ -10,6 +10,9 @@ import {
   commitRecorderStop,
   handleRecorderStop,
   installActiveRecorderForTests,
+  interruptRecording,
+  isRevokedCloseReason,
+  isRevokedCredential,
   notePageHide,
   persistBlob,
   pumpSession,
@@ -18,6 +21,7 @@ import {
   resetRecordingControllerForTests,
   resumeUnauthorizedUploads,
   setRecordingTransport,
+  startRecording,
 } from "./recordingController.ts";
 import { listChunks, openRecordingDb, readMeta, writeChunk, writeMeta } from "./recordingDb.ts";
 import {
@@ -1108,4 +1112,242 @@ test("a later status listing an acked slice clears that transient failure", asyn
   assert.equal(meta?.finalize_payload, null);
   assert.equal(meta?.finalize_persisted_at, null);
   assert.equal(meta?.recorder_state, "recording");
+});
+
+function revokedTransport() {
+  const revoked = () => new ApiError(401, "revoked_session_token", "revoked_session_token");
+  return {
+    uploadRecordingChunk: async () => {
+      throw revoked();
+    },
+    fetchUploadStatus: async () => {
+      throw revoked();
+    },
+    finalizeRecording: async () => {
+      throw revoked();
+    },
+  };
+}
+
+/** Fires one last slice and then onstop, like a real MediaRecorder. */
+function flushingRecorder(lastSlice: string) {
+  return {
+    state: "recording",
+    stops: 0,
+    ondataavailable: null as ((event: { data: Blob }) => void) | null,
+    onstop: null as (() => void) | null,
+    onerror: null as (() => void) | null,
+    stop() {
+      this.stops += 1;
+      this.state = "inactive";
+      this.ondataavailable?.({ data: blob(lastSlice) });
+      this.onstop?.();
+    },
+  };
+}
+
+test("only a revoked token counts as a revoked credential", () => {
+  assert.equal(isRevokedCloseReason("token_revoked"), true);
+  for (const reason of [
+    "session_ended",
+    "session_state_unavailable",
+    "role_connection_replaced",
+    "role_already_connected",
+    "4401",
+    null,
+  ]) {
+    assert.equal(isRevokedCloseReason(reason), false, String(reason));
+  }
+  assert.equal(isRevokedCredential(new ApiError(401, "revoked_session_token", "revoked_session_token")), true);
+  assert.equal(isRevokedCredential(new ApiError(401, "upload_grace_expired", "upload_grace_expired")), false);
+  assert.equal(isRevokedCredential(new ApiError(403, "revoked_session_token", "revoked_session_token")), false);
+  assert.equal(isRevokedCredential(new Error("revoked_session_token")), false);
+});
+
+test("a revoked upload stops the recorder, keeps its last slice, and stays recoverable as recorder_lost", async () => {
+  const sessionId = "S-revoked-upload";
+  await seed(sessionId, emptyMeta(sessionId, 1));
+  await persistBlob(sessionId, blob("first"));
+  const recorder = flushingRecorder("last");
+  attachRecorderForTests(sessionId, recorder as unknown as MediaRecorder);
+  setRecordingTransport(revokedTransport());
+
+  await pumpSession(sessionId);
+  await recorderStopPromiseForTests();
+
+  assert.equal(recorder.state, "inactive");
+  const meta = await load(sessionId);
+  assert.equal(meta?.recorder_state, "lost");
+  assert.equal(meta?.finalize_payload?.reason, "recorder_lost");
+  assert.equal(meta?.next_sequence, 2);
+  assert.equal(meta?.final_sequence, 1, "the slice flushed on stop is part of the declaration");
+  assert.equal(meta?.upload_block, "unauthorized");
+  assert.equal(meta?.finalize_pending, false);
+  assert.equal(meta?.needs_operator, true);
+  const shown = recordingView();
+  assert.equal(shown.status, "stopped");
+  assert.equal(shown.canStart, false);
+  assert.match(shown.error ?? "", /已被撤銷/);
+  assert.equal(shown.banner.kind, "interrupted");
+
+  // A second revoked answer does not stop anything again.
+  await interruptRecording(sessionId);
+  assert.equal(recorder.stops, 1);
+
+  const reopened = await resumeUnauthorizedUploads(sessionId);
+  assert.equal(reopened?.finalize_pending, true);
+  assert.equal(reopened?.recorder_state, "lost");
+  assert.equal(reopened?.finalize_payload?.reason, "recorder_lost");
+  const database = await openRecordingDb();
+  try {
+    const chunks = await listChunks(database, sessionId);
+    assert.deepEqual(
+      chunks.map((chunk) => [chunk.sequence, Boolean(chunk.terminal)]),
+      [[0, false], [1, false]],
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("a revoked socket stops the recorder without an upload having failed", async () => {
+  const sessionId = "S-revoked-socket";
+  await seed(sessionId, emptyMeta(sessionId, 1));
+  await persistBlob(sessionId, blob("first"));
+  const recorder = flushingRecorder("last");
+  attachRecorderForTests(sessionId, recorder as unknown as MediaRecorder);
+
+  await interruptRecording(sessionId);
+  await recorderStopPromiseForTests();
+
+  assert.equal(recorder.state, "inactive");
+  const meta = await load(sessionId);
+  assert.equal(meta?.recorder_state, "lost");
+  assert.equal(meta?.final_sequence, 1);
+  assert.equal(meta?.finalize_payload?.reason, "recorder_lost");
+  assert.equal(meta?.upload_block, null);
+  assert.equal(meta?.finalize_pending, true);
+});
+
+test("a revoked take is recorded as lost even if the recorder never reports stop", async () => {
+  const sessionId = "S-revoked-hung";
+  await seed(sessionId, emptyMeta(sessionId, 1));
+  await persistBlob(sessionId, blob("first"));
+  const recorder = {
+    state: "recording",
+    stop() {
+      this.state = "inactive";
+    },
+  };
+  installActiveRecorderForTests(sessionId, recorder);
+
+  await interruptRecording(sessionId);
+
+  const meta = await load(sessionId);
+  assert.equal(recorder.state, "inactive");
+  assert.equal(meta?.recorder_state, "lost");
+  assert.equal(meta?.finalize_payload?.reason, "recorder_lost");
+  assert.equal(meta?.final_sequence, 0);
+});
+
+test("other upload failures do not stop the recorder", async () => {
+  const causes = [
+    new ApiError(401, "upload_grace_expired", "upload_grace_expired"),
+    new ApiError(503, "unavailable", null),
+    new ApiError(409, "sequence_conflict", "sequence_conflict"),
+  ];
+  for (const [index, cause] of causes.entries()) {
+    await resetRecordingControllerForTests();
+    const sessionId = `S-not-revoked-${index}`;
+    await seed(sessionId, emptyMeta(sessionId, 1));
+    await persistBlob(sessionId, blob("first"));
+    const recorder = flushingRecorder("last");
+    attachRecorderForTests(sessionId, recorder as unknown as MediaRecorder);
+    setRecordingTransport({
+      uploadRecordingChunk: async () => {
+        throw cause;
+      },
+    });
+    await pumpSession(sessionId);
+    assert.equal(recorder.state, "recording", cause.code ?? String(cause.status));
+    assert.equal((await load(sessionId))?.recorder_state, "recording");
+  }
+});
+
+test("a normal stop already under way stays a normal stop", async () => {
+  const sessionId = "S-revoked-after-stop";
+  await seed(sessionId, emptyMeta(sessionId, 1));
+  await persistBlob(sessionId, blob("first"));
+  const recorder = flushingRecorder("last");
+  attachRecorderForTests(sessionId, recorder as unknown as MediaRecorder);
+  recorder.stop();
+  await interruptRecording(sessionId);
+  await recorderStopPromiseForTests();
+  const meta = await load(sessionId);
+  assert.equal(meta?.recorder_state, "stopped");
+  assert.equal(meta?.finalize_payload?.reason, undefined);
+  assert.equal(meta?.final_sequence, 1);
+});
+
+test("a revocation while the camera prompt is open never starts a recorder", async () => {
+  const sessionId = "S-revoked-prompt";
+  const prompt = deferred();
+  const track = {
+    stopped: false,
+    stop() {
+      this.stopped = true;
+    },
+  };
+  let constructed = 0;
+  let prompts = 0;
+  class FakeMediaRecorder {
+    static isTypeSupported() {
+      return true;
+    }
+    constructor() {
+      constructed += 1;
+    }
+  }
+  const globals = globalThis as unknown as { MediaRecorder?: unknown };
+  const hadRecorder = "MediaRecorder" in globals;
+  const previousRecorder = globals.MediaRecorder;
+  const previousDevices = Object.getOwnPropertyDescriptor(navigator, "mediaDevices");
+  globals.MediaRecorder = FakeMediaRecorder;
+  Object.defineProperty(navigator, "mediaDevices", {
+    configurable: true,
+    value: {
+      getUserMedia: async () => {
+        prompts += 1;
+        prompt.arrive();
+        await prompt.promise;
+        return { getTracks: () => [track] };
+      },
+    },
+  });
+  try {
+    const starting = startRecording(sessionId);
+    await prompt.entered;
+    await interruptRecording(sessionId);
+    prompt.release();
+    await starting;
+
+    assert.equal(constructed, 0);
+    assert.equal(track.stopped, true, "the camera is released");
+    assert.equal(await load(sessionId), null, "no take was opened");
+    assert.equal(recordingView().canStart, false);
+
+    await startRecording(sessionId);
+    assert.equal(prompts, 1, "a later start (manual or auto-retry) does not ask for the camera again");
+  } finally {
+    if (hadRecorder) {
+      globals.MediaRecorder = previousRecorder;
+    } else {
+      delete globals.MediaRecorder;
+    }
+    if (previousDevices) {
+      Object.defineProperty(navigator, "mediaDevices", previousDevices);
+    } else {
+      delete (navigator as unknown as { mediaDevices?: unknown }).mediaDevices;
+    }
+  }
 });

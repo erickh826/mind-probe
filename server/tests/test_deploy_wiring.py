@@ -234,3 +234,23 @@ def test_vercel_csp_and_monorepo_layout():
             assert host in policy
         assert headers["Permissions-Policy"].startswith(permissions)
         assert "AKIA" not in policy
+
+
+def test_op_vercel_csp_is_api_only():
+    """The OP page holds the operator token, so it gets the narrowest policy."""
+    directory = ROOT / "apps" / "op"
+    spec = json.loads((directory / "vercel.json").read_text(encoding="utf-8"))
+    assert spec["rewrites"] == [{"source": "/(.*)", "destination": "/index.html"}]
+    headers = {item["key"]: item["value"] for item in spec["headers"][0]["headers"]}
+    policy = headers["Content-Security-Policy"]
+    directives = dict(
+        part.strip().split(" ", 1) for part in policy.split(";") if part.strip()
+    )
+    assert directives["script-src"] == "'self'"
+    assert "unsafe-inline" not in policy and "unsafe-eval" not in policy
+    assert directives["connect-src"] == "'self' https://*.sslip.io"
+    assert directives["object-src"] == "'none'"
+    assert directives["frame-ancestors"] == "'none'"
+    assert headers["Referrer-Policy"] == "no-referrer"
+    assert headers["Cache-Control"] == "no-store"
+    assert headers["Permissions-Policy"].startswith("camera=(), microphone=()")

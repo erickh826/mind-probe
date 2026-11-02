@@ -555,6 +555,28 @@ def test_end_session_drops_events_on_the_live_socket():
         assert _stored_events(session_id) == []
 
 
+def test_wizard_bearer_end_closes_student_with_session_ended():
+    """Wizard ``POST /end`` is the operator end: the student socket closes
+    ``session_ended`` and the server does not emit a recorder-stop of its own.
+    """
+    session_id = _fresh_session_id()
+    wizard_token = create_session_token(session_id, "wizard")
+    student_token = create_session_token(session_id, "student")
+    with (
+        _connect_subprotocol(session_id, "wizard", wizard_token) as wizard,
+        _connect_subprotocol(session_id, "student", student_token) as student,
+    ):
+        response = client.post(
+            f"/sessions/{session_id}/end",
+            headers={"Authorization": f"Bearer {wizard_token}"},
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "ended"
+        _expect_closed(wizard, reason="session_ended")
+        _expect_closed(student, reason="session_ended")
+        assert _stored_events(session_id) == []
+
+
 def test_events_after_accepted_session_ended_are_not_persisted():
     session_id = _fresh_session_id()
     with _connect(session_id, "wizard") as wizard:
@@ -756,6 +778,153 @@ def test_reconnect_snapshot_during_scheduled_start_window_is_not_active():
         assert snapshot["snapshot_revision"] == 1
         assert snapshot["session_state"] == "starting"
         assert snapshot["start_at_server_ms"] == scheduled["start_at_server_ms"]
+
+
+@pytest.mark.parametrize(
+    ("role", "reason"),
+    [
+        ("student", "session_start_requires_wizard"),
+        ("teacher", "read_only_role_cannot_emit_events"),
+        ("observer", "read_only_role_cannot_emit_events"),
+    ],
+)
+def test_non_wizard_cannot_schedule_session_start(role, reason):
+    """Start stays on the Wizard socket. Other roles leave the row created."""
+    session_id = _fresh_session_id()
+    with _connect(session_id, "wizard") as wizard, _connect(session_id, role) as other:
+        other.send_json(
+            {
+                "sequence": 1,
+                "client_timestamp_ms": 0,
+                "event_type": "session_started",
+                "payload": {"event_id": f"evt-start-{role}"},
+            }
+        )
+        ack = other.receive_json()
+        assert ack["status"] == "rejected"
+        assert ack["reason"] == reason
+        assert ack["event_id"] == f"evt-start-{role}"
+
+        wizard.send_json({"type": "ping", "ping_id": "start-untouched", "client_timestamp_ms": 0})
+        assert wizard.receive_json()["ping_id"] == "start-untouched"
+
+    row = _session_row(session_id)
+    assert row.status == "created"
+    assert row.ended_at is None
+    assert _stored_events(session_id) == []
+
+
+def test_revoked_wizard_token_cannot_start_session():
+    """Revocation closes the socket. Start is not a second path around it."""
+    session_id = _fresh_session_id()
+    token = create_session_token(session_id, "wizard")
+    with _connect_subprotocol(session_id, "wizard", token) as wizard:
+        with models.session_scope() as db:
+            models.revoke_token_hash(db, session_id, models.hash_token(token))
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            wizard.send_json(
+                {
+                    "sequence": 1,
+                    "client_timestamp_ms": 0,
+                    "event_type": "session_started",
+                    "payload": {"event_id": "evt-start-revoked"},
+                }
+            )
+            wizard.receive_json()
+        assert exc_info.value.code == 4401
+        assert exc_info.value.reason == "token_revoked"
+
+    row = _session_row(session_id)
+    assert row.status == "created"
+    assert row.ended_at is None
+    assert _stored_events(session_id) == []
+
+
+def test_wizard_start_pause_resume_does_not_open_upload_grace():
+    """Start, pause, and resume keep `ended_at` empty so grace has not begun."""
+    session_id = _fresh_session_id()
+    with _connect(session_id, "wizard") as wizard, _connect(session_id, "student") as student:
+        _start_session(wizard)
+        assert student.receive_json()["type"] == "session_start_scheduled"
+        assert student.receive_json()["event_type"] == "session_started"
+
+        row = _session_row(session_id)
+        assert row.status == "starting"
+        assert row.ended_at is None
+
+        wizard.send_json(
+            {
+                "sequence": 2,
+                "client_timestamp_ms": 0,
+                "event_type": "session_started",
+                "payload": {"event_id": "evt-start-again"},
+            }
+        )
+        again = wizard.receive_json()
+        assert again["status"] == "rejected"
+        assert again["reason"] == "invalid_lifecycle_transition"
+        student.send_json({"type": "ping", "ping_id": "no-second-start", "client_timestamp_ms": 0})
+        assert student.receive_json()["ping_id"] == "no-second-start"
+
+        revision = websocket_module.manager.snapshot_for(session_id).snapshot_revision
+        wizard.send_json(
+            {
+                "sequence": 3,
+                "client_timestamp_ms": 0,
+                "event_type": "session_paused",
+                "payload": {
+                    "event_id": "evt-pause",
+                    "command_id": "evt-pause",
+                    "expires_at_ms": _far_future_ms(),
+                    "snapshot_revision": revision,
+                    "reason": "manual",
+                },
+            }
+        )
+        assert wizard.receive_json()["status"] == "accepted"
+        paused = student.receive_json()
+        assert paused["event_type"] == "session_paused"
+
+        wizard.send_json(
+            {
+                "sequence": 4,
+                "client_timestamp_ms": 0,
+                "event_type": "session_started",
+                "payload": {"event_id": "evt-start-while-paused"},
+            }
+        )
+        refused = wizard.receive_json()
+        assert refused["status"] == "rejected"
+        assert refused["reason"] == "invalid_lifecycle_transition"
+
+        wizard.send_json(
+            {
+                "sequence": 5,
+                "client_timestamp_ms": 0,
+                "event_type": "session_resumed",
+                "payload": {"event_id": "evt-resume"},
+            }
+        )
+        assert wizard.receive_json()["status"] == "accepted"
+        assert student.receive_json()["event_type"] == "session_resumed"
+
+        row = _session_row(session_id)
+        assert row.status == "active"
+        assert row.ended_at is None
+
+        wizard.send_json(
+            {
+                "sequence": 6,
+                "client_timestamp_ms": 0,
+                "event_type": "session_started",
+                "payload": {"event_id": "evt-start-while-active"},
+            }
+        )
+        active = wizard.receive_json()
+        assert active["status"] == "rejected"
+        assert active["reason"] == "invalid_lifecycle_transition"
+
+    assert _session_row(session_id).ended_at is None
 
 
 # --- Realtime persistence + audit wiring (ADR-0004 §1-§4) -------------------
