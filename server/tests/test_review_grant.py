@@ -18,6 +18,7 @@ from starlette.websockets import WebSocketDisconnect
 from app import auth, models, websocket
 from app.main import app
 from app.models import Base
+from .ws_assert import assert_upgrade_refused
 
 CASE_ID = "CASE001"
 OP = {"Authorization": "Bearer test-operator-token-0123456789abcdef"}
@@ -216,13 +217,13 @@ def test_refresh_rotation_and_reuse_revokes_the_chain(client):
             response = client.get(f"/sessions/S-R{path}", headers=bearer(token))
             assert response.status_code == 401, path
             assert response.json()["detail"] == "revoked_session_token"
-    with pytest.raises(WebSocketDisconnect) as exc:
-        with client.websocket_connect(
+    assert_upgrade_refused(
+        client.websocket_connect(
             "/ws/S-R/teacher", subprotocols=protocols(third_body["access_token"])
-        ):
-            pass
-    assert exc.value.code == 4401
-    assert exc.value.reason == "token_revoked"
+        ),
+        code=4401,
+        reason="token_revoked",
+    )
 
     # The rotated refresh is dead too. Presenting it does not mint another grant.
     assert review_refresh(client, "S-R", third_body["refresh_token"]).status_code == 401
@@ -309,11 +310,11 @@ def test_ended_session_review_login_has_no_live_exemption(client):
     # The ended live token still has the read exemption. The review token does not use it.
     assert client.get("/sessions/S-R/events", headers=bearer(live_token)).status_code == 200
     assert client.get("/sessions/S-R", headers=bearer(live_token)).status_code == 401
-    with pytest.raises(WebSocketDisconnect) as exc:
-        with client.websocket_connect("/ws/S-R/teacher", subprotocols=protocols(access)):
-            pass
-    assert exc.value.code == 4401
-    assert exc.value.reason == "session_ended"
+    assert_upgrade_refused(
+        client.websocket_connect("/ws/S-R/teacher", subprotocols=protocols(access)),
+        code=4401,
+        reason="session_ended",
+    )
 
     assert client.post("/sessions/S-R/review-logout", headers=bearer(access)).status_code == 200
     refused = client.get("/sessions/S-R/events", headers=bearer(access))

@@ -24,6 +24,7 @@ import anyio
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from starlette.websockets import WebSocketDisconnect
@@ -43,6 +44,8 @@ from app.websocket import (
     compute_offset_median,
     create_session_token,
 )
+
+from .ws_assert import assert_upgrade_refused
 
 client = TestClient(app)
 
@@ -396,36 +399,48 @@ def test_invalid_json_text_is_rejected_without_crashing():
 
 def test_unauthenticated_websocket_is_rejected():
     session_id = _fresh_session_id()
-    with pytest.raises(WebSocketDisconnect) as exc_info:
-        with client.websocket_connect(f"/ws/{session_id}/student"):
-            pass
-    assert exc_info.value.code == 4401
+    assert_upgrade_refused(
+        client.websocket_connect(f"/ws/{session_id}/student"),
+        code=4401,
+        reason="missing_session_token",
+        subprotocol=None,
+    )
 
 
 def test_role_mismatched_token_is_rejected():
     session_id = _fresh_session_id()
-    with pytest.raises(WebSocketDisconnect) as exc_info:
-        with _connect(session_id, "wizard", token_role="student"):
-            pass
-    assert exc_info.value.code == 4403
-    assert exc_info.value.reason == "role_token_mismatch"
+    assert_upgrade_refused(
+        _connect(session_id, "wizard", token_role="student"),
+        code=4403,
+        reason="role_token_mismatch",
+        subprotocol=None,
+    )
 
 
 def test_second_student_connection_is_rejected_while_first_is_live():
     session_id = _fresh_session_id()
-    with _connect(session_id, "student"):
-        with pytest.raises(WebSocketDisconnect) as exc_info:
-            with _connect(session_id, "student"):
-                pass
-    assert exc_info.value.code == 4409
+    token = create_session_token(session_id, "student")
+    with _connect_subprotocol(session_id, "student", token) as first:
+        # 4429 is retryable; 4409 is reserved for the connection that was
+        # replaced, which clients treat as terminal.
+        assert_upgrade_refused(
+            _connect_subprotocol(session_id, "student", token),
+            code=4429,
+            reason="role_already_connected",
+        )
+        # The refused socket was never registered: the first one still works.
+        first.send_json({"type": "ping", "ping_id": "still-here", "client_timestamp_ms": 0})
+        assert first.receive_json()["ping_id"] == "still-here"
 
 
 def test_invalid_role_is_rejected_at_handshake():
     session_id = _fresh_session_id()
-    with pytest.raises(WebSocketDisconnect) as exc_info:
-        with client.websocket_connect(f"/ws/{session_id}/not_a_role"):
-            pass
-    assert exc_info.value.code == 4400
+    assert_upgrade_refused(
+        client.websocket_connect(f"/ws/{session_id}/not_a_role"),
+        code=4400,
+        reason="invalid_role",
+        subprotocol=None,
+    )
 
 
 def _subprotocols(token: str) -> list[str]:
@@ -451,14 +466,14 @@ def test_subprotocol_auth_echoes_only_mindprobe_v1():
 
 def test_subprotocol_auth_rejects_missing_token():
     session_id = _fresh_session_id()
-    with pytest.raises(WebSocketDisconnect) as exc_info:
-        with client.websocket_connect(
+    assert_upgrade_refused(
+        client.websocket_connect(
             f"/ws/{session_id}/student",
             subprotocols=[WS_PROTOCOL],
-        ):
-            pass
-    assert exc_info.value.code == 4401
-    assert exc_info.value.reason == "missing_session_token"
+        ),
+        code=4401,
+        reason="missing_session_token",
+    )
 
 
 def test_bearer_subprotocol_without_mindprobe_v1_is_rejected():
@@ -477,22 +492,22 @@ def test_bearer_subprotocol_without_mindprobe_v1_is_rejected():
 def test_subprotocol_auth_rejects_wrong_role():
     session_id = _fresh_session_id()
     token = create_session_token(session_id, "student")
-    with pytest.raises(WebSocketDisconnect) as exc_info:
-        with _connect_subprotocol(session_id, "wizard", token):
-            pass
-    assert exc_info.value.code == 4403
-    assert exc_info.value.reason == "role_token_mismatch"
+    assert_upgrade_refused(
+        _connect_subprotocol(session_id, "wizard", token),
+        code=4403,
+        reason="role_token_mismatch",
+    )
 
 
 def test_subprotocol_auth_rejects_wrong_session():
     session_id = _fresh_session_id()
     other_id = _fresh_session_id()
     token = create_session_token(other_id, "student")
-    with pytest.raises(WebSocketDisconnect) as exc_info:
-        with _connect_subprotocol(session_id, "student", token):
-            pass
-    assert exc_info.value.code == 4401
-    assert exc_info.value.reason == "session_token_mismatch"
+    assert_upgrade_refused(
+        _connect_subprotocol(session_id, "student", token),
+        code=4401,
+        reason="session_token_mismatch",
+    )
 
 
 def test_subprotocol_auth_rejects_revoked_token():
@@ -500,11 +515,11 @@ def test_subprotocol_auth_rejects_revoked_token():
     token = create_session_token(session_id, "wizard")
     with models.session_scope() as db:
         models.revoke_token_hash(db, session_id, models.hash_token(token))
-    with pytest.raises(WebSocketDisconnect) as exc_info:
-        with _connect_subprotocol(session_id, "wizard", token):
-            pass
-    assert exc_info.value.code == 4401
-    assert exc_info.value.reason == "token_revoked"
+    assert_upgrade_refused(
+        _connect_subprotocol(session_id, "wizard", token),
+        code=4401,
+        reason="token_revoked",
+    )
 
 
 def _note(sequence: int, event_id: str) -> dict:
@@ -600,11 +615,12 @@ def test_cookie_is_ignored_when_cookie_auth_is_disabled(monkeypatch):
     session_id = _fresh_session_id()
     token = create_session_token(session_id, "student")
     headers = {"cookie": f"{WS_SESSION_COOKIE}={token}"}
-    with pytest.raises(WebSocketDisconnect) as exc_info:
-        with client.websocket_connect(f"/ws/{session_id}/student", headers=headers):
-            pass
-    assert exc_info.value.code == 4401
-    assert exc_info.value.reason == "missing_session_token"
+    assert_upgrade_refused(
+        client.websocket_connect(f"/ws/{session_id}/student", headers=headers),
+        code=4401,
+        reason="missing_session_token",
+        subprotocol=None,
+    )
 
     with _connect_subprotocol(session_id, "student", token) as sock:
         assert sock.accepted_subprotocol == WS_PROTOCOL
@@ -613,13 +629,12 @@ def test_cookie_is_ignored_when_cookie_auth_is_disabled(monkeypatch):
 def test_query_string_token_is_not_a_credential():
     session_id = _fresh_session_id()
     token = create_session_token(session_id, "student")
-    with pytest.raises(WebSocketDisconnect) as exc_info:
-        with client.websocket_connect(
-            f"/ws/{session_id}/student?access_token={token}"
-        ):
-            pass
-    assert exc_info.value.code == 4401
-    assert exc_info.value.reason == "missing_session_token"
+    assert_upgrade_refused(
+        client.websocket_connect(f"/ws/{session_id}/student?access_token={token}"),
+        code=4401,
+        reason="missing_session_token",
+        subprotocol=None,
+    )
 
 
 def _far_future_ms() -> int:
@@ -977,10 +992,28 @@ def test_connect_to_unknown_session_is_rejected():
     # The token is validly signed for this session id -- only the row is
     # missing, so this exercises the persistence guard and not auth.
     session_id = _unpersisted_session_id()
-    with pytest.raises(WebSocketDisconnect) as exc_info:
-        with _connect(session_id, "student"):
-            pass
-    assert exc_info.value.code == 4404
+    assert_upgrade_refused(
+        _connect(session_id, "student"),
+        code=4404,
+        reason="session_not_found",
+        subprotocol=None,
+    )
+
+
+def test_database_failure_at_upgrade_is_retryable_1013(monkeypatch):
+    # Transient: a 4401 here would stop every client from reconnecting.
+    session_id = _fresh_session_id()
+
+    def broken(*_args, **_kwargs):
+        raise SQLAlchemyError("database is locked")
+
+    monkeypatch.setattr(models, "get_session", broken)
+    assert_upgrade_refused(
+        _connect(session_id, "student"),
+        code=1013,
+        reason="session_state_unavailable",
+        subprotocol=None,
+    )
 
 
 def test_accepted_event_is_persisted_to_sqlite():
