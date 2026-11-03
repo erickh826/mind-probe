@@ -9,6 +9,7 @@ import test from "node:test";
 import { ApiError } from "./apiError.ts";
 import {
   bindSession,
+  interruptRecording,
   notePageHide,
   pumpSession,
   recorderStopPromiseForTests,
@@ -523,6 +524,22 @@ afterEach(() => {
   restoreDigest = null;
 });
 
+/** Make every attempt to store a slice whose bytes are `text` fail. */
+function failSliceWrites(text: string): void {
+  const subtle = crypto.subtle as unknown as { digest: SubtleCrypto["digest"] };
+  const digest = subtle.digest.bind(crypto.subtle);
+  subtle.digest = (async (algorithm: AlgorithmIdentifier, data: BufferSource) => {
+    const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer);
+    if (new TextDecoder().decode(bytes) === text) {
+      throw new Error("QuotaExceededError");
+    }
+    return digest(algorithm, data);
+  }) as SubtleCrypto["digest"];
+  restoreDigest = () => {
+    Reflect.deleteProperty(crypto.subtle, "digest");
+  };
+}
+
 /** Pump with the clock past the finalize deadline, as the 400 ms timer would later. */
 async function pumpPastDeadline(sessionId: string, times: number): Promise<void> {
   const realNow = Date.now;
@@ -630,6 +647,61 @@ test("a held takeover declaration waits for the tab still storing it, and a late
   assert.deepEqual(later.pastFinal, []);
   assert.deepEqual(later.finalizes, [{ final_sequence: 0, reason: "recorder_lost" }]);
   assert.equal((await load(sessionId))?.server_finalize_state, "incomplete");
+});
+
+test("a revocation's lost declaration also waits for the recorder's last slices", async () => {
+  // The token is revoked, but an upload code may lift the block in this page:
+  // whatever finalize goes out must cover the slices flushed on stop.
+  const env = install();
+  const sessionId = "S-revoked-flush";
+  await admitted(sessionId);
+  await startRecording(sessionId);
+  const recorder = FakeRecorder.instances[0];
+  recorder.ondataavailable?.({ data: new Blob(["s0"], { type: "video/webm" }) });
+  await waitFor(async () => (await load(sessionId))?.next_sequence === 1, "slice 0 stored");
+
+  const releaseWrites = holdSliceWrites();
+  await interruptRecording(sessionId);
+  await pumpPastDeadline(sessionId, 4);
+  assert.deepEqual(env.finalizes, [], "no finalize while the last slice is being stored");
+  assert.equal((await load(sessionId))?.recorder_flush_pending, true);
+
+  releaseWrites();
+  await recorderStopPromiseForTests();
+  for (let i = 0; i < 6; i += 1) {
+    await pumpSession(sessionId);
+  }
+  assert.deepEqual(env.pastFinal, []);
+  assert.deepEqual(env.finalizes, [{ final_sequence: 1, reason: "recorder_lost" }]);
+  assert.equal((await load(sessionId))?.needs_operator, true);
+});
+
+test("a slice that could not be stored holds the lost declaration until the recorder stops", async () => {
+  const env = install();
+  const sessionId = "S-chunk-lost";
+  await admitted(sessionId);
+  await startRecording(sessionId);
+  const recorder = FakeRecorder.instances[0];
+  recorder.ondataavailable?.({ data: new Blob(["s0"], { type: "video/webm" }) });
+  await waitFor(async () => (await load(sessionId))?.next_sequence === 1, "slice 0 stored");
+
+  failSliceWrites("bad");
+  recorder.ondataavailable?.({ data: new Blob(["bad"], { type: "video/webm" }) });
+  await waitFor(async () => (await load(sessionId))?.recorder_state === "lost", "loss declared");
+  assert.equal(recorder.state, "recording", "the recorder keeps running");
+  await pumpPastDeadline(sessionId, 4);
+  assert.deepEqual(env.finalizes, [], "no finalize while the recorder still adds slices");
+
+  recorder.ondataavailable?.({ data: new Blob(["s1"], { type: "video/webm" }) });
+  recorder.stop();
+  await recorderStopPromiseForTests();
+  for (let i = 0; i < 6; i += 1) {
+    await pumpSession(sessionId);
+  }
+  assert.deepEqual([...env.uploads].sort(), [0, 1, 2]);
+  assert.deepEqual(env.pastFinal, []);
+  assert.deepEqual(env.finalizes, [{ final_sequence: 2, reason: "recorder_lost" }]);
+  assert.equal((await load(sessionId))?.needs_operator, true);
 });
 
 async function holdLockElsewhere(sessionId: string): Promise<() => void> {
