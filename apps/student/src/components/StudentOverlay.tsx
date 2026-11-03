@@ -29,6 +29,8 @@ function connectionNotice(socket: StudentSocket): string | null {
       return "伺服器暫時無法確認場次狀態，稍後自動再試。";
     case "ended":
       return "場次已結束。";
+    case "replaced":
+      return "此裝置已被另一個連線取代，不會再自動連線。";
     default:
       return null;
   }

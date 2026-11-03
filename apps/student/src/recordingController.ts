@@ -24,6 +24,7 @@ import {
   closeBanner,
   emptyMeta,
   finalizeDue,
+  holdForRecorderFlush,
   noteFinalizeAttempt,
   notePermanentFailure,
   permanentBlockMessage,
@@ -33,6 +34,7 @@ import {
   persistReplaced,
   persistStop,
   planReload,
+  releaseRecorderFlush,
   sequencesAlreadyReceived,
   storageWarning,
   takeAlreadyStarted,
@@ -147,6 +149,8 @@ const inFlight = new Set<number>();
 let chunkUploaded: ((sequence: number, timestampMs: number) => void) | null = null;
 let persistChain: Promise<void> = Promise.resolve();
 let stopPromise: Promise<void> = Promise.resolve();
+/** The session whose onstop is storing its last slices and declaring the take. */
+let committingStop: string | null = null;
 /** Sessions whose live credential was revoked in this tab. No recorder starts for them again. */
 const revokedSessions = new Set<string>();
 /** Sessions another device took over from this tab (4409). No recorder starts for them again. */
@@ -503,10 +507,18 @@ async function reconcile(sessionId: string, now: number): Promise<void> {
     return;
   }
   const recorderHere = active?.sessionId === sessionId && active.recorder.state !== "inactive";
+  // This tab's recorder is stopping: its onstop stores the last slices and
+  // owns the declaration.
+  const stopPendingHere =
+    !recorderHere && (active?.sessionId === sessionId || committingStop === sessionId);
   // A duplicated tab shares this meta. While the tab that records it holds
-  // the lock, its take is alive, not lost; look again once the lock is free.
+  // the lock, its take is alive, not lost, and a held lost declaration still
+  // waits for its last slices; look again once the lock is free.
   const recordingElsewhere =
-    !recorderHere && current.recorder_state === "recording" && (await recorderHeldElsewhere(sessionId));
+    !recorderHere &&
+    !stopPendingHere &&
+    (current.recorder_state === "recording" || current.recorder_flush_pending === true) &&
+    (await recorderHeldElsewhere(sessionId));
   if (recordingElsewhere) {
     meta = current;
     canStart = false;
@@ -519,7 +531,7 @@ async function reconcile(sessionId: string, now: number): Promise<void> {
     }, OTHER_TAB_RECHECK_MS);
     return;
   }
-  const recorderStillHere = recorderHere;
+  const recorderStillHere = recorderHere || stopPendingHere;
   try {
     const serverStatus = await transport.fetchUploadStatus(sessionId);
     const chunks = await listChunks(database, sessionId);
@@ -542,8 +554,10 @@ async function reconcile(sessionId: string, now: number): Promise<void> {
   }
   meta = current;
   canStart = false;
-  if (recorderStillHere) {
+  if (recorderHere) {
     status = "recording";
+  } else if (stopPendingHere) {
+    status = "stopping";
   } else if (planReload(current).kind !== "idle") {
     status = "stopped";
   }
@@ -559,6 +573,11 @@ function mergeReload(
   // A remount while MediaRecorder is still running is not a lost take.
   if (planReload(next).kind === "recorder_lost" && !recorderStillHere) {
     next = persistRecorderLost(next, now);
+  }
+  // No recorder is left to store the slices a held declaration waited for
+  // (the page that ran it is gone): declare what was stored.
+  if (!recorderStillHere) {
+    next = releaseRecorderFlush(next, now);
   }
   return next;
 }
@@ -641,10 +660,11 @@ export async function persistBlob(sessionId: string, blob: Blob): Promise<void> 
 
 async function markDurableChunkLoss(sessionId: string): Promise<void> {
   const database = await db();
-  const updated = await updateMeta(database, sessionId, (latest) => ({
-    ...persistRecorderLost(latest, Date.now()),
-    needs_operator: true,
-  }));
+  const running = active?.sessionId === sessionId && active.recorder.state !== "inactive";
+  const updated = await updateMeta(database, sessionId, (latest) => {
+    const lost = { ...persistRecorderLost(latest, Date.now()), needs_operator: true };
+    return running ? holdForRecorderFlush(lost) : lost;
+  });
   if (updated) {
     meta = updated;
   }
@@ -1062,8 +1082,9 @@ export async function interruptRecording(sessionId: string): Promise<void> {
   const current = active?.sessionId === sessionId ? active : null;
   if (current && current.recorder.state !== "inactive") {
     const database = await db();
+    // Held: the recorder still flushes slices this declaration does not cover.
     const updated = await updateMeta(database, sessionId, (latest) =>
-      persistInterrupted(latest, Date.now()),
+      holdForRecorderFlush(persistInterrupted(latest, Date.now())),
     );
     if (updated) {
       meta = updated;
@@ -1100,8 +1121,10 @@ export async function stopReplacedRecording(sessionId: string): Promise<void> {
   const current = active?.sessionId === sessionId ? active : null;
   if (current && current.recorder.state !== "inactive") {
     const database = await db();
+    // Held: the live token could finalize this before the recorder's last
+    // slices are stored, and the server would then refuse them.
     const updated = await updateMeta(database, sessionId, (latest) =>
-      persistReplaced(latest, Date.now()),
+      holdForRecorderFlush(persistReplaced(latest, Date.now())),
     );
     if (updated) {
       meta = updated;
@@ -1304,6 +1327,10 @@ async function sendFinalizeIfDue(sessionId: string): Promise<void> {
       meta = updated;
     }
     forgetError();
+    if (replacedSessions.has(sessionId)) {
+      // Still true after the finalize: this tab stays replaced and never records again.
+      rememberHeldFailure(REPLACED_MESSAGE);
+    }
   } catch (cause) {
     const block = cause instanceof ApiError ? permanentUploadBlock(cause.status, cause.code) : null;
     // Chunk retries must not move finalize_persisted_at. Only the attempt clock moves.
@@ -1346,30 +1373,40 @@ export async function commitRecorderStop(
   const lost = stopAsLost || chunkPersistLost;
   stopAsLost = false;
   const database = await db();
-  const updated = await updateMeta(database, sessionId, (latest) => {
-    if (latest.recorder_state === "lost") {
-      // A revocation or a takeover declared the take lost before the recorder
-      // flushed its last slice: extend the declaration over that slice.
-      const kept = revokedSessions.has(sessionId)
-        ? persistInterrupted(latest, now)
-        : replacedSessions.has(sessionId)
-          ? persistReplaced(latest, now)
-          : latest;
-      return chunkPersistLost ? { ...kept, needs_operator: true } : kept;
-    }
-    if (lost) {
-      const marked = persistRecorderLost(latest, now);
-      return chunkPersistLost ? { ...marked, needs_operator: true } : marked;
-    }
-    if (latest.finalize_pending && latest.finalize_persisted_at != null) {
-      return latest;
-    }
-    return persistStop(latest, now);
-  });
+  const updated = await updateMeta(database, sessionId, (latest) =>
+    // Every slice is stored now; a held declaration may go out.
+    releaseRecorderFlush(declareStop(latest, lost, sessionId, now), now),
+  );
   if (updated) {
     meta = updated;
   }
   return updated;
+}
+
+function declareStop(
+  latest: RecordingMeta,
+  lost: boolean,
+  sessionId: string,
+  now: number,
+): RecordingMeta {
+  if (latest.recorder_state === "lost") {
+    // A revocation or a takeover declared the take lost before the recorder
+    // flushed its last slice: extend the declaration over that slice.
+    const kept = revokedSessions.has(sessionId)
+      ? persistInterrupted(latest, now)
+      : replacedSessions.has(sessionId)
+        ? persistReplaced(latest, now)
+        : latest;
+    return chunkPersistLost ? { ...kept, needs_operator: true } : kept;
+  }
+  if (lost) {
+    const marked = persistRecorderLost(latest, now);
+    return chunkPersistLost ? { ...marked, needs_operator: true } : marked;
+  }
+  if (latest.finalize_pending && latest.finalize_persisted_at != null) {
+    return latest;
+  }
+  return persistStop(latest, now);
 }
 
 export function notePageHide(): void {
@@ -1384,6 +1421,7 @@ export function notePageHide(): void {
 }
 
 export function handleRecorderStop(sessionId: string, stream: MediaStream | null): Promise<void> {
+  committingStop = sessionId;
   status = "stopped";
   stream?.getTracks().forEach((track) => track.stop());
   if (active?.sessionId === sessionId) {
@@ -1397,6 +1435,9 @@ export function handleRecorderStop(sessionId: string, stream: MediaStream | null
     })
     .finally(() => {
       // The take is declared; another tab may now judge it.
+      if (committingStop === sessionId) {
+        committingStop = null;
+      }
       dropRecorderLock();
       emit();
     });
@@ -1472,6 +1513,7 @@ export async function resetRecordingControllerForTests(
   inFlight.clear();
   persistChain = Promise.resolve();
   stopPromise = Promise.resolve();
+  committingStop = null;
   revokedSessions.clear();
   replacedSessions.clear();
   admittedSessions.clear();

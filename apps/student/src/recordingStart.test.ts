@@ -64,6 +64,8 @@ interface Env {
   prompt: () => Promise<void>;
   uploads: number[];
   finalizes: Array<{ final_sequence: number; reason?: string | null }>;
+  /** Slices the server refused because a finalize already ended before them. */
+  pastFinal: number[];
 }
 
 const free = (): ServerUploadStatus => ({
@@ -86,7 +88,10 @@ function install(): Env {
     prompt: async () => {},
     uploads: [],
     finalizes: [],
+    pastFinal: [],
   };
+  // Like the server: the first finalize fixes the take's last sequence.
+  let serverFinal: number | null = null;
   FakeRecorder.instances = [];
   FakeRecorder.startBehaviour = () => {};
   const globals = globalThis as unknown as { MediaRecorder?: unknown };
@@ -133,10 +138,15 @@ function install(): Env {
       return env.claim(takeId);
     },
     uploadRecordingChunk: async (_sessionId, sequence) => {
+      if (serverFinal !== null && sequence > serverFinal) {
+        env.pastFinal.push(sequence);
+        throw conflict("sequence_past_final");
+      }
       env.uploads.push(sequence);
       return { status: "received" };
     },
     finalizeRecording: async (_sessionId, payload) => {
+      serverFinal ??= payload.final_sequence;
       env.finalizes.push({ final_sequence: payload.final_sequence, reason: payload.reason });
       return {
         recording_state: "incomplete",
@@ -474,6 +484,152 @@ test("a replaced tab stops as recorder_lost and keeps uploading with its live to
   setSocketAdmitted(sessionId, true);
   await startRecording(sessionId);
   assert.equal(env.prompts, 1, "the replaced tab never records again");
+});
+
+async function waitFor(check: () => Promise<boolean>, what: string, timeoutMs = 2_000): Promise<void> {
+  const until = Date.now() + timeoutMs;
+  while (Date.now() < until) {
+    if (await check()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(`timed out waiting: ${what}`);
+}
+
+/**
+ * Hold every slice's IndexedDB write: persisting a slice hashes it first.
+ * Released by the returned function; the hold is removed in either case.
+ */
+function holdSliceWrites(): () => void {
+  const subtle = crypto.subtle as unknown as { digest: SubtleCrypto["digest"] };
+  const digest = subtle.digest.bind(crypto.subtle);
+  let open: () => void = () => {};
+  const gate = new Promise<void>((resolve) => (open = resolve));
+  subtle.digest = (async (...args: Parameters<SubtleCrypto["digest"]>) => {
+    await gate;
+    return digest(...args);
+  }) as SubtleCrypto["digest"];
+  restoreDigest = () => {
+    Reflect.deleteProperty(crypto.subtle, "digest");
+    open();
+  };
+  return () => restoreDigest?.();
+}
+
+let restoreDigest: (() => void) | null = null;
+afterEach(() => {
+  restoreDigest?.();
+  restoreDigest = null;
+});
+
+/** Pump with the clock past the finalize deadline, as the 400 ms timer would later. */
+async function pumpPastDeadline(sessionId: string, times: number): Promise<void> {
+  const realNow = Date.now;
+  Date.now = () => realNow() + 31_000;
+  try {
+    for (let i = 0; i < times; i += 1) {
+      await pumpSession(sessionId);
+    }
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+async function chunkRows(sessionId: string) {
+  const database = await openRecordingDb();
+  try {
+    return await listChunks(database, sessionId);
+  } finally {
+    database.close();
+  }
+}
+
+test("a takeover sends no finalize until the recorder's last slices are stored", async () => {
+  const env = install();
+  const sessionId = "S-replaced-flush";
+  await admitted(sessionId);
+  await startRecording(sessionId);
+  const recorder = FakeRecorder.instances[0];
+  recorder.ondataavailable?.({ data: new Blob(["s0"], { type: "video/webm" }) });
+  recorder.ondataavailable?.({ data: new Blob(["s1"], { type: "video/webm" }) });
+  await waitFor(async () => (await load(sessionId))?.next_sequence === 2, "slices 0 and 1 stored");
+  for (let i = 0; i < 3; i += 1) {
+    await pumpSession(sessionId);
+  }
+  assert.deepEqual([...env.uploads].sort(), [0, 1], "slices 0 and 1 are on the server");
+
+  // Slice 2 is being written when the takeover arrives; stop() flushes slice 3
+  // and onstop fires before either write settles.
+  const releaseWrites = holdSliceWrites();
+  recorder.ondataavailable?.({ data: new Blob(["s2"], { type: "video/webm" }) });
+  setSocketAdmitted(sessionId, false);
+  await stopReplacedRecording(sessionId);
+  assert.equal(recorder.state, "inactive");
+  await pumpPastDeadline(sessionId, 4);
+  assert.deepEqual(env.finalizes, [], "no finalize while the last slices are being stored");
+  const held = await load(sessionId);
+  assert.equal(held?.recorder_state, "lost", "the lost marker is durable before the flush");
+  assert.equal(held?.recorder_flush_pending, true);
+
+  releaseWrites();
+  await recorderStopPromiseForTests();
+  const declared = await load(sessionId);
+  assert.equal(declared?.recorder_flush_pending, false);
+  assert.equal(declared?.next_sequence, 4);
+  assert.equal(declared?.final_sequence, 3, "the declaration covers slices 0-3");
+  for (let i = 0; i < 6; i += 1) {
+    await pumpSession(sessionId);
+  }
+  assert.deepEqual([...env.uploads].sort(), [0, 1, 2, 3]);
+  assert.deepEqual(env.pastFinal, [], "no slice refused as past the final sequence");
+  assert.deepEqual(env.finalizes, [{ final_sequence: 3, reason: "recorder_lost" }]);
+  const settled = await load(sessionId);
+  assert.equal(settled?.server_finalize_state, "incomplete");
+  assert.equal(settled?.upload_block, null);
+  assert.deepEqual(await chunkRows(sessionId), [], "nothing stranded locally");
+  assert.match(recordingView().error ?? "", /已被另一個連線取代/);
+});
+
+test("a held takeover declaration waits for the tab still storing it, and a later page releases it", async () => {
+  const env = install();
+  const sessionId = "S-replaced-reload";
+  await admitted(sessionId);
+  await startRecording(sessionId);
+  const recorder = FakeRecorder.instances[0];
+  recorder.ondataavailable?.({ data: new Blob(["s0"], { type: "video/webm" }) });
+  await waitFor(async () => (await load(sessionId))?.next_sequence === 1, "slice 0 stored");
+  // The page is interrupted right after stop(): onstop never runs here.
+  recorder.stop = function stop(this: FakeRecorder) {
+    this.state = "inactive";
+  };
+  await stopReplacedRecording(sessionId);
+  await pumpPastDeadline(sessionId, 3);
+  assert.deepEqual(env.finalizes, [], "the dying page never sends the held declaration");
+  assert.equal((await load(sessionId))?.recorder_flush_pending, true);
+
+  // A later page. While some tab still holds the recorder lock, that tab may
+  // still be storing slices: leave the declaration held.
+  await resetRecordingControllerForTests({ keepDatabase: true });
+  restoreGlobals?.();
+  const later = install();
+  const release = await holdLockElsewhere(sessionId);
+  await bindSession(sessionId);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  await pumpPastDeadline(sessionId, 3);
+  assert.deepEqual(later.finalizes, []);
+  assert.equal((await load(sessionId))?.recorder_flush_pending, true);
+
+  // No recorder is left anywhere: declare what was stored and send it.
+  release();
+  await waitFor(async () => (await load(sessionId))?.recorder_flush_pending === false, "hold released", 6_000);
+  for (let i = 0; i < 4; i += 1) {
+    await pumpSession(sessionId);
+  }
+  assert.deepEqual([...env.uploads, ...later.uploads].sort(), [0]);
+  assert.deepEqual(later.pastFinal, []);
+  assert.deepEqual(later.finalizes, [{ final_sequence: 0, reason: "recorder_lost" }]);
+  assert.equal((await load(sessionId))?.server_finalize_state, "incomplete");
 });
 
 async function holdLockElsewhere(sessionId: string): Promise<() => void> {

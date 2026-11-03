@@ -47,6 +47,13 @@ export interface RecordingMeta {
   last_chunk_end_ms: number;
   needs_operator: boolean;
   upload_block: UploadBlock | null;
+  /**
+   * A lost declaration was written while the recorder was still running, and
+   * its last slices may not be stored yet. Finalize waits until the stop is
+   * committed (or a later page finds no recorder left). Rows written before
+   * this field existed have none.
+   */
+  recorder_flush_pending?: boolean;
 }
 
 export interface StoredChunkDraft {
@@ -169,6 +176,9 @@ export function finalizeDue(
   if (!meta.finalize_pending || meta.finalize_confirmed) {
     return false;
   }
+  if (meta.recorder_flush_pending) {
+    return false;
+  }
   if (meta.finalize_payload == null || meta.finalize_persisted_at == null) {
     return false;
   }
@@ -288,6 +298,42 @@ export function persistReplaced(meta: RecordingMeta, now: number): RecordingMeta
     return meta;
   }
   return persistRecorderLost(meta, now);
+}
+
+/**
+ * Hold a lost declaration written while the recorder still runs. Its payload
+ * stops short of the slices the recorder flushes on stop, so it must not be
+ * sent yet. Write this in the same transaction as the declaration.
+ */
+export function holdForRecorderFlush(meta: RecordingMeta): RecordingMeta {
+  if (meta.recorder_state !== "lost" || meta.finalize_confirmed) {
+    return meta;
+  }
+  if (meta.server_finalize_state === "complete" || meta.server_finalize_state === "incomplete") {
+    return meta;
+  }
+  return { ...meta, recorder_flush_pending: true };
+}
+
+/**
+ * The recorder's last slice is stored, or no recorder is left to store it:
+ * declare the take over every stored slice and let finalize go. The finalize
+ * deadline starts now, when the declaration is ready.
+ */
+export function releaseRecorderFlush(meta: RecordingMeta, now: number): RecordingMeta {
+  if (!meta.recorder_flush_pending) {
+    return meta;
+  }
+  const released: RecordingMeta = { ...meta, recorder_flush_pending: false };
+  if (released.recorder_state !== "lost" || released.finalize_confirmed) {
+    return released;
+  }
+  if (released.server_finalize_state === "complete" || released.server_finalize_state === "incomplete") {
+    return released;
+  }
+  const lost = persistRecorderLost({ ...released, finalize_persisted_at: null }, now);
+  // A block that stops finalize (a revoked token) stays until an upload code lifts it.
+  return released.upload_block ? notePermanentFailure(lost, released.upload_block) : lost;
 }
 
 /** Reload resumes uploads or declares the take lost. It never starts a recorder. */
