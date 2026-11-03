@@ -1,3 +1,4 @@
+import type { CloseKind } from "@mind-probe/shared";
 import type { ClockState } from "../useSessionSocket";
 import type { ConnectionStatus, SessionView } from "../types";
 
@@ -10,6 +11,8 @@ interface Props {
   caseId: string;
   status: ConnectionStatus;
   closedReason: string | null;
+  /** Why the console is not admitted right now, if anything is worth saying. */
+  notice: CloseKind | null;
   session: SessionView;
   clock: ClockState;
   pendingCount: number;
@@ -24,6 +27,16 @@ interface Props {
   startPending: boolean;
   onStartSession: () => void;
 }
+
+const NOTICE_LABEL: Record<CloseKind, string | null> = {
+  occupied: "另一個裝置正使用 Wizard 角色，約 30 秒後自動再試",
+  unavailable: "伺服器暫時無法確認場次狀態，稍後自動再試",
+  replaced: "已被另一個裝置的 Wizard 連線取代",
+  revoked: "此裝置的連線已被撤銷",
+  ended: null,
+  refused: null,
+  lost: null,
+};
 
 const CONNECTION_LABEL: Record<ConnectionStatus, string> = {
   idle: "未連線",
@@ -65,6 +78,7 @@ export default function SessionStatusHeader({
   caseId,
   status,
   closedReason,
+  notice,
   session,
   clock,
   pendingCount,
@@ -99,6 +113,7 @@ export default function SessionStatusHeader({
         <div style={{ fontSize: 12, color: CONNECTION_COLOR[status] }}>
           ● {CONNECTION_LABEL[status]}
           {closedReason !== null && ` · ${closedReason}`}
+          {notice !== null && NOTICE_LABEL[notice] !== null && ` · ${NOTICE_LABEL[notice]}`}
         </div>
       </div>
 

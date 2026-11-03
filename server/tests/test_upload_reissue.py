@@ -12,11 +12,11 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool, StaticPool
-from starlette.websockets import WebSocketDisconnect
 
 from app import auth, cases, models, recording, websocket
 from app.main import app
 from app.models import Base
+from .ws_assert import assert_upgrade_refused
 
 OPERATOR = {"Authorization": "Bearer test-operator-token-0123456789abcdef"}
 EBML = recording.EBML_MAGIC + b"\x01\x00\x00\x00\x00\x00\x00\x23header"
@@ -197,14 +197,15 @@ def test_health_stays_public_with_an_upload_token(client):
 def test_upload_token_websocket_is_rejected(client):
     session_id, _tokens, _codes = _open(client)
     token = _upload_token(client, session_id)
-    with pytest.raises(WebSocketDisconnect) as exc:
-        with client.websocket_connect(
+    assert_upgrade_refused(
+        client.websocket_connect(
             f"/ws/{session_id}/student",
             headers={"cookie": f"{websocket.WS_SESSION_COOKIE}={token}"},
-        ):
-            pass
-    assert exc.value.code == 4401
-    assert exc.value.reason == "token_type_mismatch"
+        ),
+        code=4401,
+        reason="token_type_mismatch",
+        subprotocol=None,
+    )
 
 
 def test_live_student_cannot_issue_an_upload_code(client):
@@ -231,6 +232,7 @@ def test_upload_routes_accept_live_and_upload_tokens(client, chunk_root):
         "final_sequence",
         "finalize_state",
         "recording_state",
+        "take_claimed",
     }
     stored = _upload(client, session_id, upload, 0, EBML)
     assert stored.status_code == 200, stored.text

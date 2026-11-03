@@ -451,6 +451,7 @@ export default function App() {
         caseId={joined.caseId}
         status={status}
         closedReason={socket.closedReason}
+        notice={socket.notice}
         session={sessionForHeader}
         clock={socket.clock}
         pendingCount={socket.pendingCount}

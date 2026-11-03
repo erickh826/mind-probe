@@ -32,6 +32,7 @@ STUDENT_STATUS_KEYS = {
     "final_sequence",
     "finalize_state",
     "recording_state",
+    "take_claimed",
 }
 
 

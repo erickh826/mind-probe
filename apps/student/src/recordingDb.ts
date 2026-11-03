@@ -205,6 +205,38 @@ export function writeChunk(db: IDBDatabase, chunk: PersistedChunk): Promise<void
   });
 }
 
+/**
+ * Remove a meta row only if it is still the untouched one an attempt wrote:
+ * same `recorder_started_at`, no slice stored. Returns whether it was removed.
+ */
+export function deleteUnstartedMeta(
+  db: IDBDatabase,
+  sessionId: string,
+  recorderStartedAt: number,
+): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(META_STORE, "readwrite");
+    let removed = false;
+    tx.oncomplete = () => resolve(removed);
+    tx.onerror = () => fail(reject, tx.error);
+    tx.onabort = () => fail(reject, tx.error);
+    const store = tx.objectStore(META_STORE);
+    const getReq = store.get(sessionId);
+    getReq.onerror = () => fail(reject, getReq.error);
+    getReq.onsuccess = () => {
+      const existing = getReq.result as RecordingMeta | undefined;
+      if (
+        existing &&
+        existing.recorder_started_at === recorderStartedAt &&
+        existing.next_sequence === 0
+      ) {
+        store.delete(sessionId);
+        removed = true;
+      }
+    };
+  });
+}
+
 export function deleteSessionRecords(db: IDBDatabase, sessionId: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const tx = db.transaction([CHUNK_STORE, META_STORE], "readwrite");

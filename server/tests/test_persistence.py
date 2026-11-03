@@ -18,7 +18,6 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-from starlette.websockets import WebSocketDisconnect
 
 # Must be set before app.main imports app.websocket, which reads it when
 # signing. setdefault so we never clobber a secret an earlier test module set.
@@ -28,6 +27,7 @@ from app import models, websocket
 from app.events import EventEnvelope, EventType, Source
 from app.main import app
 from app.models import Base
+from .ws_assert import assert_upgrade_refused
 
 
 # --- Fixtures ---------------------------------------------------------------
@@ -650,9 +650,12 @@ def test_join_cookie_completes_a_real_websocket_upgrade(client):
         assert reply["ping_id"] == "p1"
 
     # The same token must not open a socket for the role it is not bound to.
-    with pytest.raises(WebSocketDisconnect):
-        with client.websocket_connect("/ws/S001/student", headers=headers):
-            pass
+    assert_upgrade_refused(
+        client.websocket_connect("/ws/S001/student", headers=headers),
+        code=4403,
+        reason="role_token_mismatch",
+        subprotocol=None,
+    )
 
 
 def test_join_rejects_client_supplied_role(client):
@@ -706,10 +709,12 @@ def test_end_session_revokes_existing_cookie_and_blocks_websocket_upgrade(
     assert token not in str(entries[0].details)
 
     headers = {"cookie": f"{websocket.WS_SESSION_COOKIE}={token}"}
-    with pytest.raises(WebSocketDisconnect) as exc_info:
-        with client.websocket_connect("/ws/S001/wizard", headers=headers):
-            pass
-    assert exc_info.value.code == 4401
+    assert_upgrade_refused(
+        client.websocket_connect("/ws/S001/wizard", headers=headers),
+        code=4401,
+        reason="session_ended",
+        subprotocol=None,
+    )
 
 
 def test_join_audits_the_issued_token_without_storing_it(client, db):
