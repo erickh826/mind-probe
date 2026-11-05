@@ -10,6 +10,7 @@
     "test": "node --experimental-strip-types --test --test-concurrency=1 src/opLogic.test.ts src/api.test.ts"
   },
   "dependencies": {
+    "@mind-probe/shared": "file:../../packages/shared",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },

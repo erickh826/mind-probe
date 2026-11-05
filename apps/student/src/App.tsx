@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { ClipManifestEntry } from "@mind-probe/shared";
 import {
   clearJoinedSession,
@@ -19,6 +19,9 @@ import {
 } from "./recordingController";
 import { findUnfinishedUploadSessions, type UploadRecovery } from "./uploadRecovery";
 import { StudentOverlay } from "./components/StudentOverlay";
+import { UpdatePrompt } from "./components/UpdatePrompt";
+import { buildUpdate } from "./buildUpdate";
+import { canPromptStudentUpdate } from "./updateGate";
 import { SuspectVideoPlayer } from "./components/SuspectVideoPlayer";
 import { useMediaRecorder } from "./useMediaRecorder";
 import { useStudentSocket } from "./useStudentSocket";
@@ -300,10 +303,24 @@ export default function App() {
     }
   }, [recorder.status, socket.sendRecordingStarted, socket.sendRecordingStopped]);
 
+  const newerBuild = useSyncExternalStore(buildUpdate.subscribe, buildUpdate.getSnapshot);
+  // Hidden, not just disabled, while recording work could be lost by a reload.
+  const updatePrompt =
+    newerBuild !== null &&
+    canPromptStudentUpdate({
+      joined: joined !== null,
+      recorderStatus: recorder.status,
+      pendingCount: recorder.pendingCount,
+      bannerKind: recorder.banner.kind,
+    }) ? (
+      <UpdatePrompt />
+    ) : null;
+
   if (restorePending || joined === null) {
     if (restorePending && joined === null) {
       return (
         <div className="join-shell">
+          {updatePrompt}
           <p className="join-panel">Restoring session…</p>
         </div>
       );
@@ -311,6 +328,7 @@ export default function App() {
     if (restoreError && joined === null) {
       return (
         <div className="join-shell">
+          {updatePrompt}
           <div className="join-panel">
             <h1>Session not reachable</h1>
             <p className="join-error">{restoreError}</p>
@@ -330,43 +348,51 @@ export default function App() {
     if (!recoveryChecked) {
       return (
         <div className="join-shell">
+          {updatePrompt}
           <p className="join-panel">Checking local recording…</p>
         </div>
       );
     }
     if (!preferJoin && recoveries.length > 0) {
       return (
-        <UploadCodeForm
-          sessions={recoveries}
-          pending={joinPending}
-          error={joinError}
-          onSubmit={handleUploadLogin}
-          onJoinAnother={() => {
-            setJoinError(null);
-            setPreferJoin(true);
-          }}
-        />
+        <>
+          {updatePrompt}
+          <UploadCodeForm
+            sessions={recoveries}
+            pending={joinPending}
+            error={joinError}
+            onSubmit={handleUploadLogin}
+            onJoinAnother={() => {
+              setJoinError(null);
+              setPreferJoin(true);
+            }}
+          />
+        </>
       );
     }
     return (
-      <JoinSessionModal
-        pending={joinPending}
-        error={joinError}
-        onJoin={handleJoin}
-        onResumeUpload={
-          recoveries.length > 0
-            ? () => {
-                setJoinError(null);
-                setPreferJoin(false);
-              }
-            : undefined
-        }
-      />
+      <>
+        {updatePrompt}
+        <JoinSessionModal
+          pending={joinPending}
+          error={joinError}
+          onJoin={handleJoin}
+          onResumeUpload={
+            recoveries.length > 0
+              ? () => {
+                  setJoinError(null);
+                  setPreferJoin(false);
+                }
+              : undefined
+          }
+        />
+      </>
     );
   }
 
   return (
     <div className="app-shell">
+      {updatePrompt}
       <SuspectVideoPlayer
         activeClip={activeClip}
         idleClip={idleClip}

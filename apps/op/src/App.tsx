@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 
 import { createOpClient, OpApiError, type OpClient } from "./api";
 import { CodesPanel } from "./components/CodesPanel";
@@ -6,6 +6,8 @@ import { CreateSessionForm } from "./components/CreateSessionForm";
 import { SessionDetail } from "./components/SessionDetail";
 import { SessionTable } from "./components/SessionTable";
 import { TokenGate } from "./components/TokenGate";
+import { UpdatePrompt } from "./components/UpdatePrompt";
+import { buildUpdate } from "./buildUpdate";
 import { API_BASE_URL } from "./config";
 import {
   addFirstReads,
@@ -255,8 +257,16 @@ export default function App() {
     return () => window.removeEventListener("beforeunload", warn);
   }, [holdsCodes]);
 
+  const newerBuild = useSyncExternalStore(buildUpdate.subscribe, buildUpdate.getSnapshot);
+  const updatePrompt = newerBuild !== null ? <UpdatePrompt holdsCodes={holdsCodes} /> : null;
+
   if (!client) {
-    return <TokenGate busy={gateBusy} error={gateError} onSubmit={signIn} />;
+    return (
+      <>
+        {updatePrompt}
+        <TokenGate busy={gateBusy} error={gateError} onSubmit={signIn} />
+      </>
+    );
   }
 
   const selectedRow = rows.find((row) => row.session_id === selectedId) ?? null;
@@ -264,6 +274,7 @@ export default function App() {
 
   return (
     <div className="layout">
+      {updatePrompt}
       <header className="topbar">
         <h1>mind-probe · OP 管理</h1>
         <span className="hint">API：{API_BASE_URL || "（同源）"}</span>

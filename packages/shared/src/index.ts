@@ -5,3 +5,4 @@ export * from "./api";
 export * from "./sessionAuth";
 export * from "./reviewSession";
 export * from "./socketLifecycle";
+export * from "./versionCheck";
