@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fake docker for the dry run. State lives in $STATE.
+# Fake docker for the dry run. State lives in $STATE; route lists in $OLD_PATHS / $NEW_PATHS.
 set -euo pipefail
 img() { printf '%s/images/%s' "$STATE" "${1//\//_}"; }
 printf 'docker %s\n' "$*" >> "$STATE/log"
@@ -32,6 +32,10 @@ if [ "$1" = compose ]; then
             pw="$(cat)"
             printf '%s' "$pw" | sha256sum | cut -d' ' -f1 > "$STATE/hashed_pw"
             if [ -e "$STATE/bad_hash" ]; then echo 'Traceback: boom'; else echo "scrypt:16384:8:1:c2FsdHNhbHQ:${#pw}ZmFrZQ"; fi ;;
+          *app.openapi*)
+            if [ "$new" = yes ]; then echo "$NEW_PATHS"; else echo "$OLD_PATHS"; fi ;;
+          *MINDPROBE_ADMIN_USERNAME*)
+            if grep -q '^MINDPROBE_ADMIN_PASSWORD_HASH=' "$STATE/env_at_up"; then echo 'OP admin login: configured'; else echo 'OP admin login: not configured (set-admin.sh)'; fi ;;
           *) echo "fake: unknown -c" >&2; exit 1 ;;
         esac
         exit 0
@@ -42,9 +46,6 @@ if [ "$1" = compose ]; then
           if [ -e "$STATE/busy" ]; then echo 'Activity: WAIT'; echo ' - session S-busy is active'; exit 1; fi
           echo 'Activity: none in progress' ;;
         *backup*) echo "Database backup: /data/backups/pre-$2-$3.db integrity ok" ;;
-        *review_issue_limiter*)
-          [ "$new" = yes ] || { echo 'AssertionError: review-code limit missing' >&2; exit 1; }
-          if grep -q '^MINDPROBE_ADMIN_PASSWORD_HASH=' "$STATE/env_at_up"; then echo 'OP admin login: configured'; else echo 'OP admin login: not configured yet (run set-admin.sh)'; fi ;;
         *) echo "fake: unknown exec body" >&2; exit 1 ;;
       esac ;;
     *) echo "fake compose: $cmd" >&2; exit 1 ;;

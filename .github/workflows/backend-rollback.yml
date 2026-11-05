@@ -1,0 +1,64 @@
+name: Backend rollback
+
+# Puts back the release and image recorded by the last upgrade
+# (/opt/mindprobe/rollback-target and rollback-image). See deploy/backend/README.md.
+on:
+  workflow_dispatch:
+    inputs:
+      maintenance_confirmed:
+        description: "Confirmed: no running sessions or uploads (the backend restarts)"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-production
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    runs-on: ubuntu-24.04
+    environment: production
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write the SSH key and pinned host key
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          umask 077
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$RUNNER_TEMP/deploy_key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$RUNNER_TEMP/known_hosts"
+          test -s "$RUNNER_TEMP/deploy_key" || { echo 'Secret DEPLOY_SSH_KEY is missing.'; exit 1; }
+          test -s "$RUNNER_TEMP/known_hosts" || { echo 'Secret DEPLOY_KNOWN_HOSTS is missing.'; exit 1; }
+
+      - name: Roll back
+        env:
+          DEPLOY_ACTION: rollback
+          MAINTENANCE_CONFIRMED: ${{ inputs.maintenance_confirmed }}
+          DEPLOY_RUN_ID: gh-rollback-${{ github.run_id }}-${{ github.run_attempt }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY_FILE: ${{ runner.temp }}/deploy_key
+          DEPLOY_KNOWN_HOSTS_FILE: ${{ runner.temp }}/known_hosts
+          DEPLOY_OUT: ${{ runner.temp }}/deploy-out
+          DEPLOY_TIMEOUT_S: "900"
+        run: bash deploy/backend/ci-deploy.sh
+
+      - name: Remove the SSH key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/deploy_key"
+
+      - name: Keep the rollback log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-rollback-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/deploy-out/deploy-*.log
+          if-no-files-found: warn
+          retention-days: 90

@@ -1,5 +1,8 @@
-# Sourced by preflight.sh, upgrade.sh and rollback.sh. Verifies the uploaded
-# release files and sets: commit, short, release, rollback_tag.
+# Sourced by preflight.sh and upgrade.sh. Verifies the staged release files and
+# sets: commit, short, release, tarball, rollback_tag.
+# MP_TMP is the staging directory holding mindprobe-release.* (default /tmp;
+# the CD workflow stages each run in its own directory). MP_ROOT exists only
+# for the local dry run.
 tmp="${MP_TMP:-/tmp}"
 root="${MP_ROOT:-/opt/mindprobe}"
 (cd "$tmp" && sha256sum --quiet -c mindprobe-release.sha256) \

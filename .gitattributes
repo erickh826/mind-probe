@@ -1,0 +1,4 @@
+# Shell scripts and workflows run on Linux; keep LF on every checkout.
+*.sh text eol=lf
+deploy/** text eol=lf
+.github/** text eol=lf

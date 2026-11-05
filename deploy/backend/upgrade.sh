@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Replace the Lightsail backend with the release in /tmp/mindprobe-release.*
-# (PR #18 + #20). Run preflight.sh first.
-#   bash /tmp/upgrade.sh --maintenance-confirmed
+# Replace the Lightsail backend with the staged release (mindprobe-release.*
+# in MP_TMP, default /tmp). Run preflight.sh first; the CD workflow runs both
+# through remote-run.sh.
+#   bash upgrade.sh --maintenance-confirmed
 # The flag states that operators will not create or start sessions and that
-# students have finished uploading until this script, set-admin.sh and the
-# smoke checks end.
+# students have finished uploading until this script and the smoke checks end.
 #
 # Keeps runtime.env and the data volume; tags the running image so
 # rollback.sh can start it again without a rebuild. Safe to rerun after a
@@ -12,7 +12,8 @@
 # and the rollback tag is never moved to a different image. Prints no secret values.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-# MP_ROOT / MP_TMP / MP_API exist only for the local dry run; leave them unset on the host.
+# MP_TMP: staging directory (see release-info.sh). MP_ROOT / MP_API exist only
+# for the local dry run; leave them unset on the host.
 api="${MP_API:-https://95-41-69-24.sslip.io}"
 compose=(sudo docker compose -p mindprobe-prod -f docker-compose.prod.yml)
 
@@ -30,7 +31,7 @@ step '1/7 Check the release files and the running release'
 source "$here/release-info.sh"
 echo "New release: $short ($commit)"
 previous="$(readlink -f "$root/current")"
-test "$previous" != "$release" || { echo "current already points at $short; the upgrade is done. Next: set-admin.sh."; exit 0; }
+test "$previous" != "$release" || { echo "current already points at $short; the upgrade is done."; exit 0; }
 cd "$previous"
 server_id="$("${compose[@]}" ps -q server)"
 test -n "$server_id" || { echo 'No running server container.'; exit 1; }
@@ -119,23 +120,25 @@ if [ "$healthy" != yes ]; then
   exit 1
 fi
 
-step '7/7 Check routes and the new code, then switch current'
-curl --fail --silent --max-time 10 "$api/openapi.json" | python3 -c '
-import json, sys
-paths = json.load(sys.stdin)["paths"]
-need = ["/op/login", "/op/logout", "/sessions/{session_id}/review-codes",
-        "/sessions/{session_id}/join-codes", "/recording/{session_id}/claim", "/sessions"]
-missing = [p for p in need if p not in paths]
-assert not missing, f"missing routes: {missing}"
-print("Routes present:", ", ".join(need))'
-"${compose[@]}" exec -T server python - <<'PY'
-import os
-from app import auth
-assert hasattr(auth, 'review_issue_limiter'), 'review-code limit (#18) missing from the running image'
-configured = bool(os.environ.get('MINDPROBE_ADMIN_USERNAME')) and bool(os.environ.get('MINDPROBE_ADMIN_PASSWORD_HASH'))
-print('Review-code limit present. OP admin login:', 'configured' if configured else 'not configured yet (run set-admin.sh)')
-PY
+step '7/7 Check that the public API is the new release, then switch current'
+server_id="$("${compose[@]}" ps -q server)"
+serving_dir="$(readlink -f "$(sudo docker inspect --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$server_id")")"
+[ "$serving_dir" = "$(readlink -f "$release")" ] \
+  || { echo "The server container came from $serving_dir, not $release. Run rollback.sh." >&2; exit 1; }
+# The routes the new container reports for itself must be what the public
+# HTTPS endpoint serves, so Caddy really reaches the new code.
+own="$("${compose[@]}" exec -T server python -c \
+  'import json; from app.main import app; print(json.dumps(sorted(app.openapi()["paths"])))' </dev/null)"
+public="$(curl --fail --silent --max-time 10 "$api/openapi.json" \
+  | python3 -c 'import json, sys; print(json.dumps(sorted(json.load(sys.stdin)["paths"])))')"
+if [ "$own" != "$public" ]; then
+  echo 'The public /openapi.json differs from the routes of the new container. Run rollback.sh.' >&2
+  exit 1
+fi
+echo "Public API serves the new release: $(python3 -c 'import json, sys; print(len(json.loads(sys.argv[1])))' "$own") routes match."
+"${compose[@]}" exec -T server python -c \
+  'import os; print("OP admin login:", "configured" if os.environ.get("MINDPROBE_ADMIN_USERNAME") and os.environ.get("MINDPROBE_ADMIN_PASSWORD_HASH") else "not configured (set-admin.sh)")' </dev/null
 ln -sfn "$release" "$root/current"
 "${compose[@]}" ps
 trap - ERR
-echo "Upgrade to $short done. Next: bash /tmp/set-admin.sh, then the smoke checks in README.md."
+echo "Upgrade to $short done. Run the smoke checks in deploy/backend/README.md."

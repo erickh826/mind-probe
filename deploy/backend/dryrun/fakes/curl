@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fake curl. Health follows $STATE/unhealthy; openapi lists the new routes only
+# Fake curl. Health follows $STATE/unhealthy; openapi lists $NEW_PATHS only
 # when the new image runs; /op/login accepts $STATE/admin_password only if the
 # server was (re)started after runtime.env got the admin lines.
 url="${*: -1}"
@@ -9,10 +9,11 @@ case "$url" in
     [ -e "$STATE/unhealthy" ] && { echo 'curl: (22) fake 502' >&2; exit 22; }
     echo '{"status":"ok"}' ;;
   */openapi.json)
-    if [ "$(cat "$STATE/running_image")" = img-new ]; then
-      echo '{"paths":{"/sessions":{},"/sessions/{session_id}/join-codes":{},"/recording/{session_id}/claim":{},"/sessions/{session_id}/review-codes":{},"/op/login":{},"/op/logout":{}}}'
+    # $STATE/stale_proxy: the public endpoint still serves the old routes.
+    if [ "$(cat "$STATE/running_image")" = img-new ] && [ ! -e "$STATE/stale_proxy" ]; then
+      echo "{\"paths\": $(python3 -c 'import json,sys; print(json.dumps({p: {} for p in json.loads(sys.argv[1])}))' "$NEW_PATHS")}"
     else
-      echo '{"paths":{"/sessions":{},"/sessions/{session_id}/join-codes":{},"/recording/{session_id}/claim":{},"/sessions/{session_id}/review-codes":{}}}'
+      echo "{\"paths\": $(python3 -c 'import json,sys; print(json.dumps({p: {} for p in json.loads(sys.argv[1])}))' "$OLD_PATHS")}"
     fi ;;
   */op/login)
     body="$(cat)"

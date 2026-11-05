@@ -1,18 +1,27 @@
 #!/usr/bin/env bash
-# Dry run of preflight / upgrade / rollback / set-admin with fake sudo, docker
-# and curl. Real bash, tar, sha256sum and python3. Run inside WSL:
-#   bash run.sh <kit dir> <dir holding mindprobe-release.{tar,env,sha256}>
+# Dry run of the backend deploy kit, including the CD path (ci-deploy.sh ->
+# fake ssh/scp -> remote-run.sh), with fake sudo, docker, curl, ssh and scp.
+# Real bash, tar, sha256sum, flock, setsid and python3. Linux or WSL:
+#   bash deploy/backend/dryrun/run.sh [release dir]
+# Without a release dir it builds one from HEAD (make-release.sh --unmerged).
 set -uo pipefail
-kit="$1"; rel="$2"
-work=/tmp/mp-dryrun-pr18-pr20
-rm -rf "$work"; mkdir -p "$work/bin"
-cp "$kit"/dryrun/fakes/docker "$kit"/dryrun/fakes/curl "$work/bin/"
-printf '#!/usr/bin/env bash\nexec "$@"\n' > "$work/bin/sudo"
+kit="$(cd "$(dirname "$0")/.." && pwd)"
+work="${DRYRUN_WORK:-$(mktemp -d /tmp/mp-dryrun.XXXXXX)}"
+rm -rf "$work"; mkdir -p "$work/bin" "$work/tmp"
+if [ -n "${1:-}" ]; then
+  rel="$1"
+else
+  rel="$work/release"
+  bash "$kit/make-release.sh" HEAD --unmerged --out "$rel" > /dev/null || { echo 'make-release.sh failed'; exit 1; }
+fi
+cp "$kit"/dryrun/fakes/{docker,curl,ssh,scp,sudo} "$work/bin/"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$work/bin/sleep"
 chmod +x "$work/bin/"*
-cp "$kit"/{preflight,upgrade,rollback,set-admin,activity-check,release-info}.sh "$work/"
+cp "$kit"/{preflight,upgrade,rollback,set-admin,activity-check,release-info,remote-run,ci-deploy,make-release}.sh "$work/"
 export PATH="$work/bin:$PATH" MP_TMP="$work/tmp" MP_API=https://fake.invalid
-mkdir -p "$MP_TMP"
+# Routes the fake old and new servers report (sorted, as upgrade.sh compares them).
+export OLD_PATHS='["/health", "/sessions"]'
+export NEW_PATHS='["/health", "/op/login", "/sessions"]'
 cp "$rel"/mindprobe-release.{tar,env,sha256} "$MP_TMP/"
 commit="$(sed -n 's/^RELEASE_COMMIT=//p' "$MP_TMP/mindprobe-release.env")"
 NEW="${commit:0:7}"
@@ -77,7 +86,8 @@ fresh b; touch "$STATE/fail_build"; up --maintenance-confirmed
 expect 'build failure stops before cutover' 1 'FAILED during: 4/7' "$OLD pre-tag=img-old"
 rm "$STATE/fail_build"; up --maintenance-confirmed
 expect 'rerun reuses the matching release and upgrades' 0 'Reusing .* matches the tar' "$NEWST"
-ok 'step 7 reports admin login not configured yet' 'grep -q "not configured yet" "$STATE/out"'
+ok 'step 7 matches public and container routes' 'grep -q "3 routes match" "$STATE/out"'
+ok 'step 7 reports admin login not configured' 'grep -q "OP admin login: not configured" "$STATE/out"'
 ok 'backup file named after the new release' 'grep -q "pre-$NEW-" "$STATE/out"'
 up --maintenance-confirmed
 expect 'rerun after success says done' 0 'the upgrade is done' "$NEWST"
@@ -166,6 +176,52 @@ printf '{"note":"%s"}\n200' "$SECRET" > "$STATE/login_response"
 admin admin "$SECRET" "$SECRET"
 ok 'a 200 without a token is refused and its body is not printed' '[ $rc = 1 ] && grep -q "without an operator token" "$STATE/out" && ! grep -q "$SECRET" "$STATE/out"'
 rm "$STATE/login_response"
+
+echo '# S: the public API still serves the old routes after the swap'
+fresh s; touch "$STATE/stale_proxy"; up --maintenance-confirmed
+expect 'route mismatch stops before current switches' 1 'differs from the routes of the new container' "running=img-new from=$NEW current=9579475 pre-tag=img-old"
+
+echo '# CD: ci-deploy.sh -> fake ssh/scp -> remote-run.sh'
+cd_env() {  # cd_env <name> [extra VAR=value ...]
+  CD_OUT="$work/out-$1"
+  rm -rf "$CD_OUT"
+  env DEPLOY_ACTION="${ACTION:-deploy}" DEPLOY_COMMIT="${COMMIT:-$commit}" MAINTENANCE_CONFIRMED="${CONFIRMED:-true}" \
+    DEPLOY_RUN_ID="run-$1" DEPLOY_HOST=fake.host DEPLOY_USER=ubuntu \
+    DEPLOY_SSH_KEY_FILE=/dev/null DEPLOY_KNOWN_HOSTS_FILE=/dev/null DEPLOY_OUT="$CD_OUT" \
+    DEPLOY_REMOTE_BASE="$work/remote-$1" DEPLOY_REMOTE_ROOT="$MP_ROOT" DEPLOY_POLL_S=0 DEPLOY_TIMEOUT_S=60 \
+    DEPLOY_RELEASE_DIR="$rel" bash "$work/ci-deploy.sh" > "$STATE/out" 2>&1
+  rc=$?
+}
+fresh cd1; cd_env cd1
+expect 'CD deploy: preflight, upgrade, exit 0' 0 "Upgrade to $NEW done" "$NEWST"
+ok 'CD deploy: preflight ran on the host first' 'grep -q "Preflight passed" "$STATE/out"'
+ok 'CD deploy: host log kept and copied for the artifact' 'grep -q "== exit 0" "$MP_ROOT/deploy-logs/run-cd1.log" && cmp -s "$MP_ROOT/deploy-logs/run-cd1.log" "$CD_OUT/deploy-run-cd1.log"'
+ok 'CD deploy: staging directory is 0700 and holds the release' '[ "$(stat -c %a "$work/remote-cd1/mindprobe-deploy-run-cd1")" = 700 ] && [ -f "$work/remote-cd1/mindprobe-deploy-run-cd1/mindprobe-release.tar" ]'
+ACTION=rollback cd_env cd1-rb
+expect 'CD rollback restores the old release' 0 'health passed' "$OLD pre-tag=img-old"
+
+fresh cd2; CONFIRMED=false cd_env cd2
+expect 'CD refuses without maintenance confirmation, nothing staged' 2 'Not confirmed' "$OLD pre-tag=none"
+ok 'CD unconfirmed: no host directory, no log' '[ ! -e "$work/remote-cd2" ] && [ ! -e "$MP_ROOT/deploy-logs" ]'
+ACTION=rollback CONFIRMED=false cd_env cd2-rb
+expect 'CD rollback also needs the confirmation' 2 'Not confirmed' "$OLD pre-tag=none"
+COMMIT="${commit:0:7}" cd_env cd2-short
+expect 'CD refuses a short commit' 2 '40-character' "$OLD pre-tag=none"
+
+fresh cd3; touch "$STATE/busy"; cd_env cd3
+expect 'CD stops at preflight while a session is active' 1 'Activity: WAIT' "$OLD pre-tag=none"
+ok 'CD activity stop: upgrade never started' '! grep -q "== 1/7" "$STATE/out"'
+
+fresh cd4; exec 9>"$MP_ROOT/.deploy.lock"; flock -n 9; cd_env cd4; exec 9>&-
+expect 'CD refuses while another run holds the host lock' 75 'Another deploy or rollback is running' "$OLD pre-tag=none"
+
+fresh cd5; touch "$STATE/sudo_password"; cd_env cd5
+expect 'CD stops when sudo would ask for a password' 1 'passwordless sudo' "$OLD pre-tag=none"
+
+fresh cd6; touch "$STATE/unhealthy"; cd_env cd6
+expect 'CD reports an unhealthy cutover and leaves current alone' 1 'Run rollback.sh' "running=img-new from=$NEW current=9579475 pre-tag=img-old"
+rm "$STATE/unhealthy"; ACTION=rollback cd_env cd6-rb
+expect 'CD rollback after a failed cutover' 0 'health passed' "$OLD pre-tag=img-old"
 
 echo "passed=$pass failed=$fail"
 [ "$fail" = 0 ]

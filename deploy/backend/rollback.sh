@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Put the previous backend back on its own image. The database stays: the new
-# release only adds audit rows (operator_login, and operator token revocations
-# under the pseudo session __operator__), which 9579475 ignores (checked with
-# verify/rollback_probe.py). Restore the pre-upgrade backup only if the
-# database is damaged. On the old code login tokens stop working; the static
-# operator token keeps working, so the current OP page is unaffected.
+# Put the previous backend back on its own image: the directory in
+# <root>/rollback-target and the image in <root>/rollback-image, both written
+# by upgrade.sh. The database stays. Before relying on that for a release,
+# check the older code reads what the newer one wrote (for 444edcc:
+# tasks/02_implement/deploy-pr18-pr20/verify/rollback_probe.py, 17/17).
+# Restore the pre-upgrade backup only if the database is damaged.
 set -euo pipefail
 # MP_ROOT / MP_API exist only for the local dry run; leave them unset on the host.
 root="${MP_ROOT:-/opt/mindprobe}"
