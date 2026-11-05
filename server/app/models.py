@@ -160,6 +160,7 @@ AUDIT_REVIEW_LOGIN = "review_login"
 AUDIT_REVIEW_REFRESH = "review_refresh"
 AUDIT_REVIEW_LOGOUT = "review_logout"
 AUDIT_REVIEW_REVOKE = "review_revoke"
+AUDIT_OPERATOR_LOGIN = "operator_login"
 
 #: Reusable review codes issued to the operator (ADR-0005 §6.5). Not join codes.
 REVIEW_CODE_ROLES = ("teacher", "observer")
@@ -1393,6 +1394,8 @@ REVOKE_REASON_SECURITY = "security"
 #: OP replaced a role's join code and chose to cut that role's live tokens.
 #: Exempt nowhere: no ended exemption and no grace upload.
 REVOKE_REASON_JOIN_CODES_REISSUED = "join_codes_reissued"
+#: OP ``POST /op/logout``. Rows sit under ``auth.OPERATOR_AUDIT_SESSION_ID``.
+REVOKE_REASON_OPERATOR_LOGOUT = "operator_logout"
 
 
 def token_revocation_reason(
