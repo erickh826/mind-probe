@@ -89,6 +89,7 @@ test("attention flags", () => {
 
 test("server reasons map to operator copy, unknown ones pass through", () => {
   assert.match(errorMessage(401, "invalid_operator_credentials"), /帳號或密碼不正確/);
+  assert.match(errorMessage(422, "invalid_login_request"), /1024/);
   assert.match(errorMessage(401, "invalid_operator_token"), /重新登入/);
   assert.match(errorMessage(401, "expired_session_token"), /已過期/);
   assert.match(errorMessage(401, "revoked_session_token"), /已登出/);

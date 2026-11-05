@@ -28,6 +28,7 @@ export function LoginGate({ busy, error, onSubmit }: LoginGateProps) {
           id="op-username"
           autoComplete="username"
           spellCheck={false}
+          maxLength={200}
           value={username}
           onChange={(event) => setUsername(event.target.value)}
         />
@@ -36,6 +37,7 @@ export function LoginGate({ busy, error, onSubmit }: LoginGateProps) {
           id="op-password"
           type="password"
           autoComplete="current-password"
+          maxLength={1024}
           value={password}
           onChange={(event) => setPassword(event.target.value)}
         />

@@ -150,3 +150,31 @@ test("logout posts with the login token", async () => {
   assert.equal(calls[0].init.method, "POST");
   assert.equal(new Headers(calls[0].init.headers).get("Authorization"), "Bearer op-secret");
 });
+
+test("a login error never carries the server's quoted input", async () => {
+  const quoted = {
+    detail: [{ type: "string_too_long", loc: ["body", "password"], input: "pw-secret-tail" }],
+  };
+  await assert.rejects(
+    operatorLogin({
+      baseUrl: "https://api.example",
+      username: "admin",
+      password: "pw-secret-tail",
+      fetchImpl: async () => jsonResponse(422, quoted),
+    }),
+    (error: unknown) =>
+      error instanceof OpApiError &&
+      error.status === 422 &&
+      error.detail === "" &&
+      !error.message.includes("secret"),
+  );
+  await assert.rejects(
+    operatorLogin({
+      baseUrl: "https://api.example",
+      username: "admin",
+      password: "pw-secret-tail",
+      fetchImpl: async () => jsonResponse(422, { detail: "pw-secret-tail" }),
+    }),
+    (error: unknown) => error instanceof OpApiError && error.detail === "",
+  );
+});

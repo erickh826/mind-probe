@@ -7,6 +7,7 @@ const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 
 const ERROR_COPY: Record<string, string> = {
   invalid_operator_credentials: "帳號或密碼不正確。",
+  invalid_login_request: "帳號或密碼的格式不符（帳號最多 200 字，密碼最多 1024 字）。",
   invalid_operator_token: "登入已失效，請重新登入。",
   missing_session_token: "尚未登入，請重新登入。",
   expired_session_token: "登入已過期，請重新登入。",

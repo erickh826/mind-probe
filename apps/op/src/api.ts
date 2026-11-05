@@ -73,7 +73,9 @@ export async function operatorLogin({
     referrerPolicy: "no-referrer",
   });
   if (!response.ok) {
-    throw new OpApiError(response.status, await readDetail(response));
+    // Only a bare reason code: a validation error can quote the submitted password.
+    const detail = await readDetail(response);
+    throw new OpApiError(response.status, /^[a-z_]{1,64}$/.test(detail) ? detail : "");
   }
   return (await response.json()) as OperatorLogin;
 }
