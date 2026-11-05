@@ -33,7 +33,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from starlette.datastructures import MutableHeaders
 from starlette.middleware.cors import CORSMiddleware as StarletteCORSMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DBSession
@@ -315,6 +315,19 @@ class OperatorLoginRequest(BaseModel):
 
     username: str = Field(..., min_length=1, max_length=200)
     password: str = Field(..., min_length=1, max_length=1024)
+
+
+async def _operator_login_body(request: Request) -> OperatorLoginRequest:
+    """Parse the login body without FastAPI's default 422, which quotes the input.
+
+    That default would hand the password back in the response body, where a
+    client or script may print it. Any malformed body, extra field, wrong type
+    or out-of-range length is 422 ``invalid_login_request`` and nothing else.
+    """
+    try:
+        return OperatorLoginRequest.model_validate_json(await request.body())
+    except ValidationError:
+        raise HTTPException(status_code=422, detail="invalid_login_request") from None
 
 
 class ReviewLoginRequest(BaseModel):
@@ -921,8 +934,8 @@ def regenerate_review_codes(
 
 @app.post("/op/login")
 def operator_login(
-    body: OperatorLoginRequest,
     request: Request,
+    body: OperatorLoginRequest = Depends(_operator_login_body),
     db: DBSession = Depends(get_db),
 ) -> dict:
     """Exchange the admin username and password for an OP login token.

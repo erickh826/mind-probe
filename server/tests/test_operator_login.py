@@ -150,11 +150,38 @@ def test_malformed_hash_refuses_login(client, monkeypatch):
     assert login(client, password="plaintext-password").status_code == 401
 
 
-def test_extra_fields_are_rejected(client):
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"username": USERNAME, "password": "p" * 1025 + "-secret-tail"},
+        {"username": USERNAME, "password": PASSWORD, "role": "admin-secret-tail"},
+        {"username": USERNAME + "-secret-tail" * 30, "password": PASSWORD},
+        {"username": USERNAME, "password": ["-secret-tail"]},
+        {"username": USERNAME},
+    ],
+)
+def test_invalid_bodies_are_422_without_quoting_the_input(client, db, body):
+    response = client.post("/op/login", json=body)
+    assert response.status_code == 422
+    assert response.json() == {"detail": "invalid_login_request"}
+    assert "secret-tail" not in response.text
+    assert PASSWORD not in response.text
+    # Not a credential attempt: no audit row.
+    assert operator_audits(db) == []
+
+
+def test_non_json_body_is_422(client):
     response = client.post(
-        "/op/login", json={"username": USERNAME, "password": PASSWORD, "role": "admin"}
+        "/op/login", content=b"username=admin&password=x", headers={"Content-Type": "application/json"}
     )
     assert response.status_code == 422
+    assert response.json() == {"detail": "invalid_login_request"}
+
+
+def test_password_at_the_length_limit_still_logs_in(client, monkeypatch):
+    longest = "p" * 1024
+    monkeypatch.setenv(auth.ADMIN_PASSWORD_HASH_ENV, admin_password.hash_password(longest))
+    assert login(client, password=longest).status_code == 200
 
 
 def test_login_attempts_are_rate_limited_per_client(client, monkeypatch):
