@@ -56,6 +56,9 @@ UPLOAD_REDEEM_LIMIT = 5
 #: Join-code reissue has its own budget at the upload-reissue rate.
 JOIN_ISSUE_LIMIT = UPLOAD_ISSUE_LIMIT
 JOIN_ISSUE_WINDOW_SECONDS = UPLOAD_ISSUE_WINDOW_SECONDS
+#: Review-code regeneration has its own budget at the same rate.
+REVIEW_ISSUE_LIMIT = UPLOAD_ISSUE_LIMIT
+REVIEW_ISSUE_WINDOW_SECONDS = UPLOAD_ISSUE_WINDOW_SECONDS
 UPLOAD_REDEEM_WINDOW_SECONDS = 60
 
 
@@ -95,21 +98,24 @@ upload_issue_limiter = SlidingWindowLimiter()
 upload_redeem_limiter = SlidingWindowLimiter()
 review_login_limiter = SlidingWindowLimiter()
 join_issue_limiter = SlidingWindowLimiter()
+review_issue_limiter = SlidingWindowLimiter()
 
 
 def reset_upload_rate_limits() -> None:
     upload_issue_limiter.reset()
     upload_redeem_limiter.reset()
     join_issue_limiter.reset()
+    review_issue_limiter.reset()
 
 
 def review_rate_now() -> float:
-    """Clock for review-login rate limits. Tests replace this rather than sleeping."""
+    """Clock for review rate limits. Tests replace this rather than sleeping."""
     return time.monotonic()
 
 
 def reset_review_rate_limits() -> None:
     review_login_limiter.reset()
+    review_issue_limiter.reset()
 
 
 def _positive_int_env(name: str, default: int) -> int:

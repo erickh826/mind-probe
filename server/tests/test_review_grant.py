@@ -193,6 +193,77 @@ def test_regenerate_review_codes_invalidates_old_codes_not_existing_grants(clien
     assert again.status_code == 200
 
 
+def test_review_code_regeneration_is_rate_limited_per_session(client):
+    create(client)
+    create(client, "S-OTHER")
+    for _ in range(auth.REVIEW_ISSUE_LIMIT):
+        last = client.post("/sessions/S-R/review-codes", headers=OP)
+        assert last.status_code == 200, last.text
+    limited = client.post("/sessions/S-R/review-codes", headers=OP)
+    assert limited.status_code == 429
+    assert limited.json()["detail"] == "rate_limited"
+    # The refused call wrote nothing: the last issued codes still log in.
+    assert review_login(client, "S-R", last.json()["review_codes"]["teacher"]).status_code == 200
+    assert review_login(client, "S-R", last.json()["review_codes"]["observer"]).status_code == 200
+    # Another session has its own budget.
+    assert client.post("/sessions/S-OTHER/review-codes", headers=OP).status_code == 200
+
+
+def test_review_code_rate_limit_window_reopens(client, monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(auth, "review_rate_now", lambda: now[0])
+    create(client)
+    for _ in range(auth.REVIEW_ISSUE_LIMIT):
+        assert client.post("/sessions/S-R/review-codes", headers=OP).status_code == 200
+    now[0] += auth.REVIEW_ISSUE_WINDOW_SECONDS - 1
+    assert client.post("/sessions/S-R/review-codes", headers=OP).status_code == 429
+    now[0] += 1
+    assert client.post("/sessions/S-R/review-codes", headers=OP).status_code == 200
+
+
+@pytest.fixture()
+def _fresh_upload_limits():
+    auth.reset_upload_rate_limits()
+    yield
+    auth.reset_upload_rate_limits()
+
+
+def test_review_code_budget_is_separate_from_join_and_upload_reissue(client, _fresh_upload_limits):
+    create(client)
+    for _ in range(auth.REVIEW_ISSUE_LIMIT):
+        assert client.post("/sessions/S-R/review-codes", headers=OP).status_code == 200
+    assert client.post("/sessions/S-R/review-codes", headers=OP).status_code == 429
+    joined = client.post("/sessions/S-R/join-codes", json={"roles": ["wizard"]}, headers=OP)
+    assert joined.status_code == 200, joined.text
+    uploaded = client.post("/sessions/S-R/upload-reissue", headers=OP)
+    assert uploaded.status_code == 200, uploaded.text
+
+    create(client, "S-JOIN")
+    for _ in range(auth.JOIN_ISSUE_LIMIT):
+        assert client.post("/sessions/S-JOIN/join-codes", json={"roles": ["wizard"]}, headers=OP).status_code == 200
+    assert client.post("/sessions/S-JOIN/join-codes", json={"roles": ["wizard"]}, headers=OP).status_code == 429
+    assert client.post("/sessions/S-JOIN/review-codes", headers=OP).status_code == 200
+
+
+def test_review_code_limit_counts_only_real_issues(client):
+    # Unauthenticated and unknown-session calls never reach the limiter.
+    create(client)
+    for _ in range(auth.REVIEW_ISSUE_LIMIT + 1):
+        assert client.post("/sessions/S-R/review-codes", headers=NO_OP).status_code == 401
+        assert client.post("/sessions/S-LATER/review-codes", headers=OP).status_code == 404
+    assert client.post("/sessions/S-R/review-codes", headers=OP).status_code == 200
+    create(client, "S-LATER")
+    assert client.post("/sessions/S-LATER/review-codes", headers=OP).status_code == 200
+
+
+def test_ended_session_can_still_regenerate_review_codes_within_the_limit(client):
+    create(client)
+    assert client.post("/sessions/S-R/end", headers=OP).status_code == 200
+    for _ in range(auth.REVIEW_ISSUE_LIMIT):
+        assert client.post("/sessions/S-R/review-codes", headers=OP).status_code == 200
+    assert client.post("/sessions/S-R/review-codes", headers=OP).status_code == 429
+
+
 def test_refresh_rotation_and_reuse_revokes_the_chain(client):
     created = create(client)
     first = review_login(client, "S-R", created["review_codes"]["teacher"]).json()
