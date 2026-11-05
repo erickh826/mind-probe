@@ -21,6 +21,7 @@ from typing import Any
 
 from fastapi import HTTPException
 from sqlalchemy import update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DBSession
 
 from . import auth, models
@@ -69,6 +70,7 @@ STUDENT_STATUS_KEYS = (
     "final_sequence",
     "finalize_state",
     "recording_state",
+    "take_claimed",
 )
 
 #: Synchronous ``POST /process`` may run only from these states. Incomplete
@@ -582,9 +584,53 @@ def student_upload_status(session_id: str, db: DBSession) -> dict[str, Any]:
         "final_sequence": final_sequence,
         "finalize_state": rec.finalize_state if rec is not None else "none",
         "recording_state": rec.recording_state if rec is not None else "recording",
+        # Any row means this session already has its one take: claimed by a
+        # new client, or started by an older one (first chunk, finalize, /end).
+        "take_claimed": rec is not None,
     }
     assert set(body) == set(STUDENT_STATUS_KEYS)
     return body
+
+
+def claim_take(db: DBSession, session_id: str, take_id: str) -> dict[str, Any]:
+    """Reserve the session's single take for ``take_id`` (ADR-0005 one take).
+
+    The caller has already checked authentication, that the session exists
+    and is live, and that the token holds the admitted student socket. A
+    repeat of the same ``take_id`` is 200 only while the take is still
+    untouched -- no chunk, no finalize, still ``recording`` -- so a lost
+    response can be retried but nothing is ever restarted. Any other row is
+    409 ``recording_already_claimed``; the claim is never released.
+    """
+    for _attempt in range(2):
+        rec = models.get_recording(db, session_id)
+        if rec is None:
+            db.add(
+                models.Recording(
+                    session_id=session_id,
+                    missing_sequences=[],
+                    take_id=take_id,
+                    claimed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                )
+            )
+            try:
+                db.commit()
+            except IntegrityError:
+                # Another claim, or an older client's first chunk, won the
+                # insert. Judge against the row that exists now.
+                db.rollback()
+                continue
+            return {"take_id": take_id, "status": "claimed"}
+        untouched = (
+            rec.take_id == take_id
+            and rec.recording_state == "recording"
+            and rec.finalize_state == "none"
+            and not _received(session_id, rec)
+        )
+        if untouched:
+            return {"take_id": take_id, "status": "claimed"}
+        raise HTTPException(status_code=409, detail="recording_already_claimed")
+    raise HTTPException(status_code=409, detail="recording_already_claimed")
 
 
 def transcode_allowed(session_id: str, db: DBSession) -> bool:

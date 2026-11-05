@@ -16,13 +16,17 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ADMISSION_TIMEOUT_MS,
   isEventEnvelope,
   isWebSocketControlMessage,
   readAccessToken,
+  SocketLifecycle,
   websocketSubprotocols,
 } from "@mind-probe/shared";
 import type {
   AnyEventEnvelope,
+  CloseKind,
+  SocketEffects,
   ClipCommandPayload,
   ClipInterruptedPayload,
   EventAckMessage,
@@ -60,8 +64,6 @@ const PING_INTERVAL_MS = 10_000;
 const PONG_WAIT_MS = 5_000;
 /** Consecutive missed pongs that mark the connection offline. */
 const MAX_MISSED_HEARTBEATS = 3;
-/** Reconnect backoff ladder, capped (ADR-0001 §3). */
-const BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
 /** Time-to-live stamped onto every short-lived command (ADR-0001 §5). */
 const COMMAND_TTL_MS = 5_000;
 /** Initial clock-sync burst: 9 probes, keep the 5 lowest-RTT (ADR-0003 §4). */
@@ -77,12 +79,6 @@ const START_CHECK_RETRY_FLOOR_MS = 200;
 /** Fallback streak at which ADR-0002 §5 asks the host to step in. */
 export const FALLBACK_THRESHOLD = 3;
 
-/**
- * Close codes the server uses for terminal refusals (4400 invalid_role, 4401
- * auth, 4404 unknown session, 4409 role conflict / taken over). Reconnecting
- * cannot fix any of them, so the ladder stops and the Wizard is told why.
- */
-const TERMINAL_CLOSE_CODES = new Set([4400, 4401, 4403, 4404, 4409]);
 
 /**
  * Event types for which the server bumps `snapshot_revision`. Mirrors
@@ -151,8 +147,14 @@ interface PendingFrame {
 
 export interface SessionSocket {
   status: ConnectionStatus;
-  /** Terminal close reason, e.g. "role_already_connected". */
+  /** Final close reason, e.g. "role_connection_replaced" or "session_ended". */
   closedReason: string | null;
+  /**
+   * Why the console is not admitted (`occupied` while another device holds
+   * the Wizard role, `unavailable` on a server hiccup), or why it closed.
+   * An open transport is not admission: the first snapshot is.
+   */
+  notice: CloseKind | null;
   session: SessionView;
   clock: ClockState;
   lastAck: AckView | null;
@@ -198,6 +200,7 @@ export function useSessionSocket(
 ): SessionSocket {
   const [status, setStatus] = useState<ConnectionStatus>("idle");
   const [closedReason, setClosedReason] = useState<string | null>(null);
+  const [notice, setNotice] = useState<CloseKind | null>(null);
   const [session, setSession] = useState<SessionView>(INITIAL_SESSION_VIEW);
   const [clock, setClock] = useState<ClockState>({
     offset_ms: null,
@@ -215,10 +218,12 @@ export function useSessionSocket(
   const [startError, setStartError] = useState<string | null>(null);
 
   const socketRef = useRef<WebSocket | null>(null);
-  const shouldReconnectRef = useRef(false);
-  const reconnectAttemptRef = useRef(0);
   const reconnectTimerRef = useRef<number | null>(null);
-  const hasConnectedOnceRef = useRef(false);
+  const admissionTimerRef = useRef<number | null>(null);
+  /** Set while the current socket is admitted; envelopes are sent only then. */
+  const admittedRef = useRef(false);
+  /** Called with the id of the socket a `session_snapshot` arrived on. */
+  const admitRef = useRef<((socketId: number) => void) | null>(null);
 
   const pingTimerRef = useRef<number | null>(null);
   const pongTimersRef = useRef(new Map<string, number>());
@@ -397,7 +402,7 @@ export function useSessionSocket(
             ? payload.command_id
             : `${sessionId}:wizard:${sequence}`;
 
-      if (!rawSend(envelope)) {
+      if (!admittedRef.current || !rawSend(envelope)) {
         appendLog("error", `連線中斷，${eventType} 未送出 (not sent: offline)`);
         return false;
       }
@@ -528,7 +533,7 @@ export function useSessionSocket(
         client_timestamp_ms: Date.now(),
         payload,
       };
-      if (!rawSend(frame)) {
+      if (!admittedRef.current || !rawSend(frame)) {
         appendLog("error", "連線中斷，fallback 未送出 (not sent: offline)");
         return;
       }
@@ -849,7 +854,7 @@ export function useSessionSocket(
     pongTimersRef.current.clear();
   }, []);
 
-  const startHeartbeat = useCallback(() => {
+  const startHeartbeat = useCallback((onTimeout: () => void) => {
     clearHeartbeat();
     missedPongsRef.current = 0;
     pingTimerRef.current = window.setInterval(() => {
@@ -862,8 +867,8 @@ export function useSessionSocket(
         missedPongsRef.current += 1;
         if (missedPongsRef.current >= MAX_MISSED_HEARTBEATS) {
           appendLog("error", "心跳連續逾時，重新連線 (heartbeat lost)");
-          // Closing is what starts the backoff ladder over in `onclose`.
-          socketRef.current?.close();
+          // Do not wait for onclose: on a silent network it can come very late.
+          onTimeout();
         } else {
           setStatus("degraded");
         }
@@ -887,7 +892,7 @@ export function useSessionSocket(
   // --- Message router ------------------------------------------------------
 
   const handleMessage = useCallback(
-    (raw: string) => {
+    (raw: string, socketId: number) => {
       let parsed: unknown;
       try {
         parsed = JSON.parse(raw);
@@ -907,6 +912,8 @@ export function useSessionSocket(
             handleAck(parsed);
             return;
           case "session_snapshot":
+            // The first snapshot on a socket is its admission.
+            admitRef.current?.(socketId);
             applySnapshot(parsed);
             return;
           case "clock_sync_response":
@@ -972,10 +979,9 @@ export function useSessionSocket(
       return;
     }
 
-    shouldReconnectRef.current = true;
-    reconnectAttemptRef.current = 0;
-    hasConnectedOnceRef.current = false;
     let disposed = false;
+    const lifecycle = new SocketLifecycle();
+    admittedRef.current = false;
 
     const token = accessToken ?? readAccessToken(sessionId);
     if (!token) {
@@ -984,39 +990,116 @@ export function useSessionSocket(
       return;
     }
 
+    const clearAdmissionTimer = () => {
+      if (admissionTimerRef.current !== null) {
+        window.clearTimeout(admissionTimerRef.current);
+        admissionTimerRef.current = null;
+      }
+    };
+
+    const apply = (socket: WebSocket, socketId: number, effects: SocketEffects) => {
+      if (effects.status !== undefined) {
+        setStatus(effects.status);
+      }
+      if (effects.closedReason !== undefined) {
+        setClosedReason(effects.closedReason);
+      }
+      if (effects.notice !== undefined) {
+        setNotice(effects.notice);
+      }
+      if (effects.sendHello) {
+        requestSnapshot();
+      }
+      if (effects.admitted) {
+        clearAdmissionTimer();
+        admittedRef.current = true;
+        // ADR-0001 §4: snapshot first, and only then the replay of whatever
+        // was still unacknowledged when the old socket died. The admitting
+        // snapshot is applied right after this, which runs that replay.
+        replayAfterSnapshotRef.current = true;
+        appendLog("info", "WebSocket 已入場 (admitted)");
+        startClockSync();
+        startHeartbeat(() => apply(socket, socketId, lifecycle.timedOut(socketId)));
+      }
+      if (effects.detach || effects.reconnectInMs !== undefined || effects.stop) {
+        clearHeartbeat();
+        clearAdmissionTimer();
+        admittedRef.current = false;
+      }
+      if (effects.detach) {
+        socket.onopen = null;
+        socket.onmessage = null;
+        socket.onerror = null;
+        socket.onclose = null;
+        socket.close();
+        if (socketRef.current === socket) {
+          socketRef.current = null;
+        }
+      }
+      if (effects.reconnectInMs !== undefined) {
+        const delay = effects.reconnectInMs;
+        appendLog(
+          "warn",
+          effects.notice === "occupied"
+            ? `另一個裝置正使用 Wizard 角色，${delay / 1000}s 後重試 (role occupied)`
+            : `連線中斷，${delay / 1000}s 後重試 (reconnecting)`,
+        );
+        reconnectTimerRef.current = window.setTimeout(connect, delay);
+      }
+      if (effects.stop) {
+        const reason = effects.closedReason ?? "unknown";
+        // POST /end closes every live socket with this reason and does not
+        // broadcast a session_ended envelope first. Reflect that here so the
+        // console leaves the live state without a second end path.
+        if (effects.notice === "ended") {
+          setSession((view) =>
+            view.session_state === "ended" ? view : { ...view, session_state: "ended" },
+          );
+          appendLog("info", "場次已結束 (session_ended)");
+        } else {
+          appendLog("error", `連線結束：${reason}`);
+        }
+      }
+    };
+
     const connect = () => {
-      if (disposed || !shouldReconnectRef.current) {
+      reconnectTimerRef.current = null;
+      if (disposed) {
         return;
       }
-      setStatus(hasConnectedOnceRef.current ? "reconnecting" : "connecting");
+      const { id: socketId, status: nextStatus } = lifecycle.begin();
+      setStatus(nextStatus);
       const socket = new WebSocket(
         sessionSocketUrl(sessionId),
         websocketSubprotocols(token),
       );
       socketRef.current = socket;
 
+      admitRef.current = (admittedId: number) => {
+        if (admittedId === socketId) {
+          apply(socket, socketId, lifecycle.snapshot(socketId));
+        }
+      };
+
       socket.onopen = () => {
-        if (disposed) {
+        if (disposed || !lifecycle.isCurrent(socketId)) {
           socket.close();
           return;
         }
-        hasConnectedOnceRef.current = true;
-        reconnectAttemptRef.current = 0;
-        setStatus("open");
-        setClosedReason(null);
-        appendLog("info", "WebSocket 已連線 (connected)");
-        // ADR-0001 §4: snapshot first, and only then the replay of whatever
-        // was still unacknowledged when the old socket died.
-        replayAfterSnapshotRef.current = true;
-        requestSnapshot();
-        startClockSync();
-        startHeartbeat();
+        // Not admitted yet: the server accepts a refusal too, then closes it.
+        appendLog("info", "WebSocket 已開啟，等待 snapshot (waiting for admission)");
+        admissionTimerRef.current = window.setTimeout(() => {
+          admissionTimerRef.current = null;
+          apply(socket, socketId, lifecycle.timedOut(socketId));
+        }, ADMISSION_TIMEOUT_MS);
+        apply(socket, socketId, lifecycle.opened(socketId));
       };
 
       socket.onmessage = (event) => {
-        if (typeof event.data === "string") {
-          handleMessage(event.data);
+        if (!lifecycle.isCurrent(socketId) || typeof event.data !== "string") {
+          return;
         }
+        handleMessage(event.data, socketId);
       };
 
       socket.onerror = () => {
@@ -1025,43 +1108,13 @@ export function useSessionSocket(
       };
 
       socket.onclose = (event) => {
-        clearHeartbeat();
-        socketRef.current = null;
-        if (disposed) {
+        if (disposed || !lifecycle.isCurrent(socketId)) {
           return;
         }
-        if (TERMINAL_CLOSE_CODES.has(event.code)) {
-          // 4400/4401/4403/4404/4409 are refusals rather than glitches — retrying
-          // would hammer the server with the same rejected upgrade.
-          shouldReconnectRef.current = false;
-          setStatus("closed");
-          const reason = event.reason || String(event.code);
-          setClosedReason(reason);
-          // POST /end closes every live socket with this reason and does not
-          // broadcast a session_ended envelope first. Reflect that here so the
-          // console leaves the live state without a second end path.
-          if (reason === "session_ended") {
-            setSession((view) =>
-              view.session_state === "ended"
-                ? view
-                : { ...view, session_state: "ended" },
-            );
-            appendLog("info", "場次已結束 (session_ended)");
-          } else {
-            appendLog("error", `連線被拒絕 (${event.code}): ${reason}`);
-          }
-          return;
+        if (socketRef.current === socket) {
+          socketRef.current = null;
         }
-        if (!shouldReconnectRef.current) {
-          setStatus("closed");
-          return;
-        }
-        const attempt = reconnectAttemptRef.current;
-        const delay = BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)];
-        reconnectAttemptRef.current = attempt + 1;
-        setStatus("reconnecting");
-        appendLog("warn", `連線中斷，${delay / 1000}s 後重試 (reconnecting)`);
-        reconnectTimerRef.current = window.setTimeout(connect, delay);
+        apply(socket, socketId, lifecycle.closed(socketId, event.code, event.reason));
       };
     };
 
@@ -1069,8 +1122,11 @@ export function useSessionSocket(
 
     return () => {
       disposed = true;
-      shouldReconnectRef.current = false;
+      lifecycle.dispose();
+      admittedRef.current = false;
+      admitRef.current = null;
       clearHeartbeat();
+      clearAdmissionTimer();
       if (reconnectTimerRef.current !== null) {
         window.clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
@@ -1119,6 +1175,7 @@ export function useSessionSocket(
     () => ({
       status,
       closedReason,
+      notice,
       session,
       clock,
       lastAck,
@@ -1145,6 +1202,7 @@ export function useSessionSocket(
       dismissThresholdAlert,
       lastAck,
       log,
+      notice,
       pendingCount,
       sendClipCommand,
       sendClipInterrupted,

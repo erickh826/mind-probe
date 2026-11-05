@@ -108,7 +108,8 @@ flowchart LR
 | `GET /sessions/{id}/audit` | T、O | T、OP（**O 不行**） | review/OP | ✔ | ✔ | audit 內容比較敏感 |
 | `POST /recording/{id}/chunk` | 公開 | **只限 S** | live | ✔ | ✔，但在 §7.3 的寬限期內允許 | |
 | `POST /recording/{id}/finalize`（新增） | — | **只限 S** | live | ✔ | 同上 | 提交最後一段的 sequence（§7） |
-| `GET /recording/{id}/status` | 公開 | **S（只看自己的上傳進度）**；T、O、OP 改用 `/sessions/{id}/recording/status` | live（S） | ✔ | ✔，但在 §7.3 的寬限期內允許 | **只回傳精簡欄位**：`received_sequences`（或用壓縮的區間表示）、`next_expected_sequence`（最小缺漏序號）、`final_sequence`、`finalize_state`（`none\|pending\|complete\|incomplete`）、`recording_state`。**不回傳**路徑、檔案大小、checksum、轉檔和上傳細節 |
+| `POST /recording/{id}/claim {take_id}`（新增，D3） | — | **只限 S**，且此 token 必須持有已入場的學生 WS 連線，否則 409 `role_not_admitted` | live | ✔ | ended 時回 409 `session_ended` | 取得相機後、`MediaRecorder.start()` 前認領這場次唯一的錄影。同一個 `take_id` 在錄影尚未有片段或 finalize 時重送回 200，其他情況一律 409 `recording_already_claimed`，認領不會釋放。`take_id` 由分頁產生、只存在記憶體，不是憑證 |
+| `GET /recording/{id}/status` | 公開 | **S（只看自己的上傳進度）**；T、O、OP 改用 `/sessions/{id}/recording/status` | live（S） | ✔ | ✔，但在 §7.3 的寬限期內允許 | **只回傳精簡欄位**：`received_sequences`（或用壓縮的區間表示）、`next_expected_sequence`（最小缺漏序號）、`final_sequence`、`finalize_state`（`none\|pending\|complete\|incomplete`）、`recording_state`、`take_claimed`（這場次已有錄影，含首段尚未上傳的已認領錄影）。**不回傳**路徑、檔案大小、checksum、轉檔和上傳細節 |
 | `POST /recording/{id}/process` | 公開，同步執行 | OP，或 T（review） | OP/review | ✔ | ✔ | 改成**只建立工作**（§8），回 202；`allow_missing_header` 只限 OP |
 | `WS /ws/{id}/{role}` | cookie | path 上的 role 必須等於 token 的 role；S 和 W 各只能有一個連線，T 和 O 可以多個 | live（T 和 O 也可以用 review） | ✔ | ✔，ended 時拒絕 | §6.6 |
 | `GET /cases/*` StaticFiles | 公開 | 只在 local backend 時掛載 | | | | 正式環境由 R2 提供 |

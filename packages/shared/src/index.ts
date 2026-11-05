@@ -4,3 +4,4 @@ export * from "./messages";
 export * from "./api";
 export * from "./sessionAuth";
 export * from "./reviewSession";
+export * from "./socketLifecycle";

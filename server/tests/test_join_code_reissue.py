@@ -23,6 +23,7 @@ from app import auth, models, recording, websocket
 from app.main import app
 from app.models import Base
 from app.websocket import WS_PROTOCOL
+from .ws_assert import assert_upgrade_refused
 
 OPERATOR = {"Authorization": "Bearer test-operator-token-0123456789abcdef"}
 EBML = recording.EBML_MAGIC + b"\x01\x00\x00\x00\x00\x00\x00\x23header"
@@ -314,12 +315,13 @@ def test_revoke_live_closes_the_old_socket_only_after_commit_and_spares_others()
         _ping(wiz, "wizard-still-up")
 
     # The old token cannot open a new socket.
-    with pytest.raises(WebSocketDisconnect) as refused:
-        with client.websocket_connect(
+    assert_upgrade_refused(
+        client.websocket_connect(
             f"/ws/{session_id}/student", subprotocols=_subprotocols(student)
-        ):
-            pass
-    assert refused.value.code == 4401
+        ),
+        code=4401,
+        reason="token_revoked",
+    )
 
     # A device joining with the new code connects and stays up.
     fresh = _token(session_id, response.json()["join_codes"]["student"], "new-device")

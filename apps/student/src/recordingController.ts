@@ -5,6 +5,7 @@
 import { ApiError } from "./apiError.ts";
 import {
   deleteChunk,
+  deleteUnstartedMeta,
   listChunks,
   openRecordingDb,
   purgeExpiredMeta,
@@ -23,16 +24,20 @@ import {
   closeBanner,
   emptyMeta,
   finalizeDue,
+  holdForRecorderFlush,
   noteFinalizeAttempt,
   notePermanentFailure,
   permanentBlockMessage,
   permanentUploadBlock,
   persistInterrupted,
   persistRecorderLost,
+  persistReplaced,
   persistStop,
   planReload,
+  releaseRecorderFlush,
   sequencesAlreadyReceived,
   storageWarning,
+  takeAlreadyStarted,
   type CloseBanner,
   type FinalizePayload,
   type RecordingMeta,
@@ -51,7 +56,14 @@ export interface RecordingView {
   banner: CloseBanner;
   storageWarning: string | null;
   canStart: boolean;
+  /**
+   * The server's word on whether this session already has its take: `free`
+   * lets a fresh tab start, `unknown` (not loaded or failed) does not.
+   */
+  takeCheck: TakeState;
 }
+
+export type TakeState = "unknown" | "free" | "claimed";
 
 type Listener = (view: RecordingView) => void;
 
@@ -77,6 +89,7 @@ interface RecordingTransport {
     final_sequence: number | null;
     missing_sequences: number[];
   }>;
+  claimRecording: (sessionId: string, takeId: string) => Promise<unknown>;
 }
 
 const defaultTransport: RecordingTransport = {
@@ -91,6 +104,10 @@ const defaultTransport: RecordingTransport = {
   finalizeRecording: async (sessionId, payload) => {
     const api = await import("./api.ts");
     return api.finalizeRecording(sessionId, payload);
+  },
+  claimRecording: async (sessionId, takeId) => {
+    const api = await import("./api.ts");
+    return api.claimRecording(sessionId, takeId);
   },
 };
 
@@ -132,11 +149,101 @@ const inFlight = new Set<number>();
 let chunkUploaded: ((sequence: number, timestampMs: number) => void) | null = null;
 let persistChain: Promise<void> = Promise.resolve();
 let stopPromise: Promise<void> = Promise.resolve();
+/** The session whose onstop is storing its last slices and declaring the take. */
+let committingStop: string | null = null;
 /** Sessions whose live credential was revoked in this tab. No recorder starts for them again. */
 const revokedSessions = new Set<string>();
+/** Sessions another device took over from this tab (4409). No recorder starts for them again. */
+const replacedSessions = new Set<string>();
+/**
+ * Sessions whose socket the server has admitted right now. Fed by the socket
+ * hook; an open transport is not enough, and neither is holding a live token.
+ */
+const admittedSessions = new Set<string>();
+/**
+ * The take this tab has asked the server for and not yet started recording.
+ * Memory only: never storage, so a duplicated tab or a reload cannot reuse it.
+ */
+let pendingTake: { sessionId: string; takeId: string } | null = null;
+/** The one start attempt in flight; concurrent starts join it. */
+let startTask: Promise<void> | null = null;
+let takeCheck: { sessionId: string; state: TakeState } | null = null;
+const CLAIM_ATTEMPTS = 3;
+const CLAIM_RETRY_MS = 500;
+/**
+ * Held by the tab whose recorder owns a session's take, for as long as it may
+ * write it. Tabs share IndexedDB: without this a duplicated tab reconciling
+ * the same meta would declare the live take lost and finalize it.
+ */
+const RECORDER_LOCK_PREFIX = "mindprobe-recorder:";
+const OTHER_TAB_RECHECK_MS = 3_000;
+let releaseRecorderLock: (() => void) | null = null;
 
 const REVOKED_MESSAGE =
   "此裝置的連線已被撤銷，錄影已停止。已保存的片段仍可在權限及期限允許時補傳：重新整理頁面，再輸入老師或管理員提供的補傳碼。這段錄影會標記為不完整。";
+const REPLACED_MESSAGE =
+  "此裝置已被另一個連線取代，錄影已停止。已保存的片段會繼續上傳；這段錄影會標記為不完整。";
+const ALREADY_CLAIMED_MESSAGE =
+  "此場次已有錄影，換裝置不會接續；如需重新錄影請建立新場次。";
+const NOT_ADMITTED_MESSAGE = "尚未連上場次。連線完成後才能開始錄影。";
+const TAKE_UNKNOWN_MESSAGE = "無法確認此場次的錄影狀態，請稍後再按 Start REC。";
+const SESSION_ENDED_MESSAGE = "場次已結束，無法開始錄影。";
+const UNAUTHORIZED_MESSAGE = "此裝置的登入已失效，無法開始錄影。請重新加入場次。";
+const CLAIM_FAILED_MESSAGE = "無法向伺服器確認開始錄影，請再按一次 Start REC。";
+const START_FAILED_MESSAGE = "錄影器無法啟動，請再按一次 Start REC";
+const OTHER_TAB_MESSAGE = "此場次正在另一個分頁錄影。請回到那個分頁，不要在這裡重新開始。";
+
+function webLocks(): LockManager | null {
+  return typeof navigator !== "undefined" && navigator.locks ? navigator.locks : null;
+}
+
+/** Take the recorder lock for this tab. False when another tab holds it. */
+function holdRecorderLock(sessionId: string): Promise<boolean> {
+  const locks = webLocks();
+  if (locks === null) {
+    return Promise.resolve(true);
+  }
+  dropRecorderLock();
+  return new Promise<boolean>((resolve) => {
+    void locks
+      .request(RECORDER_LOCK_PREFIX + sessionId, { ifAvailable: true }, (lock) => {
+        if (lock === null) {
+          resolve(false);
+          return undefined;
+        }
+        resolve(true);
+        return new Promise<void>((release) => {
+          releaseRecorderLock = release;
+        });
+      })
+      .catch(() => resolve(true));
+  });
+}
+
+function dropRecorderLock(): void {
+  releaseRecorderLock?.();
+  releaseRecorderLock = null;
+}
+
+/** Whether another tab's recorder holds this session's take right now. */
+async function recorderHeldElsewhere(sessionId: string): Promise<boolean> {
+  const locks = webLocks();
+  if (locks === null) {
+    return false;
+  }
+  try {
+    const snapshot = await locks.query();
+    return (snapshot.held ?? []).some((lock) => lock.name === RECORDER_LOCK_PREFIX + sessionId);
+  } catch {
+    return false;
+  }
+}
+
+function newTakeId(): string {
+  return typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
 
 function db(): Promise<IDBDatabase> {
   databasePromise ??= openRecordingDb();
@@ -153,8 +260,62 @@ function view(): RecordingView {
     pendingCount,
     banner: closeBanner(meta, pendingCount),
     storageWarning: warning,
-    canStart: canStart && !(boundSession !== null && revokedSessions.has(boundSession)),
+    canStart:
+      canStart &&
+      !(boundSession !== null && revokedSessions.has(boundSession)) &&
+      !(boundSession !== null && replacedSessions.has(boundSession)) &&
+      currentTakeState() !== "claimed",
+    takeCheck: currentTakeState(),
   };
+}
+
+function currentTakeState(): TakeState {
+  if (boundSession === null || takeCheck?.sessionId !== boundSession) {
+    return "unknown";
+  }
+  // A take this tab is still confirming is its own, not someone else's.
+  if (pendingTake?.sessionId === boundSession && takeCheck.state === "claimed" && meta === null) {
+    return "free";
+  }
+  return takeCheck.state;
+}
+
+/**
+ * The socket hook reports admission. A fresh tab with no local take asks the
+ * server whether the session already has one, so Start REC and auto-start
+ * wait for a definite answer and a failed check is tried again.
+ */
+export function setSocketAdmitted(sessionId: string, admitted: boolean): void {
+  if (admitted) {
+    admittedSessions.add(sessionId);
+  } else {
+    admittedSessions.delete(sessionId);
+  }
+  if (
+    admitted &&
+    boundSession === sessionId &&
+    meta === null &&
+    currentTakeState() === "unknown"
+  ) {
+    void checkTake(sessionId).then(() => {
+      showClaimedElsewhere(sessionId);
+      emit();
+    });
+  }
+  emit();
+}
+
+/** A fresh tab learned the take exists: say so, rather than just hiding Start REC. */
+function showClaimedElsewhere(sessionId: string): void {
+  if (
+    boundSession === sessionId &&
+    meta === null &&
+    pendingTake?.sessionId !== sessionId &&
+    takeCheck?.sessionId === sessionId &&
+    takeCheck.state === "claimed"
+  ) {
+    lockAlreadyClaimed(sessionId);
+  }
 }
 
 function emit(): void {
@@ -338,10 +499,39 @@ async function reconcile(sessionId: string, now: number): Promise<void> {
   if (current === null) {
     meta = null;
     canStart = true;
+    if (admittedSessions.has(sessionId) && currentTakeState() === "unknown") {
+      await checkTake(sessionId);
+      showClaimedElsewhere(sessionId);
+      emit();
+    }
     return;
   }
-  const recorderStillHere =
-    active?.sessionId === sessionId && active.recorder.state !== "inactive";
+  const recorderHere = active?.sessionId === sessionId && active.recorder.state !== "inactive";
+  // This tab's recorder is stopping: its onstop stores the last slices and
+  // owns the declaration.
+  const stopPendingHere =
+    !recorderHere && (active?.sessionId === sessionId || committingStop === sessionId);
+  // A duplicated tab shares this meta. While the tab that records it holds
+  // the lock, its take is alive, not lost, and a held lost declaration still
+  // waits for its last slices; look again once the lock is free.
+  const recordingElsewhere =
+    !recorderHere &&
+    !stopPendingHere &&
+    (current.recorder_state === "recording" || current.recorder_flush_pending === true) &&
+    (await recorderHeldElsewhere(sessionId));
+  if (recordingElsewhere) {
+    meta = current;
+    canStart = false;
+    status = "idle";
+    rememberHeldFailure(OTHER_TAB_MESSAGE);
+    setTimeout(() => {
+      if (boundSession === sessionId) {
+        void reconcile(sessionId, Date.now()).then(() => emit());
+      }
+    }, OTHER_TAB_RECHECK_MS);
+    return;
+  }
+  const recorderStillHere = recorderHere || stopPendingHere;
   try {
     const serverStatus = await transport.fetchUploadStatus(sessionId);
     const chunks = await listChunks(database, sessionId);
@@ -364,8 +554,10 @@ async function reconcile(sessionId: string, now: number): Promise<void> {
   }
   meta = current;
   canStart = false;
-  if (recorderStillHere) {
+  if (recorderHere) {
     status = "recording";
+  } else if (stopPendingHere) {
+    status = "stopping";
   } else if (planReload(current).kind !== "idle") {
     status = "stopped";
   }
@@ -381,6 +573,11 @@ function mergeReload(
   // A remount while MediaRecorder is still running is not a lost take.
   if (planReload(next).kind === "recorder_lost" && !recorderStillHere) {
     next = persistRecorderLost(next, now);
+  }
+  // No recorder is left to store the slices a held declaration waited for
+  // (the page that ran it is gone): declare what was stored.
+  if (!recorderStillHere) {
+    next = releaseRecorderFlush(next, now);
   }
   return next;
 }
@@ -463,10 +660,11 @@ export async function persistBlob(sessionId: string, blob: Blob): Promise<void> 
 
 async function markDurableChunkLoss(sessionId: string): Promise<void> {
   const database = await db();
-  const updated = await updateMeta(database, sessionId, (latest) => ({
-    ...persistRecorderLost(latest, Date.now()),
-    needs_operator: true,
-  }));
+  const running = active?.sessionId === sessionId && active.recorder.state !== "inactive";
+  const updated = await updateMeta(database, sessionId, (latest) => {
+    const lost = { ...persistRecorderLost(latest, Date.now()), needs_operator: true };
+    return running ? holdForRecorderFlush(lost) : lost;
+  });
   if (updated) {
     meta = updated;
   }
@@ -516,9 +714,50 @@ function attachRecorder(sessionId: string, recorder: MediaRecorder, stream: Medi
   };
 }
 
-export async function startRecording(sessionId: string): Promise<void> {
-  cancelRelease();
+/**
+ * Start this tab's one take. Concurrent calls -- a double click, auto-start,
+ * the 5 s camera retry -- share one attempt, so two recorders never start.
+ */
+export function startRecording(sessionId: string): Promise<void> {
+  startTask ??= startRecordingOnce(sessionId).finally(() => {
+    startTask = null;
+  });
+  return startTask;
+}
+
+function stopTracks(stream: MediaStream | null): void {
+  stream?.getTracks().forEach((track) => track.stop());
+}
+
+/** Why this tab may not start right now, or null. Checked before and after each wait. */
+function startBlocked(sessionId: string): string | null {
   if (revokedSessions.has(sessionId)) {
+    return REVOKED_MESSAGE;
+  }
+  if (replacedSessions.has(sessionId)) {
+    return REPLACED_MESSAGE;
+  }
+  if (!admittedSessions.has(sessionId)) {
+    return NOT_ADMITTED_MESSAGE;
+  }
+  return null;
+}
+
+function holdStartRefusal(message: string): void {
+  rememberHeldFailure(message);
+  retryable = false;
+  status = "idle";
+}
+
+function lockAlreadyClaimed(sessionId: string): void {
+  takeCheck = { sessionId, state: "claimed" };
+  canStart = false;
+  holdStartRefusal(ALREADY_CLAIMED_MESSAGE);
+}
+
+async function startRecordingOnce(sessionId: string): Promise<void> {
+  cancelRelease();
+  if (revokedSessions.has(sessionId) || replacedSessions.has(sessionId)) {
     emit();
     return;
   }
@@ -537,6 +776,28 @@ export async function startRecording(sessionId: string): Promise<void> {
     emit();
     return;
   }
+  const blocked = startBlocked(sessionId);
+  if (blocked !== null) {
+    holdStartRefusal(blocked);
+    emit();
+    return;
+  }
+  // D3: a take this tab is still confirming skips only the "already claimed"
+  // check for its own id. Everything else is asked of the server again.
+  const pendingId = pendingTake?.sessionId === sessionId ? pendingTake.takeId : null;
+  if (pendingId === null) {
+    const state = await checkTake(sessionId);
+    if (state === "claimed") {
+      lockAlreadyClaimed(sessionId);
+      emit();
+      return;
+    }
+    if (state !== "free") {
+      holdStartRefusal(TAKE_UNKNOWN_MESSAGE);
+      emit();
+      return;
+    }
+  }
   if (typeof MediaRecorder === "undefined" || !navigator.mediaDevices?.getUserMedia) {
     status = "unavailable";
     rememberHeldFailure("MediaRecorder is not available in this browser.");
@@ -547,41 +808,10 @@ export async function startRecording(sessionId: string): Promise<void> {
   forgetError();
   retryable = false;
   emit();
-  let stream: MediaStream | null = null;
+  let stream: MediaStream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-    if (revokedSessions.has(sessionId)) {
-      // Revoked while the permission prompt was open: never start capturing.
-      stream.getTracks().forEach((track) => track.stop());
-      status = "idle";
-      emit();
-      return;
-    }
-    const again = await readMeta(database, sessionId);
-    if (again !== null) {
-      stream.getTracks().forEach((track) => track.stop());
-      canStart = false;
-      meta = again;
-      emit();
-      return;
-    }
-    const mimeType = pickMimeType();
-    const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-    const created = emptyMeta(sessionId, Date.now());
-    await writeMeta(database, created);
-    meta = created;
-    canStart = false;
-    attachRecorder(sessionId, recorder, stream);
-    recorder.start(2_000);
-    status = "recording";
-    ensurePump(sessionId);
-    if (revokedSessions.has(sessionId)) {
-      // Revoked during the meta write above: stop the take that just began.
-      await interruptRecording(sessionId);
-      return;
-    }
   } catch (cause) {
-    stream?.getTracks().forEach((track) => track.stop());
     if (revokedSessions.has(sessionId)) {
       // The prompt failed after the revocation. Keep the revocation in view, no retry.
       status = "idle";
@@ -591,8 +821,230 @@ export async function startRecording(sessionId: string): Promise<void> {
       retryable = described.retryable;
       status = "error";
     }
+    emit();
+    return;
+  }
+  const blockedAfterPrompt = startBlocked(sessionId);
+  if (blockedAfterPrompt !== null) {
+    // Revoked, replaced, or disconnected while the permission prompt was open.
+    stopTracks(stream);
+    holdStartRefusal(blockedAfterPrompt);
+    emit();
+    return;
+  }
+  const again = await readMeta(database, sessionId);
+  if (again !== null) {
+    stopTracks(stream);
+    canStart = false;
+    meta = again;
+    status = "idle";
+    emit();
+    return;
+  }
+
+  // Claim after the camera is granted, so a refused camera never uses up the take.
+  const takeId = pendingId ?? newTakeId();
+  pendingTake = { sessionId, takeId };
+  const claim = await claimWithRetry(sessionId, takeId);
+  if (claim !== "claimed" && claim !== "legacy") {
+    stopTracks(stream);
+    await refuseClaim(sessionId, claim);
+    emit();
+    return;
+  }
+  const blockedAfterClaim = startBlocked(sessionId);
+  if (blockedAfterClaim !== null) {
+    // The claim stands (it is never released); this tab just may not record now.
+    stopTracks(stream);
+    holdStartRefusal(blockedAfterClaim);
+    emit();
+    return;
+  }
+  takeCheck = { sessionId, state: "claimed" };
+  if (!(await holdRecorderLock(sessionId))) {
+    // Another tab of this browser is recording this take already.
+    stopTracks(stream);
+    canStart = false;
+    holdStartRefusal(OTHER_TAB_MESSAGE);
+    emit();
+    return;
+  }
+
+  let recorder: MediaRecorder;
+  let created: RecordingMeta;
+  try {
+    const mimeType = pickMimeType();
+    recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+    created = emptyMeta(sessionId, Date.now());
+    await writeMeta(database, created);
+  } catch (cause) {
+    // Nothing was captured. The claim is kept and this tab may retry it.
+    dropRecorderLock();
+    stopTracks(stream);
+    rememberHeldFailure(`${START_FAILED_MESSAGE}（${String(cause)}）`);
+    status = "error";
+    emit();
+    return;
+  }
+  meta = created;
+  canStart = false;
+  attachRecorder(sessionId, recorder, stream);
+  try {
+    recorder.start(2_000);
+  } catch (cause) {
+    await abandonUnstartedRecorder(sessionId, recorder, stream, created);
+    rememberHeldFailure(`${START_FAILED_MESSAGE}（${String(cause)}）`);
+    status = "error";
+    emit();
+    return;
+  }
+  // start() returned: from here on any failure is a lost take, never a restart.
+  pendingTake = null;
+  status = "recording";
+  ensurePump(sessionId);
+  if (revokedSessions.has(sessionId)) {
+    // Revoked during the meta write above: stop the take that just began.
+    await interruptRecording(sessionId);
+    return;
+  }
+  if (replacedSessions.has(sessionId)) {
+    await stopReplacedRecording(sessionId);
+    return;
   }
   emit();
+}
+
+/**
+ * `MediaRecorder.start()` threw, so it never captured. Fence the recorder off,
+ * let anything already queued settle, and remove only the meta this attempt
+ * wrote. The same tab may then retry with the same pending take id.
+ */
+async function abandonUnstartedRecorder(
+  sessionId: string,
+  recorder: MediaRecorder,
+  stream: MediaStream,
+  created: RecordingMeta,
+): Promise<void> {
+  recorder.ondataavailable = null;
+  recorder.onstop = null;
+  recorder.onerror = null;
+  stopTracks(stream);
+  if (active?.recorder === recorder) {
+    active = null;
+  }
+  await persistChain.catch(() => undefined);
+  dropRecorderLock();
+  const database = await db();
+  const removed = await deleteUnstartedMeta(
+    database,
+    sessionId,
+    created.recorder_started_at ?? -1,
+  );
+  if (removed) {
+    meta = null;
+    canStart = true;
+  } else {
+    // A slice was stored after all, so capture did happen: keep it, declare
+    // the take lost, and never restart it.
+    meta = await updateMeta(database, sessionId, (latest) => persistRecorderLost(latest, Date.now()));
+    canStart = false;
+  }
+}
+
+/** The server's word on this session's take: claimed, free, or unknown (failed). */
+async function checkTake(sessionId: string): Promise<TakeState> {
+  try {
+    const serverStatus = await transport.fetchUploadStatus(sessionId);
+    const state: TakeState = takeAlreadyStarted(serverStatus) ? "claimed" : "free";
+    takeCheck = { sessionId, state };
+    return state;
+  } catch {
+    takeCheck = { sessionId, state: "unknown" };
+    return "unknown";
+  }
+}
+
+type ClaimOutcome =
+  | "claimed"
+  | "legacy"
+  | "already_claimed"
+  | "ended"
+  | "not_admitted"
+  | "revoked"
+  | "unauthorized"
+  | "failed";
+
+async function claimWithRetry(sessionId: string, takeId: string): Promise<ClaimOutcome> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await transport.claimRecording(sessionId, takeId);
+      return "claimed";
+    } catch (cause) {
+      const outcome = classifyClaimError(cause);
+      if (outcome !== "failed" || attempt >= CLAIM_ATTEMPTS) {
+        return outcome;
+      }
+      await new Promise((resolve) => setTimeout(resolve, CLAIM_RETRY_MS * attempt));
+    }
+  }
+}
+
+function classifyClaimError(cause: unknown): ClaimOutcome {
+  if (!(cause instanceof ApiError)) {
+    return "failed";
+  }
+  if (cause.status === 409) {
+    switch (cause.code) {
+      case "recording_already_claimed":
+        return "already_claimed";
+      case "session_ended":
+        return "ended";
+      case "role_not_admitted":
+        return "not_admitted";
+      default:
+        return "already_claimed";
+    }
+  }
+  if (cause.status === 401) {
+    return isRevokedCredential(cause) ? "revoked" : "unauthorized";
+  }
+  // A server from before claims existed has no such route. Record as before;
+  // its first chunk still makes the take visible to other devices.
+  if (cause.status === 405 || (cause.status === 404 && cause.code === "Not Found")) {
+    return "legacy";
+  }
+  return "failed";
+}
+
+async function refuseClaim(sessionId: string, outcome: ClaimOutcome): Promise<void> {
+  switch (outcome) {
+    case "already_claimed":
+      pendingTake = null;
+      lockAlreadyClaimed(sessionId);
+      return;
+    case "ended":
+      pendingTake = null;
+      canStart = false;
+      holdStartRefusal(SESSION_ENDED_MESSAGE);
+      return;
+    case "not_admitted":
+      // Keep the pending id: the next admission may confirm it.
+      holdStartRefusal(NOT_ADMITTED_MESSAGE);
+      return;
+    case "revoked":
+      pendingTake = null;
+      status = "idle";
+      await interruptRecording(sessionId);
+      return;
+    case "unauthorized":
+      pendingTake = null;
+      canStart = false;
+      holdStartRefusal(UNAUTHORIZED_MESSAGE);
+      return;
+    default:
+      // The claim may have landed with its answer lost: keep the id for the retry.
+      holdStartRefusal(CLAIM_FAILED_MESSAGE);
+  }
 }
 
 /** A 401 that no retry with this live token can get past (ADR-0004 §3). */
@@ -630,8 +1082,9 @@ export async function interruptRecording(sessionId: string): Promise<void> {
   const current = active?.sessionId === sessionId ? active : null;
   if (current && current.recorder.state !== "inactive") {
     const database = await db();
+    // Held: the recorder still flushes slices this declaration does not cover.
     const updated = await updateMeta(database, sessionId, (latest) =>
-      persistInterrupted(latest, Date.now()),
+      holdForRecorderFlush(persistInterrupted(latest, Date.now())),
     );
     if (updated) {
       meta = updated;
@@ -646,6 +1099,46 @@ export async function interruptRecording(sessionId: string): Promise<void> {
   }
   if (boundSession === sessionId) {
     rememberHeldFailure(REVOKED_MESSAGE);
+  }
+  emit();
+}
+
+/**
+ * Stop this tab's take because another device took the student role over
+ * (close 4409 role_connection_replaced). Safe to call more than once.
+ *
+ * Like a revocation, the take is written as lost before the recorder stops,
+ * and onstop extends it over the last slice. Unlike one, the live token still
+ * works: nothing is marked unauthorized, and the stored slices keep uploading
+ * and finalize with recorder_lost. The take does not continue on the new device.
+ */
+export async function stopReplacedRecording(sessionId: string): Promise<void> {
+  replacedSessions.add(sessionId);
+  retryable = false;
+  if (pendingTake?.sessionId === sessionId) {
+    pendingTake = null;
+  }
+  const current = active?.sessionId === sessionId ? active : null;
+  if (current && current.recorder.state !== "inactive") {
+    const database = await db();
+    // Held: the live token could finalize this before the recorder's last
+    // slices are stored, and the server would then refuse them.
+    const updated = await updateMeta(database, sessionId, (latest) =>
+      holdForRecorderFlush(persistReplaced(latest, Date.now())),
+    );
+    if (updated) {
+      meta = updated;
+    }
+    status = "stopping";
+    try {
+      current.recorder.stop();
+    } catch {
+      // Already stopping. onstop still sees the lost row.
+    }
+    current.stream?.getTracks().forEach((track) => track.stop());
+  }
+  if (boundSession === sessionId) {
+    rememberHeldFailure(REPLACED_MESSAGE);
   }
   emit();
 }
@@ -834,6 +1327,10 @@ async function sendFinalizeIfDue(sessionId: string): Promise<void> {
       meta = updated;
     }
     forgetError();
+    if (replacedSessions.has(sessionId)) {
+      // Still true after the finalize: this tab stays replaced and never records again.
+      rememberHeldFailure(REPLACED_MESSAGE);
+    }
   } catch (cause) {
     const block = cause instanceof ApiError ? permanentUploadBlock(cause.status, cause.code) : null;
     // Chunk retries must not move finalize_persisted_at. Only the attempt clock moves.
@@ -876,25 +1373,40 @@ export async function commitRecorderStop(
   const lost = stopAsLost || chunkPersistLost;
   stopAsLost = false;
   const database = await db();
-  const updated = await updateMeta(database, sessionId, (latest) => {
-    if (latest.recorder_state === "lost") {
-      // A revocation declared the take lost before the recorder flushed its last slice.
-      const kept = revokedSessions.has(sessionId) ? persistInterrupted(latest, now) : latest;
-      return chunkPersistLost ? { ...kept, needs_operator: true } : kept;
-    }
-    if (lost) {
-      const marked = persistRecorderLost(latest, now);
-      return chunkPersistLost ? { ...marked, needs_operator: true } : marked;
-    }
-    if (latest.finalize_pending && latest.finalize_persisted_at != null) {
-      return latest;
-    }
-    return persistStop(latest, now);
-  });
+  const updated = await updateMeta(database, sessionId, (latest) =>
+    // Every slice is stored now; a held declaration may go out.
+    releaseRecorderFlush(declareStop(latest, lost, sessionId, now), now),
+  );
   if (updated) {
     meta = updated;
   }
   return updated;
+}
+
+function declareStop(
+  latest: RecordingMeta,
+  lost: boolean,
+  sessionId: string,
+  now: number,
+): RecordingMeta {
+  if (latest.recorder_state === "lost") {
+    // A revocation or a takeover declared the take lost before the recorder
+    // flushed its last slice: extend the declaration over that slice.
+    const kept = revokedSessions.has(sessionId)
+      ? persistInterrupted(latest, now)
+      : replacedSessions.has(sessionId)
+        ? persistReplaced(latest, now)
+        : latest;
+    return chunkPersistLost ? { ...kept, needs_operator: true } : kept;
+  }
+  if (lost) {
+    const marked = persistRecorderLost(latest, now);
+    return chunkPersistLost ? { ...marked, needs_operator: true } : marked;
+  }
+  if (latest.finalize_pending && latest.finalize_persisted_at != null) {
+    return latest;
+  }
+  return persistStop(latest, now);
 }
 
 export function notePageHide(): void {
@@ -909,6 +1421,7 @@ export function notePageHide(): void {
 }
 
 export function handleRecorderStop(sessionId: string, stream: MediaStream | null): Promise<void> {
+  committingStop = sessionId;
   status = "stopped";
   stream?.getTracks().forEach((track) => track.stop());
   if (active?.sessionId === sessionId) {
@@ -921,6 +1434,11 @@ export function handleRecorderStop(sessionId: string, stream: MediaStream | null
       rememberHeldFailure(`無法保存結束標記：${String(cause)}`);
     })
     .finally(() => {
+      // The take is declared; another tab may now judge it.
+      if (committingStop === sessionId) {
+        committingStop = null;
+      }
+      dropRecorderLock();
       emit();
     });
 }
@@ -995,7 +1513,14 @@ export async function resetRecordingControllerForTests(
   inFlight.clear();
   persistChain = Promise.resolve();
   stopPromise = Promise.resolve();
+  committingStop = null;
   revokedSessions.clear();
+  replacedSessions.clear();
+  admittedSessions.clear();
+  pendingTake = null;
+  startTask = null;
+  takeCheck = null;
+  dropRecorderLock();
 }
 
 if (typeof window !== "undefined") {

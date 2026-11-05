@@ -36,6 +36,8 @@ Persistence + audit wiring (ADR-0004 §1-§4) is implemented on top of
 ``models.py``'s access layer -- this module only calls its public functions and
 never touches the schema itself:
   - The upgrade refuses a `session_id` with no persisted row (close 4404).
+    Every upgrade refusal is accepted first and then closed, so browsers see
+    the close code and reason instead of an HTTP 403 (close 1006).
   - Every accepted envelope is written through ``models.append_event`` *before*
     it is ACKed, so an ``accepted`` always means "durable" (ADR-0004 §4).
   - Accepted lifecycle events mirror onto the session row via
@@ -334,7 +336,7 @@ class ConnectionManager:
         a single-connection role (caller should notify other roles via
         `role_connection_replaced`). Raises RoleConnectionConflict if a
         single-connection role already has a live connection -- the caller
-        must reject the new socket without accepting it.
+        must refuse the new socket (4429) without registering it.
 
         ``subprotocol`` is the negotiated application protocol. It is either
         ``mindprobe.v1`` or omitted. A ``bearer.*`` value is never echoed.
@@ -376,6 +378,17 @@ class ConnectionManager:
         # `ws.accept()` is in flight cannot leave a stale mark behind.
         self._disconnected_since[session_id].pop(role, None)
         return replaced
+
+    def holds_role(self, session_id: str, role: str, token_hash: str) -> bool:
+        """Whether a socket admitted with this token holds ``role`` right now.
+
+        A live token alone does not prove the device is the admitted one: a
+        replaced device keeps a valid token, and so does one refused 4429.
+        """
+        return any(
+            info.token_hash == token_hash
+            for info in self._connections.get(session_id, {}).get(role, [])
+        )
 
     def disconnect(self, session_id: str, role: str, ws: WebSocket) -> None:
         conns = self._connections.get(session_id, {}).get(role, [])
@@ -1725,6 +1738,29 @@ async def _handle_message(
         )
 
 
+async def _reject_upgrade(websocket: WebSocket, *, code: int, reason: str) -> None:
+    """Refuse an upgrade so a real browser can read ``code`` and ``reason``.
+
+    Closing before ``accept()`` makes uvicorn answer HTTP 403, which a
+    browser only reports as close 1006: no code, no reason, and the client
+    retries forever. So accept first, then close at once. The socket is never
+    registered with the manager and is sent no frame. Only ``mindprobe.v1``
+    (or nothing) is selected -- ``bearer.*`` is a credential, never echoed.
+    A client that offered protocols but not ``mindprobe.v1`` is still refused
+    at the handshake: a browser fails an accept that selects none of them.
+    """
+    subprotocol = _selected_subprotocol(websocket)
+    if subprotocol is None and _offered_subprotocols(websocket):
+        await websocket.close(code=code, reason=reason)
+        return
+    try:
+        await websocket.accept(subprotocol=subprotocol)
+        await websocket.close(code=code, reason=reason)
+    except (WebSocketDisconnect, RuntimeError):
+        # The peer already left; there is nobody to tell.
+        pass
+
+
 @router.websocket("/ws/{session_id}/{role}")
 async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
     """One socket per (session, role).
@@ -1741,7 +1777,7 @@ async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
     a token is revoked or the session ends.
     """
     if role not in VALID_ROLES:
-        await websocket.close(code=4400, reason="invalid_role")
+        await _reject_upgrade(websocket, code=4400, reason="invalid_role")
         return
     try:
         token = _verify_session_token(websocket, session_id, role)
@@ -1749,7 +1785,7 @@ async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
         # 4403 is reserved for a valid token whose role does not match the
         # path. Every other authentication failure stays 4401.
         close_code = 4403 if exc.reason == "role_token_mismatch" else 4401
-        await websocket.close(code=close_code, reason=exc.reason)
+        await _reject_upgrade(websocket, code=close_code, reason=exc.reason)
         return
 
     # A valid token proves the bearer's role and session claim, not that the
@@ -1760,7 +1796,7 @@ async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
     try:
         claims = auth.verify_token(token, session_id=session_id, roles={role})
     except auth.TokenInvalid as exc:
-        await websocket.close(code=4401, reason=exc.reason)
+        await _reject_upgrade(websocket, code=4401, reason=exc.reason)
         return
     review_jti = claims.get("jti") if claims.get("typ") == "review" else None
     if review_jti is not None and not isinstance(review_jti, str):
@@ -1798,13 +1834,15 @@ async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
             session_id,
             role,
         )
-        await websocket.close(code=4401, reason="session_state_unavailable")
+        # Transient: 1013 (Try Again Later) is retryable for every client, old
+        # or new. A 4401 here would strand the tab now that browsers see it.
+        await _reject_upgrade(websocket, code=1013, reason="session_state_unavailable")
         return
     if rejection == "session_not_found":
-        await websocket.close(code=4404, reason="session_not_found")
+        await _reject_upgrade(websocket, code=4404, reason="session_not_found")
         return
     if rejection is not None:
-        await websocket.close(code=4401, reason=rejection)
+        await _reject_upgrade(websocket, code=4401, reason=rejection)
         return
 
     try:
@@ -1819,7 +1857,9 @@ async def session_ws(websocket: WebSocket, session_id: str, role: str) -> None:
     except RoleConnectionConflict:
         # ADR-0001 §9: a live connection must not be silently evicted by a
         # new one for the same role -- reject the new connection instead.
-        await websocket.close(code=4409, reason="role_already_connected")
+        # 4429 is retryable: the holder may be half-open and go stale within
+        # HEARTBEAT_STALE_MS. 4409 stays the terminal "you were replaced".
+        await _reject_upgrade(websocket, code=4429, reason="role_already_connected")
         return
 
     if replaced:
@@ -1927,7 +1967,8 @@ def _live_socket_rejection(
         logger.exception(
             "failed to recheck authorization for session %s", session_id
         )
-        return 4401, "session_state_unavailable"
+        # Transient, like the upgrade path: retryable, never a terminal 4401.
+        return 1013, "session_state_unavailable"
     return None
 
 

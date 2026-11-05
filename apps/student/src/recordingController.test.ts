@@ -21,6 +21,7 @@ import {
   resetRecordingControllerForTests,
   resumeUnauthorizedUploads,
   setRecordingTransport,
+  setSocketAdmitted,
   startRecording,
 } from "./recordingController.ts";
 import { listChunks, openRecordingDb, readMeta, writeChunk, writeMeta } from "./recordingDb.ts";
@@ -1324,6 +1325,11 @@ test("a revocation while the camera prompt is open never starts a recorder", asy
       },
     },
   });
+  setRecordingTransport({
+    fetchUploadStatus: async () => ({ ...liveStatus([]), take_claimed: false }),
+    claimRecording: async () => ({ take_id: "unused" }),
+  });
+  setSocketAdmitted(sessionId, true);
   try {
     const starting = startRecording(sessionId);
     await prompt.entered;

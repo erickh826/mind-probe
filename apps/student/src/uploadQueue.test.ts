@@ -15,14 +15,48 @@ import {
   showUploadCodeEntry,
   uploadWorkChunkCount,
   finalizeDue,
+  holdForRecorderFlush,
   noteFinalizeAttempt,
   notePermanentFailure,
   permanentUploadBlock,
   persistStop,
   planReload,
+  releaseRecorderFlush,
   sequencesAlreadyReceived,
   shouldDiscardMeta,
 } from "./uploadQueue.ts";
+
+test("a lost declaration held for the recorder's flush is never due, then covers every slice", () => {
+  const recording = { ...emptyMeta("S-flush", 0), next_sequence: 2, last_chunk_end_ms: 2_000 };
+  const held = holdForRecorderFlush(persistRecorderLost(recording, 1_000));
+  assert.equal(held.recorder_flush_pending, true);
+  assert.equal(finalizeDue(held, 0, 1_000), false, "queue empty");
+  assert.equal(finalizeDue(held, 3, 1_000 + FINALIZE_DELAY_MS + 1), false, "deadline passed");
+
+  // The recorder stored two more slices while the declaration was held.
+  const flushed = { ...held, next_sequence: 4, last_chunk_end_ms: 4_000 };
+  const released = releaseRecorderFlush(flushed, 50_000);
+  assert.equal(released.recorder_flush_pending, false);
+  assert.equal(released.final_sequence, 3);
+  assert.deepEqual(released.finalize_payload, {
+    final_sequence: 3,
+    total_chunks: 4,
+    total_duration_ms: 4_000,
+    reason: "recorder_lost",
+  });
+  assert.equal(released.finalize_persisted_at, 50_000, "the deadline starts when the declaration is ready");
+  assert.equal(finalizeDue(released, 0, 50_000), true);
+  assert.equal(finalizeDue(released, 1, 50_000 + FINALIZE_DELAY_MS), true);
+});
+
+test("only a lost, unsettled take is held for the recorder's flush", () => {
+  const stopped = persistStop({ ...emptyMeta("S-hold", 0), next_sequence: 1 }, 10);
+  assert.equal(holdForRecorderFlush(stopped).recorder_flush_pending, undefined);
+  const settled = { ...persistRecorderLost(emptyMeta("S-hold", 0), 10), server_finalize_state: "incomplete" as const };
+  assert.equal(holdForRecorderFlush(settled).recorder_flush_pending, undefined);
+  const plain = persistRecorderLost(emptyMeta("S-hold", 0), 10);
+  assert.equal(releaseRecorderFlush(plain, 99), plain, "nothing held, nothing changes");
+});
 
 test("next_sequence advances with the chunk and survives ACK", () => {
   const log = new MemoryUploadLog("S1");

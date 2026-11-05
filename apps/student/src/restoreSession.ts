@@ -85,7 +85,8 @@ export async function restoreStudentSession(
       probes.clearJoinedSession(stored.sessionId);
       return {
         kind: "rejected",
-        message: "Saved session is no longer valid. Join again.",
+        message:
+          "此裝置保存的場次登入已失效。如有尚未上傳的錄影片段，請向老師或管理員索取補傳碼；要加入場次，請輸入新的加入碼。",
       };
     }
     return { kind: "unavailable" };

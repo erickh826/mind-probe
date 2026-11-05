@@ -216,6 +216,7 @@ export interface UploadStatus {
   final_sequence: number | null;
   finalize_state: "none" | "pending" | "complete" | "incomplete";
   recording_state: string;
+  take_claimed: boolean;
 }
 
 function asNumberList(value: unknown): number[] {
@@ -242,7 +243,24 @@ export async function fetchUploadStatus(sessionId: string): Promise<UploadStatus
     final_sequence: typeof body.final_sequence === "number" ? body.final_sequence : null,
     finalize_state: finalizeState,
     recording_state: typeof body.recording_state === "string" ? body.recording_state : "recording",
+    take_claimed: body.take_claimed === true,
   };
+}
+
+/**
+ * Claim the session's one take before the recorder starts (D3). The id is
+ * made up by this tab and kept in memory only; it is not a credential.
+ */
+export async function claimRecording(
+  sessionId: string,
+  takeId: string,
+): Promise<{ take_id: string }> {
+  const body = await request(`/recording/${encodeURIComponent(sessionId)}/claim`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ take_id: takeId }),
+  });
+  return { take_id: isRecord(body) && typeof body.take_id === "string" ? body.take_id : takeId };
 }
 
 export interface FinalizeResult {
