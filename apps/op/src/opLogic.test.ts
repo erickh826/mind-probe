@@ -13,6 +13,7 @@ import {
   graceRemainingSeconds,
   joinReissueNotes,
   labelFor,
+  loginExpired,
   nextReads,
   parseServerTime,
   RECORDING_LABELS,
@@ -87,7 +88,10 @@ test("attention flags", () => {
 });
 
 test("server reasons map to operator copy, unknown ones pass through", () => {
-  assert.match(errorMessage(401, "invalid_operator_token"), /Operator token/);
+  assert.match(errorMessage(401, "invalid_operator_credentials"), /帳號或密碼不正確/);
+  assert.match(errorMessage(401, "invalid_operator_token"), /重新登入/);
+  assert.match(errorMessage(401, "expired_session_token"), /已過期/);
+  assert.match(errorMessage(401, "revoked_session_token"), /已登出/);
   assert.match(errorMessage(409, "upload_grace_expired"), /寬限期已過/);
   assert.match(errorMessage(409, "session already exists: S-1"), /已經存在/);
   assert.equal(errorMessage(500, "boom"), "boom（HTTP 500）");
@@ -185,4 +189,11 @@ test("a full re-read shifts reads; an older page only adds first reads", () => {
   );
   assert.deepEqual(paged["S-2"], reread["S-2"]);
   assert.deepEqual(paged["S-1"], { current: { storedSequences: 2, readAtMs: 40_000 } });
+});
+
+test("a login expires at its expires_at second, not before", () => {
+  const expiresAt = 1_900_000_000;
+  assert.equal(loginExpired(expiresAt, expiresAt * 1000 - 1), false);
+  assert.equal(loginExpired(expiresAt, expiresAt * 1000), true);
+  assert.equal(loginExpired(expiresAt, expiresAt * 1000 + 60_000), true);
 });

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { createOpClient, OpApiError } from "./api.ts";
+import { createOpClient, OpApiError, operatorLogin } from "./api.ts";
 
 interface Captured {
   url: string;
@@ -99,4 +99,54 @@ test("errors carry the server detail, including the 410 object form", async () =
     assert.equal(error.detail, "");
     return true;
   });
+});
+
+test("login sends the credentials in a JSON body only and returns the token", async () => {
+  const calls: Captured[] = [];
+  const login = await operatorLogin({
+    baseUrl: "https://api.example",
+    username: "admin",
+    password: "pw secret",
+    fetchImpl: async (input, init) => {
+      calls.push({ url: String(input), init: init ?? {} });
+      return jsonResponse(200, {
+        access_token: "op-login-token",
+        token_type: "operator",
+        role: "operator",
+        expires_at: 1_900_000_000,
+      });
+    },
+  });
+  assert.equal(login.access_token, "op-login-token");
+  assert.equal(login.expires_at, 1_900_000_000);
+  const [call] = calls;
+  assert.equal(call.url, "https://api.example/op/login");
+  assert.ok(!call.url.includes("admin") && !call.url.includes("pw"));
+  assert.equal(call.init.method, "POST");
+  assert.deepEqual(JSON.parse(String(call.init.body)), { username: "admin", password: "pw secret" });
+  assert.equal(new Headers(call.init.headers).get("Authorization"), null);
+  assert.equal(call.init.credentials, "omit");
+  assert.equal(call.init.cache, "no-store");
+  assert.equal(call.init.referrerPolicy, "no-referrer");
+});
+
+test("a refused login carries the server reason", async () => {
+  await assert.rejects(
+    operatorLogin({
+      baseUrl: "https://api.example",
+      username: "admin",
+      password: "wrong",
+      fetchImpl: async () => jsonResponse(401, { detail: "invalid_operator_credentials" }),
+    }),
+    (error: unknown) =>
+      error instanceof OpApiError && error.status === 401 && error.detail === "invalid_operator_credentials",
+  );
+});
+
+test("logout posts with the login token", async () => {
+  const { client, calls } = recordingClient(() => jsonResponse(200, { status: "ok" }));
+  await client.logout();
+  assert.equal(calls[0].url, "https://api.example/op/logout");
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(new Headers(calls[0].init.headers).get("Authorization"), "Bearer op-secret");
 });

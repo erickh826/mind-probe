@@ -26,6 +26,14 @@ export interface OperatorSessionRow extends SessionInfo {
   upload_reissue_refusal: string | null;
 }
 
+/** `POST /op/login`. `expires_at` is unix seconds. */
+export interface OperatorLogin {
+  access_token: string;
+  token_type: "operator";
+  role: "operator";
+  expires_at: number;
+}
+
 export interface SessionListResponse {
   sessions: OperatorSessionRow[];
   /** Pass back as `before` for the next older page; null on the last page. */
