@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Fake docker for the dry run. State lives in $STATE.
+set -euo pipefail
+img() { printf '%s/images/%s' "$STATE" "${1//\//_}"; }
+printf 'docker %s\n' "$*" >> "$STATE/log"
+if [ "$1" = compose ]; then
+  shift
+  while [ "$1" = -p ] || [ "$1" = -f ]; do shift 2; done
+  cmd="$1"; shift
+  case "$cmd" in
+    ps)
+      if [ "${1:-}" = -q ]; then cat "$STATE/container"; else echo "fake: running $(cat "$STATE/running_image") from $(cat "$STATE/workdir")"; fi ;;
+    build)
+      if [ -e "$STATE/fail_build" ]; then echo 'fake: build failed' >&2; exit 1; fi
+      test -f "$PWD/server/Dockerfile" || { echo 'fake: no server/Dockerfile here' >&2; exit 1; }
+      echo img-new > "$(img mind-probe-server:latest)" ;;
+    config) ;;
+    up)
+      pwd > "$STATE/workdir"
+      cp "$(img mind-probe-server:latest)" "$STATE/running_image"
+      # What the container would read from .env at this start.
+      cp "$MP_ROOT/runtime.env" "$STATE/env_at_up"
+      echo up >> "$STATE/ups" ;;
+    exec)
+      while [ "$1" = -T ] || [ "$1" = server ]; do shift; done
+      [ "$1" = python ] && shift
+      new=no; [ "$(cat "$STATE/running_image")" = img-new ] && new=yes
+      if [ "${1:-}" = -c ]; then
+        case "$2" in
+          'import app.admin_password') [ "$new" = yes ] || { echo 'ModuleNotFoundError' >&2; exit 1; } ;;
+          *hash_password*)
+            pw="$(cat)"
+            printf '%s' "$pw" | sha256sum | cut -d' ' -f1 > "$STATE/hashed_pw"
+            if [ -e "$STATE/bad_hash" ]; then echo 'Traceback: boom'; else echo "scrypt:16384:8:1:c2FsdHNhbHQ:${#pw}ZmFrZQ"; fi ;;
+          *) echo "fake: unknown -c" >&2; exit 1 ;;
+        esac
+        exit 0
+      fi
+      body="$(cat)"
+      case "$body" in
+        *seconds_since_last_chunk*)
+          if [ -e "$STATE/busy" ]; then echo 'Activity: WAIT'; echo ' - session S-busy is active'; exit 1; fi
+          echo 'Activity: none in progress' ;;
+        *backup*) echo "Database backup: /data/backups/pre-$2-$3.db integrity ok" ;;
+        *review_issue_limiter*)
+          [ "$new" = yes ] || { echo 'AssertionError: review-code limit missing' >&2; exit 1; }
+          if grep -q '^MINDPROBE_ADMIN_PASSWORD_HASH=' "$STATE/env_at_up"; then echo 'OP admin login: configured'; else echo 'OP admin login: not configured yet (run set-admin.sh)'; fi ;;
+        *) echo "fake: unknown exec body" >&2; exit 1 ;;
+      esac ;;
+    *) echo "fake compose: $cmd" >&2; exit 1 ;;
+  esac
+  exit 0
+fi
+case "$1" in
+  inspect)
+    case "$3" in
+      *working_dir*) cat "$STATE/workdir" ;;
+      '{{.Image}}') cat "$STATE/running_image" ;;
+      *) exit 1 ;;
+    esac ;;
+  image)
+    tag="${*: -1}"
+    test -f "$(img "$tag")" || exit 1
+    if [ "$3" = --format ]; then cat "$(img "$tag")"; fi ;;
+  tag)
+    if [ -f "$(img "$2")" ]; then cp "$(img "$2")" "$(img "$3")"; else echo "$2" > "$(img "$3")"; fi ;;
+  *) echo "fake docker: $1" >&2; exit 1 ;;
+esac

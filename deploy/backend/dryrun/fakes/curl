@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Fake curl. Health follows $STATE/unhealthy; openapi lists the new routes only
+# when the new image runs; /op/login accepts $STATE/admin_password only if the
+# server was (re)started after runtime.env got the admin lines.
+url="${*: -1}"
+printf 'curl %s\n' "$url" >> "$STATE/log"
+case "$url" in
+  */health)
+    [ -e "$STATE/unhealthy" ] && { echo 'curl: (22) fake 502' >&2; exit 22; }
+    echo '{"status":"ok"}' ;;
+  */openapi.json)
+    if [ "$(cat "$STATE/running_image")" = img-new ]; then
+      echo '{"paths":{"/sessions":{},"/sessions/{session_id}/join-codes":{},"/recording/{session_id}/claim":{},"/sessions/{session_id}/review-codes":{},"/op/login":{},"/op/logout":{}}}'
+    else
+      echo '{"paths":{"/sessions":{},"/sessions/{session_id}/join-codes":{},"/recording/{session_id}/claim":{},"/sessions/{session_id}/review-codes":{}}}'
+    fi ;;
+  */op/login)
+    body="$(cat)"
+    # A test can force any answer (body, newline, status), e.g. a 422 quoting the input.
+    if [ -e "$STATE/login_response" ]; then cat "$STATE/login_response"; exit 0; fi
+    printf '%s' "$body" > "$STATE/login_body"
+    expected="$(cat "$STATE/admin_password" 2>/dev/null)"
+    if [ ! -e "$STATE/login_fails" ] && grep -q '^MINDPROBE_ADMIN_PASSWORD_HASH=' "$STATE/env_at_up" \
+        && python3 -c 'import json,sys; b=json.loads(sys.argv[1]); sys.exit(0 if b["password"]==sys.argv[2] else 1)' "$body" "$expected"; then
+      printf '{"access_token":"tok-fake-123","token_type":"operator","role":"operator","expires_at":1}\n200'
+    else
+      printf '{"detail":"invalid_operator_credentials"}\n401'
+    fi ;;
+  */op/logout)
+    cat > "$STATE/logout_header" ;;
+  *) exit 6 ;;
+esac
