@@ -926,8 +926,19 @@ def regenerate_review_codes(
     _actor: auth.Actor = Depends(auth.require_operator),
     db: DBSession = Depends(get_db),
 ) -> dict:
-    """Replace the teacher and observer review codes. Plaintext is returned once."""
+    """Replace the teacher and observer review codes. Plaintext is returned once.
+
+    Five regenerations per session per ten minutes, a budget separate from
+    join-code and upload-code reissue. A refused call leaves the codes as they were.
+    """
     _load_session_or_404(db, session_id)
+    if not auth.review_issue_limiter.allow(
+        session_id,
+        limit=auth.REVIEW_ISSUE_LIMIT,
+        window_s=auth.REVIEW_ISSUE_WINDOW_SECONDS,
+        now=auth.review_rate_now(),
+    ):
+        raise HTTPException(status_code=429, detail="rate_limited")
     codes = models.issue_review_codes(db, session_id)
     return {"session_id": session_id, "review_codes": codes}
 
