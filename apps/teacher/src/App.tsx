@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 
 import {
   clearReviewSession,
@@ -8,10 +8,12 @@ import {
 } from "@mind-probe/shared";
 import { fetchAuditLogs, fetchClipManifest, fetchRecordingStatus, fetchRubric, fetchSession, fetchTimeline, joinSession, reviewLogin, reviewLogout } from "./api";
 import "./App.css";
+import { buildUpdate } from "./buildUpdate";
 import { DualVideoPlayer } from "./components/DualVideoPlayer";
 import { InteractiveTimeline } from "./components/InteractiveTimeline";
 import { RubricScoringPanel } from "./components/RubricScoringPanel";
 import { SessionJoinBar, type SessionLoadRequest } from "./components/SessionJoinBar";
+import { UpdatePrompt } from "./components/UpdatePrompt";
 import { reviewErrorMessage, ReviewRequestError, shouldReturnToReviewLogin } from "./reviewErrors";
 import { readAuthMode, rememberAuthMode, type SessionAuthMode } from "./sessionAuthMode";
 import type { AuthContext, AuditResponse, ClipManifestEntry, RecordingStatus, RubricData, SessionInfo, TeacherMarker, TimelineResponse } from "./types";
@@ -243,8 +245,11 @@ function App() {
     localStorage.setItem(`mind-probe:teacher-markers:${sessionId}`, JSON.stringify(markers));
   }, []);
 
+  const newerBuild = useSyncExternalStore(buildUpdate.subscribe, buildUpdate.getSnapshot);
+
   return (
     <main className="app-shell">
+      {newerBuild !== null ? <UpdatePrompt /> : null}
       <SessionJoinBar
         authMode={authMode}
         formNonce={formNonce}

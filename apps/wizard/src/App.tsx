@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { UncoveredQuestionPayload } from "@mind-probe/shared";
 import {
   clearJoinedSession,
@@ -15,6 +15,8 @@ import {
   resolveClipId,
 } from "./api";
 import { useSessionSocket } from "./useSessionSocket";
+import { buildUpdate } from "./buildUpdate";
+import { UpdatePrompt } from "./components/UpdatePrompt";
 import { startControl } from "./sessionStart";
 import {
   CATEGORY_KEYS,
@@ -416,6 +418,16 @@ export default function App() {
     uncoveredOpen,
   ]);
 
+  const newerBuild = useSyncExternalStore(buildUpdate.subscribe, buildUpdate.getSnapshot);
+  const sessionLive =
+    joined !== null &&
+    !sessionEnded &&
+    (session.session_state === "active" || session.session_state === "paused");
+  const updatePrompt =
+    newerBuild !== null ? (
+      <UpdatePrompt note={sessionLive ? "場次進行中，建議結束場次後再重新整理。" : null} />
+    ) : null;
+
   if (restorePending && joined === null) {
     return (
       <div
@@ -428,13 +440,19 @@ export default function App() {
           placeItems: "center",
         }}
       >
+        {updatePrompt}
         Restoring session…
       </div>
     );
   }
 
   if (joined === null) {
-    return <SessionJoinModal onJoined={handleJoined} error={restoreError} />;
+    return (
+      <>
+        {updatePrompt}
+        <SessionJoinModal onJoined={handleJoined} error={restoreError} />
+      </>
+    );
   }
 
   return (
@@ -446,6 +464,7 @@ export default function App() {
         minHeight: "100vh",
       }}
     >
+      {updatePrompt}
       <SessionStatusHeader
         sessionId={joined.sessionId}
         caseId={joined.caseId}

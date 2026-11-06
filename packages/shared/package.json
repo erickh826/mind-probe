@@ -10,7 +10,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test --test-concurrency=1 src/socketLifecycle.test.ts"
+    "test": "node --experimental-strip-types --test --test-concurrency=1 src/socketLifecycle.test.ts src/versionCheck.test.ts"
   },
   "devDependencies": {
     "typescript": "^5.4.5"
