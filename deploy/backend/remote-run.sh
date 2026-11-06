@@ -2,6 +2,7 @@
 # Host side of the CD workflow. ci-deploy.sh stages the kit in a per-run
 # directory and starts this detached, so a dropped SSH connection cannot
 # interrupt a cutover halfway.
+#   remote-run.sh preflight <run id>                          preflight.sh only (read-only)
 #   remote-run.sh deploy <run id> [--maintenance-confirmed]   preflight.sh, then upgrade.sh
 #   remote-run.sh rollback <run id>                           rollback.sh
 # Output goes to <root>/deploy-logs/<run id>.log; the exit code is written to
@@ -10,7 +11,7 @@
 set -uo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="${MP_ROOT:-/opt/mindprobe}"
-action="${1:?usage: remote-run.sh deploy|rollback <run id> [--maintenance-confirmed]}"
+action="${1:?usage: remote-run.sh preflight|deploy|rollback <run id> [--maintenance-confirmed]}"
 run_id="${2:?missing run id}"
 confirm="${3:-}"
 [[ "$run_id" =~ ^[A-Za-z0-9._-]{1,80}$ ]] || { echo "bad run id"; exit 2; }
@@ -27,6 +28,10 @@ log="$logs/$run_id.log"
   echo "== $(date -u +%FT%TZ) $action, run $run_id, as $(id -un)"
   sudo -n true 2>/dev/null || { echo 'sudo needs a password here; the deploy user needs passwordless sudo. Nothing was changed.'; exit 1; }
   case "$action" in
+    preflight)
+      export MP_TMP="$here"
+      bash "$here/preflight.sh"
+      ;;
     deploy)
       export MP_TMP="$here"
       bash "$here/preflight.sh"

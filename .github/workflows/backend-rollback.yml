@@ -2,6 +2,7 @@ name: Backend rollback
 
 # Puts back the release and image recorded by the last upgrade
 # (/opt/mindprobe/rollback-target and rollback-image). See deploy/backend/README.md.
+# SSH goes over Tailscale only, as in backend-deploy.yml.
 on:
   workflow_dispatch:
     inputs:
@@ -21,8 +22,20 @@ concurrency:
 jobs:
   rollback:
     runs-on: ubuntu-24.04
+    # The Tailscale trust credential only accepts OIDC tokens for this environment.
     environment: production
     timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write   # OIDC token for Tailscale; nothing else uses it
+    env:
+      DEPLOY_ACTION: rollback
+      MAINTENANCE_CONFIRMED: ${{ inputs.maintenance_confirmed }}
+      DEPLOY_RUN_ID: gh-rollback-${{ github.run_id }}-${{ github.run_attempt }}
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_REQUIRE_TAILNET: "1"
+      DEPLOY_TIMEOUT_S: "900"
     steps:
       - uses: actions/checkout@v4
 
@@ -31,28 +44,41 @@ jobs:
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
         run: |
+          {
+            echo "DEPLOY_SSH_KEY_FILE=$RUNNER_TEMP/deploy_key"
+            echo "DEPLOY_KNOWN_HOSTS_FILE=$RUNNER_TEMP/known_hosts"
+            echo "DEPLOY_OUT=$RUNNER_TEMP/deploy-out"
+          } >> "$GITHUB_ENV"
+          DEPLOY_SSH_KEY_FILE="$RUNNER_TEMP/deploy_key"
+          DEPLOY_KNOWN_HOSTS_FILE="$RUNNER_TEMP/known_hosts"
           umask 077
-          printf '%s\n' "$DEPLOY_SSH_KEY" > "$RUNNER_TEMP/deploy_key"
-          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$RUNNER_TEMP/known_hosts"
-          test -s "$RUNNER_TEMP/deploy_key" || { echo 'Secret DEPLOY_SSH_KEY is missing.'; exit 1; }
-          test -s "$RUNNER_TEMP/known_hosts" || { echo 'Secret DEPLOY_KNOWN_HOSTS is missing.'; exit 1; }
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$DEPLOY_SSH_KEY_FILE"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$DEPLOY_KNOWN_HOSTS_FILE"
+          test -s "$DEPLOY_SSH_KEY_FILE" || { echo 'Secret DEPLOY_SSH_KEY is missing.'; exit 1; }
+          test -s "$DEPLOY_KNOWN_HOSTS_FILE" || { echo 'Secret DEPLOY_KNOWN_HOSTS is missing.'; exit 1; }
 
-      - name: Roll back
+      - name: Check inputs
         env:
-          DEPLOY_ACTION: rollback
-          MAINTENANCE_CONFIRMED: ${{ inputs.maintenance_confirmed }}
-          DEPLOY_RUN_ID: gh-rollback-${{ github.run_id }}-${{ github.run_attempt }}
-          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
-          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-          DEPLOY_SSH_KEY_FILE: ${{ runner.temp }}/deploy_key
-          DEPLOY_KNOWN_HOSTS_FILE: ${{ runner.temp }}/known_hosts
-          DEPLOY_OUT: ${{ runner.temp }}/deploy-out
-          DEPLOY_TIMEOUT_S: "900"
+          DEPLOY_CHECK_ONLY: "1"
         run: bash deploy/backend/ci-deploy.sh
 
-      - name: Remove the SSH key
+      - name: Join the tailnet (ephemeral node, logged out when the job ends)
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:mindprobe-ci
+          version: 1.104.4
+          ping: ${{ secrets.DEPLOY_HOST }}
+
+      - name: Roll back
+        run: bash deploy/backend/ci-deploy.sh
+
+      - name: Leave the tailnet and remove the SSH key
         if: always()
-        run: rm -f "$RUNNER_TEMP/deploy_key"
+        run: |
+          rm -f "$DEPLOY_SSH_KEY_FILE"
+          if command -v tailscale > /dev/null; then sudo tailscale logout || true; fi
 
       - name: Keep the rollback log
         if: always()
