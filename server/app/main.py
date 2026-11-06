@@ -33,7 +33,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from starlette.datastructures import MutableHeaders
 from starlette.middleware.cors import CORSMiddleware as StarletteCORSMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DBSession
@@ -310,6 +310,26 @@ class UploadLoginRequest(BaseModel):
     code: str = Field(..., min_length=1, description="One-time upload code from the operator.")
 
 
+class OperatorLoginRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(..., min_length=1, max_length=200)
+    password: str = Field(..., min_length=1, max_length=1024)
+
+
+async def _operator_login_body(request: Request) -> OperatorLoginRequest:
+    """Parse the login body without FastAPI's default 422, which quotes the input.
+
+    That default would hand the password back in the response body, where a
+    client or script may print it. Any malformed body, extra field, wrong type
+    or out-of-range length is 422 ``invalid_login_request`` and nothing else.
+    """
+    try:
+        return OperatorLoginRequest.model_validate_json(await request.body())
+    except ValidationError:
+        raise HTTPException(status_code=422, detail="invalid_login_request") from None
+
+
 class ReviewLoginRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -370,6 +390,9 @@ def create_session(
     db: DBSession = Depends(get_db),
 ) -> dict:
     """Create a session in the ``created`` state (spec §4)."""
+    if body.session_id == auth.OPERATOR_AUDIT_SESSION_ID:
+        # OP logins and their revocations are audited under this id.
+        raise HTTPException(status_code=422, detail="reserved_session_id")
     if models.get_session(db, body.session_id) is not None:
         raise HTTPException(
             status_code=409, detail=f"session already exists: {body.session_id}"
@@ -903,10 +926,85 @@ def regenerate_review_codes(
     _actor: auth.Actor = Depends(auth.require_operator),
     db: DBSession = Depends(get_db),
 ) -> dict:
-    """Replace the teacher and observer review codes. Plaintext is returned once."""
+    """Replace the teacher and observer review codes. Plaintext is returned once.
+
+    Five regenerations per session per ten minutes, a budget separate from
+    join-code and upload-code reissue. A refused call leaves the codes as they were.
+    """
     _load_session_or_404(db, session_id)
+    if not auth.review_issue_limiter.allow(
+        session_id,
+        limit=auth.REVIEW_ISSUE_LIMIT,
+        window_s=auth.REVIEW_ISSUE_WINDOW_SECONDS,
+        now=auth.review_rate_now(),
+    ):
+        raise HTTPException(status_code=429, detail="rate_limited")
     codes = models.issue_review_codes(db, session_id)
     return {"session_id": session_id, "review_codes": codes}
+
+
+@app.post("/op/login")
+def operator_login(
+    request: Request,
+    body: OperatorLoginRequest = Depends(_operator_login_body),
+    db: DBSession = Depends(get_db),
+) -> dict:
+    """Exchange the admin username and password for an OP login token.
+
+    The admin comes from ``MINDPROBE_ADMIN_USERNAME`` and
+    ``MINDPROBE_ADMIN_PASSWORD_HASH``. Without both, every attempt is 401.
+    Five attempts per client IP per minute. The token works wherever the
+    static operator token does, until it expires or ``POST /op/logout``.
+    """
+    if not auth.operator_login_limiter.allow(
+        _client_host(request),
+        limit=auth.OPERATOR_LOGIN_LIMIT,
+        window_s=auth.OPERATOR_LOGIN_WINDOW_SECONDS,
+        now=auth.operator_rate_now(),
+    ):
+        raise HTTPException(status_code=429, detail="rate_limited")
+    if not auth.check_admin_credentials(body.username, body.password):
+        models.record_audit(
+            db,
+            action=models.AUDIT_OPERATOR_LOGIN,
+            actor_role=auth.OPERATOR_ROLE,
+            session_id=auth.OPERATOR_AUDIT_SESSION_ID,
+            details={"result": "invalid_credentials"},
+        )
+        raise HTTPException(status_code=401, detail="invalid_operator_credentials")
+    token, expires_at = auth.create_operator_token(body.username)
+    models.record_audit(
+        db,
+        action=models.AUDIT_OPERATOR_LOGIN,
+        actor_role=auth.OPERATOR_ROLE,
+        session_id=auth.OPERATOR_AUDIT_SESSION_ID,
+        token=token,
+        details={"result": "ok"},
+    )
+    return {
+        "access_token": token,
+        "token_type": auth.OPERATOR_TOKEN_TYP,
+        "role": auth.OPERATOR_ROLE,
+        "expires_at": expires_at,
+    }
+
+
+@app.post("/op/logout")
+def operator_logout(
+    actor: auth.Actor = Depends(auth.require_operator),
+    db: DBSession = Depends(get_db),
+) -> dict:
+    """Revoke the OP login token on this request. The static token cannot be revoked."""
+    if not auth.is_operator_token(actor.token):
+        models.record_audit(
+            db,
+            action=models.AUDIT_TOKEN_REVOKED,
+            actor_role=auth.OPERATOR_ROLE,
+            session_id=auth.OPERATOR_AUDIT_SESSION_ID,
+            token_hash=actor.token_hash,
+            details={"reason": models.REVOKE_REASON_OPERATOR_LOGOUT},
+        )
+    return {"status": "ok"}
 
 
 @app.post("/sessions/{session_id}/review-login")

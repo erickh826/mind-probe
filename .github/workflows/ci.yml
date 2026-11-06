@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [feat/m2, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend tests (with FFmpeg)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - uses: astral-sh/setup-uv@v6
+      - name: Install dependencies (Python 3.12, as in the Dockerfile)
+        run: uv sync --frozen --extra dev --python 3.12
+      - name: pytest
+        run: uv run --frozen pytest -q -rs
+
+  frontend:
+    name: Frontend ${{ matrix.package }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [packages/shared, apps/student, apps/wizard, apps/teacher, apps/op]
+    defaults:
+      run:
+        working-directory: ${{ matrix.package }}
+    env:
+      # Teacher and OP refuse a production build without an API host.
+      VITE_API_BASE_URL: https://api.example.invalid
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ${{ matrix.package }}/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - name: Typecheck
+        if: matrix.package == 'packages/shared'
+        run: npm run typecheck
+      - name: Build
+        if: matrix.package != 'packages/shared'
+        run: npm run build
+
+  deploy-kit:
+    name: Deploy kit dry run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax
+        run: for f in deploy/backend/*.sh deploy/backend/dryrun/run.sh deploy/backend/dryrun/fakes/*; do bash -n "$f"; done
+      - name: Dry run (fake sudo/docker/curl/ssh/scp; release built from this commit)
+        run: bash deploy/backend/dryrun/run.sh

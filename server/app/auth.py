@@ -14,6 +14,13 @@ does not apply to ``typ=review``. Review access is a separate grant: every
 REST and WebSocket entry checks ``review_grants`` and refuses a missing or
 revoked ``jti`` whether or not the session has ended. ``typ=upload`` stays on
 the upload grant and is rejected wherever it is not listed in ``allowed_typs``.
+
+**Operator.** Two credentials act as the operator: the static
+``MINDPROBE_OPERATOR_TOKEN`` (CLI and maintenance scripts) and a ``typ=operator``
+token from ``POST /op/login``. The login token expires after
+``MINDPROBE_OPERATOR_SESSION_TTL`` seconds and ``POST /op/logout`` revokes it.
+It is bound to the reserved pseudo session ``__operator__`` with
+``role=operator``, so it never passes a session-token or WebSocket check.
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
@@ -32,7 +40,7 @@ from typing import Any, Callable
 from fastapi import Depends, HTTPException, Request
 from sqlalchemy.orm import Session as DBSession
 
-from . import models, websocket
+from . import admin_password, models, websocket
 from .models import get_db
 
 logger = logging.getLogger(__name__)
@@ -40,6 +48,16 @@ logger = logging.getLogger(__name__)
 AUTH_COOKIE_ENV = "MINDPROBE_AUTH_COOKIE"
 OPERATOR_TOKEN_ENV = "MINDPROBE_OPERATOR_TOKEN"
 OPERATOR_ROLE = "operator"
+OPERATOR_TOKEN_TYP = "operator"
+#: ``audit_logs.session_id`` for OP logins and their revocations.
+#: ``POST /sessions`` refuses it, so it never names a real session.
+OPERATOR_AUDIT_SESSION_ID = "__operator__"
+ADMIN_USERNAME_ENV = "MINDPROBE_ADMIN_USERNAME"
+ADMIN_PASSWORD_HASH_ENV = "MINDPROBE_ADMIN_PASSWORD_HASH"
+OPERATOR_SESSION_TTL_ENV = "MINDPROBE_OPERATOR_SESSION_TTL"
+DEFAULT_OPERATOR_SESSION_TTL_SECONDS = 8 * 60 * 60
+OPERATOR_LOGIN_LIMIT = 5
+OPERATOR_LOGIN_WINDOW_SECONDS = 60
 UPLOAD_GRACE_ENV = "MINDPROBE_UPLOAD_GRACE_SECONDS"
 DEFAULT_UPLOAD_GRACE_SECONDS = 600
 REVIEW_ACCESS_TTL_ENV = "MINDPROBE_REVIEW_ACCESS_TTL"
@@ -56,6 +74,9 @@ UPLOAD_REDEEM_LIMIT = 5
 #: Join-code reissue has its own budget at the upload-reissue rate.
 JOIN_ISSUE_LIMIT = UPLOAD_ISSUE_LIMIT
 JOIN_ISSUE_WINDOW_SECONDS = UPLOAD_ISSUE_WINDOW_SECONDS
+#: Review-code regeneration has its own budget at the same rate.
+REVIEW_ISSUE_LIMIT = UPLOAD_ISSUE_LIMIT
+REVIEW_ISSUE_WINDOW_SECONDS = UPLOAD_ISSUE_WINDOW_SECONDS
 UPLOAD_REDEEM_WINDOW_SECONDS = 60
 
 
@@ -95,21 +116,34 @@ upload_issue_limiter = SlidingWindowLimiter()
 upload_redeem_limiter = SlidingWindowLimiter()
 review_login_limiter = SlidingWindowLimiter()
 join_issue_limiter = SlidingWindowLimiter()
+review_issue_limiter = SlidingWindowLimiter()
+operator_login_limiter = SlidingWindowLimiter()
 
 
 def reset_upload_rate_limits() -> None:
     upload_issue_limiter.reset()
     upload_redeem_limiter.reset()
     join_issue_limiter.reset()
+    review_issue_limiter.reset()
 
 
 def review_rate_now() -> float:
-    """Clock for review-login rate limits. Tests replace this rather than sleeping."""
+    """Clock for review rate limits. Tests replace this rather than sleeping."""
     return time.monotonic()
 
 
 def reset_review_rate_limits() -> None:
     review_login_limiter.reset()
+    review_issue_limiter.reset()
+
+
+def operator_rate_now() -> float:
+    """Clock for OP login rate limits. Tests replace this rather than sleeping."""
+    return time.monotonic()
+
+
+def reset_operator_rate_limits() -> None:
+    operator_login_limiter.reset()
 
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -138,6 +172,10 @@ def upload_grace_seconds() -> int:
 def review_access_ttl_seconds() -> int:
     """Lifetime of a ``typ=review`` access token (ADR-0005 §6.5)."""
     return _positive_int_env(REVIEW_ACCESS_TTL_ENV, DEFAULT_REVIEW_ACCESS_TTL_SECONDS)
+
+
+def operator_session_ttl_seconds() -> int:
+    return _positive_int_env(OPERATOR_SESSION_TTL_ENV, DEFAULT_OPERATOR_SESSION_TTL_SECONDS)
 
 
 def review_refresh_ttl_seconds() -> int:
@@ -368,14 +406,103 @@ def _operator_actor(token: str, session_id: str = "") -> "Actor":
     )
 
 
-def require_operator(request: Request) -> Actor:
-    """Operator-only routes (ADR-0005 §1). 401 when unset, missing or wrong."""
+def check_admin_credentials(username: str, password: str) -> bool:
+    """True only for the configured admin username and password.
+
+    The username is compared in constant time and the password always goes
+    through scrypt, against a dummy hash when the username is wrong or no
+    admin is configured, so every wrong guess costs about the same.
+    """
+    expected_username = os.environ.get(ADMIN_USERNAME_ENV, "")
+    encoded = os.environ.get(ADMIN_PASSWORD_HASH_ENV, "")
+    configured = bool(expected_username) and admin_password.is_valid_hash(encoded)
+    username_ok = hmac.compare_digest(
+        username.encode("utf-8"), expected_username.encode("utf-8")
+    )
+    password_ok = admin_password.verify_password(
+        password, encoded if configured else admin_password.dummy_hash()
+    )
+    return configured and username_ok and password_ok
+
+
+def create_operator_token(username: str) -> tuple[str, int]:
+    """Mint an OP login token. Returns the token and its ``exp`` (unix seconds)."""
+    now_s = int(time.time())
+    expires_at = now_s + operator_session_ttl_seconds()
+    claims = {
+        "sub": username,
+        "session_id": OPERATOR_AUDIT_SESSION_ID,
+        "role": OPERATOR_ROLE,
+        "typ": OPERATOR_TOKEN_TYP,
+        "jti": uuid.uuid4().hex,
+        "iat": now_s,
+        "exp": expires_at,
+    }
+    payload = websocket._b64encode(
+        json.dumps(claims, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    )
+    signature = hmac.new(websocket._token_secret(), payload.encode("ascii"), hashlib.sha256)
+    return f"{payload}.{websocket._b64encode(signature.digest())}", expires_at
+
+
+def _verified_typ(token: str) -> str | None:
+    """``typ`` of a token whose signature already verified. Only picks a 401 reason."""
+    try:
+        claims = json.loads(websocket._b64decode(token.split(".", 1)[0]))
+    except (ValueError, UnicodeError):
+        return None
+    return str(claims.get("typ", "live")) if isinstance(claims, dict) else None
+
+
+def operator_actor_for(token: str, db: DBSession, session_id: str = "") -> Actor | None:
+    """The operator behind ``token``, or None when it is not an operator credential.
+
+    Accepts the static operator token and unexpired, unrevoked OP login tokens.
+    An OP login token that expired or was logged out is a 401 here rather than
+    a fall-through, so OP can tell the user to sign in again.
+    """
+    if is_operator_token(token):
+        return _operator_actor(token, session_id)
+    try:
+        claims = decode_session_token(
+            token,
+            session_id=OPERATOR_AUDIT_SESSION_ID,
+            role=OPERATOR_ROLE,
+            typ=OPERATOR_TOKEN_TYP,
+        )
+    except TokenInvalid as exc:
+        # decode checks the signature before expiry, so this typ is authentic.
+        if exc.reason == "expired_session_token" and _verified_typ(token) == OPERATOR_TOKEN_TYP:
+            raise HTTPException(status_code=401, detail="expired_session_token") from exc
+        return None
+    token_hash = models.hash_token(token)
+    if models.is_token_hash_revoked(db, OPERATOR_AUDIT_SESSION_ID, token_hash):
+        raise HTTPException(status_code=401, detail="revoked_session_token")
+    return Actor(
+        session_id=session_id,
+        role=OPERATOR_ROLE,
+        client_id=str(claims.get("sub") or OPERATOR_ROLE),
+        token=token,
+        token_hash=token_hash,
+        is_operator=True,
+    )
+
+
+def require_operator(request: Request, db: DBSession = Depends(get_db)) -> Actor:
+    """Operator-only routes (ADR-0005 §1). 401 when unset, missing or wrong.
+
+    Either the static operator token or an OP login token. An expired or
+    logged-out login token is 401 ``expired_session_token`` or
+    ``revoked_session_token``. Anything else that is not an operator
+    credential is 401 ``invalid_operator_token``.
+    """
     token = extract_token(request)
     if not token:
         raise HTTPException(status_code=401, detail="missing_session_token")
-    if not is_operator_token(token):
+    actor = operator_actor_for(token, db)
+    if actor is None:
         raise HTTPException(status_code=401, detail="invalid_operator_token")
-    return _operator_actor(token)
+    return actor
 
 
 
@@ -539,12 +666,13 @@ def require_roles(
         token = extract_token(request)
         if not token:
             raise HTTPException(status_code=401, detail="missing_session_token")
-        if is_operator_token(token):
+        operator = operator_actor_for(token, db, session_id)
+        if operator is not None:
             if not allow_operator:
                 raise HTTPException(
                     status_code=403, detail="operator may not use this endpoint"
                 )
-            return _operator_actor(token, session_id)
+            return operator
         try:
             claims = decode_session_token(token, session_id=session_id, typ=decode_typ)
         except TokenInvalid as exc:
@@ -647,8 +775,10 @@ def _resolve_pathless_actor(
     token = extract_token(request)
     if not token:
         raise HTTPException(status_code=401, detail="missing_session_token")
-    if allow_operator and is_operator_token(token):
-        return _operator_actor(token)
+    if allow_operator:
+        operator = operator_actor_for(token, db)
+        if operator is not None:
+            return operator
     try:
         claims = decode_session_token(token)
     except TokenInvalid as exc:
