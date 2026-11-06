@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Fake scp: last argument is user@host:dir; copy the files there locally.
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o|-i|-P) shift 2 ;;
+    -*) shift ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+dest="${args[-1]#*:}"
+unset 'args[-1]'
+printf 'scp %s -> %s\n' "${#args[@]} files" "$dest" >> "$STATE/log"
+cp "${args[@]}" "$dest"
