@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Fake sudo: -n fails when the test says sudo would ask for a password.
+if [ "${1:-}" = -n ]; then
+  shift
+  [ -e "$STATE/sudo_password" ] && exit 1
+fi
+exec "$@"

@@ -1,0 +1,126 @@
+name: Backend deploy
+
+# Manual only: a merge never restarts the backend. See deploy/backend/README.md.
+# SSH goes over Tailscale only (ephemeral runner node, OIDC, no long-lived
+# Tailscale secret); the host's public port 22 can stay closed.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "preflight = read-only checks, changes nothing; deploy = back up and replace the backend"
+        required: true
+        type: choice
+        options: [preflight, deploy]
+        default: preflight
+      commit:
+        description: Full 40-character feat/m2 commit
+        required: true
+        type: string
+      maintenance_confirmed:
+        description: "deploy only: maintenance window confirmed (no new or running sessions, uploads finished, old tabs handled)"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Shared with backend-rollback.yml: one production run at a time, never cancelled midway.
+concurrency:
+  group: backend-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Backend ${{ inputs.mode }}
+    runs-on: ubuntu-24.04
+    # The Tailscale trust credential only accepts OIDC tokens for this environment.
+    environment: production
+    timeout-minutes: 50
+    permissions:
+      contents: read
+      id-token: write   # OIDC token for Tailscale; nothing else uses it
+    env:
+      DEPLOY_ACTION: ${{ inputs.mode }}
+      DEPLOY_COMMIT: ${{ inputs.commit }}
+      MAINTENANCE_CONFIRMED: ${{ inputs.maintenance_confirmed }}
+      DEPLOY_RUN_ID: gh-${{ github.run_id }}-${{ github.run_attempt }}
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_REQUIRE_TAILNET: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Write the SSH key and pinned host key
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          {
+            echo "DEPLOY_SSH_KEY_FILE=$RUNNER_TEMP/deploy_key"
+            echo "DEPLOY_KNOWN_HOSTS_FILE=$RUNNER_TEMP/known_hosts"
+            echo "DEPLOY_OUT=$RUNNER_TEMP/deploy-out"
+          } >> "$GITHUB_ENV"
+          DEPLOY_SSH_KEY_FILE="$RUNNER_TEMP/deploy_key"
+          DEPLOY_KNOWN_HOSTS_FILE="$RUNNER_TEMP/known_hosts"
+          umask 077
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$DEPLOY_SSH_KEY_FILE"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$DEPLOY_KNOWN_HOSTS_FILE"
+          test -s "$DEPLOY_SSH_KEY_FILE" || { echo 'Secret DEPLOY_SSH_KEY is missing.'; exit 1; }
+          test -s "$DEPLOY_KNOWN_HOSTS_FILE" || { echo 'Secret DEPLOY_KNOWN_HOSTS is missing.'; exit 1; }
+
+      # Before joining the tailnet: mode, commit, confirmation, tailnet address, host key entry.
+      - name: Check inputs
+        env:
+          DEPLOY_CHECK_ONLY: "1"
+        run: bash deploy/backend/ci-deploy.sh
+
+      - name: Join the tailnet (ephemeral node, logged out when the job ends)
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:mindprobe-ci
+          version: 1.104.4
+          ping: ${{ secrets.DEPLOY_HOST }}
+
+      - name: Run on the host (preflight, or preflight + backup + cutover + checks)
+        run: bash deploy/backend/ci-deploy.sh
+
+      - name: Summary
+        if: always()
+        run: |
+          OUT="$DEPLOY_OUT"
+          {
+            echo "### Backend $DEPLOY_ACTION"
+            echo "- commit: \`$DEPLOY_COMMIT\`"
+            if git cat-file -e "$DEPLOY_COMMIT^{commit}" 2>/dev/null; then
+              echo "- tree: \`$(git rev-parse "$DEPLOY_COMMIT^{tree}")\`"
+            fi
+            if [ -f "$OUT/stage/mindprobe-release.sha256" ]; then
+              echo "- release sha256 (tar bytes depend on the git version; compare commit and tree):"
+              echo '```'; cat "$OUT/stage/mindprobe-release.sha256"; echo '```'
+            fi
+            echo "- host log: /opt/mindprobe/deploy-logs/$DEPLOY_RUN_ID.log (copy in the artifact)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Leave the tailnet and remove the SSH key
+        if: always()
+        run: |
+          rm -f "$DEPLOY_SSH_KEY_FILE"
+          # The action's post step logs out too; this makes it explicit and immediate.
+          if command -v tailscale > /dev/null; then sudo tailscale logout || true; fi
+
+      - name: Keep the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-${{ inputs.mode }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/deploy-out/deploy-*.log
+            ${{ runner.temp }}/deploy-out/stage/mindprobe-release.env
+            ${{ runner.temp }}/deploy-out/stage/mindprobe-release.sha256
+          if-no-files-found: warn
+          retention-days: 90
