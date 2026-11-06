@@ -15,6 +15,12 @@ api="${MP_API:-https://95-41-69-24.sslip.io}"
 backup_dir="${MP_BACKUP_DIR:-$HOME}"
 env_file="$root/runtime.env"
 compose=(sudo docker compose -p mindprobe-prod -f docker-compose.prod.yml)
+# One mutating operation at a time on this host (it rewrites runtime.env and
+# restarts the server). Same lock as remote-run.sh, upgrade.sh and rollback.sh.
+if [ "${MP_LOCK_HELD:-}" != 1 ] || ! [ /proc/self/fd/9 -ef "$root/.deploy.lock" ]; then
+  exec 9>"$root/.deploy.lock"
+  flock -n 9 || { echo 'Another deploy, rollback or admin change is running on this host. Nothing was changed.'; exit 75; }
+fi
 cd "$(readlink -f "$root/current")"
 
 "${compose[@]}" exec -T server python -c 'import app.admin_password' </dev/null \

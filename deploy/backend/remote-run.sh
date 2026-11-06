@@ -23,6 +23,7 @@ log="$logs/$run_id.log"
   # One deploy or rollback at a time on this host, whoever starts it.
   exec 9>"$root/.deploy.lock"
   flock -n 9 || { echo 'Another deploy or rollback is running on this host. Nothing was changed.'; exit 75; }
+  export MP_LOCK_HELD=1  # upgrade.sh and rollback.sh then skip taking the lock again
   echo "== $(date -u +%FT%TZ) $action, run $run_id, as $(id -un)"
   sudo -n true 2>/dev/null || { echo 'sudo needs a password here; the deploy user needs passwordless sudo. Nothing was changed.'; exit 1; }
   case "$action" in

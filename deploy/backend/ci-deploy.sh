@@ -53,7 +53,7 @@ if [ "$action" = deploy ]; then
     bash "$here/make-release.sh" "$DEPLOY_COMMIT" --out "$stage"
   fi
 fi
-cp "$here"/{release-info,preflight,activity-check,upgrade,rollback,remote-run}.sh "$stage/"
+cp "$here"/{release-info,preflight,activity-check,upgrade,rollback,remote-run,set-admin}.sh "$stage/"
 
 remote_dir="$remote_base/mindprobe-deploy-$run_id"
 echo "== Staging on $DEPLOY_HOST:$remote_dir"
@@ -100,5 +100,10 @@ if remote "cat '$log_remote'" > "$log_local.part"; then
   tail -c +"$((shown + 1))" "$log_local"
 fi
 echo "== Host finished $action with exit $code. Log: $log_remote (copy in the workflow artifact)."
+# Staged from this reviewed kit, never run by CD. The target release (e.g. one
+# older than deploy/backend) does not have to contain it.
+if [ "$action" = deploy ] && [ "$code" = 0 ]; then
+  echo "== set-admin.sh is staged at $remote_dir/set-admin.sh on the host. To set or change the OP admin login, run it there by hand: bash '$remote_dir/set-admin.sh'"
+fi
 [[ "$code" =~ ^[0-9]+$ ]] || code=1
 exit "$code"

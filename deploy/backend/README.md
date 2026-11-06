@@ -18,20 +18,25 @@
 |---|---|---|
 | `make-release.sh` | 本機或 CI | `git archive` 指定 commit，產生 `mindprobe-release.{tar,env,sha256}`；正式部署要求 commit 在 `origin/feat/m2` 上 |
 | `ci-deploy.sh` | GitHub runner | 把 release 和腳本傳到主機的 `/tmp/mindprobe-deploy-<run>/`（0700），以背景方式啟動 `remote-run.sh`，持續讀取 log 直到結束，並回傳主機端的結束碼 |
-| `remote-run.sh` | 主機 | 先拿主機鎖（`/opt/mindprobe/.deploy.lock`），確認 `sudo -n` 可用，再跑 `preflight.sh` + `upgrade.sh`，或 `rollback.sh`。log 寫到 `/opt/mindprobe/deploy-logs/<run>.log`，結束碼寫到 `<run>.exit` |
+| `remote-run.sh` | 主機 | 先拿主機鎖（`/opt/mindprobe/.deploy.lock`）並告知子腳本，確認 `sudo -n` 可用，再跑 `preflight.sh` + `upgrade.sh`，或 `rollback.sh`。log 寫到 `/opt/mindprobe/deploy-logs/<run>.log`，結束碼寫到 `<run>.exit` |
 | `release-info.sh` | 主機 | 校驗 staging 目錄（`MP_TMP`）裡的 release 檔 |
-| `preflight.sh`、`activity-check.sh`、`upgrade.sh`、`rollback.sh` | 主機 | 和人手操作時是同一套腳本，詳見下文 |
-| `set-admin.sh` | 主機，**人手執行** | 設定或更換 OP 管理員帳密 |
+| `preflight.sh`、`activity-check.sh`、`upgrade.sh`、`rollback.sh` | 主機 | 和人手操作時是同一套腳本，詳見下文。`upgrade.sh`、`rollback.sh` 也會自己拿同一把主機鎖 |
+| `set-admin.sh` | 主機，**人手執行** | 設定或更換 OP 管理員帳密。CD 會把這份審過的腳本隨部署包上傳到 staging 目錄，但**不會執行**；它也拿同一把主機鎖 |
 | `dryrun/` | 本機 WSL 或 CI | 用假的 sudo／docker／curl／ssh／scp 跑完整流程，包括 CD 路徑 |
+
+**主機鎖：** 所有會改動服務的入口（`remote-run.sh`、直接執行的 `upgrade.sh`、`rollback.sh`、`set-admin.sh`）都用 `/opt/mindprobe/.deploy.lock`。鎖被佔用時，直接執行的腳本回傳結束碼 75，什麼都不改。`remote-run.sh` 持有鎖時會設定 `MP_LOCK_HELD=1`，子腳本會再確認 fd 9 真的是那把鎖才跳過，所以不會自己卡死，單獨設這個變數也繞不過去。`preflight.sh` 和 `activity-check.sh` 只讀，不用鎖。
 
 `upgrade.sh` 的 7 個階段：
 1. 校驗 release，確認正在跑的 stack 來自 `current`，記下回退資訊。
 2. 把正在跑的 image 標為 `pre-<短碼>`。
-3. 解開 release 到 `releases/<短碼>`。
+3. 解開 release 到 `releases/<短碼>`，並把 commit 寫進 `server/RELEASE_COMMIT`（build context，會進到 image 的 `/app/RELEASE_COMMIT`）。
 4. 建新 image，期間舊容器繼續服務。
 5. **再查一次活動**，然後備份 SQLite。
 6. 換新容器，等健康檢查通過。
-7. 確認 server 容器來自新的 release 目錄，而且公開 `/openapi.json` 的路由和新容器自己列出的路由完全相同，最後才切換 `current`。
+7. 確認 release 身分，最後才切換 `current`：
+   - 容器來自新的 release 目錄，而且 image 內的 `/app/RELEASE_COMMIT` 等於這次的 commit。
+   - 對公開 HTTPS 網址送一個唯一的探針請求（`/health?mp_release_probe=<隨機碼>`），這個碼必須出現在**新容器**自己的 access log 裡；公開端點若還指向舊版，就看不到。
+   - 補充檢查：公開 `/openapi.json` 的路由和新容器自己列出的路由相同。路由相同**不能**證明版本正確，只是多一道檢查。
 
 ## 一次性設定（由負責人做）
 
@@ -65,7 +70,7 @@
    - Student 錄一段短影片，Stop REC 後顯示可以安全關閉，OP 詳情顯示 complete。
    - Teacher 用 review code 登入並播放。
 
-**同時只會有一個部署：** 部署和回退共用 `backend-production` 這個 concurrency group，第二個會排隊，不會被取消。主機上還有 `flock`，所以手動跑的腳本和 CD 也不會同時執行；遇到時回傳結束碼 75。
+**同時只會有一個部署：** 部署和回退共用 `backend-production` 這個 concurrency group，第二個會排隊，不會被取消。主機上所有會改動服務的入口（CD、直接執行的 `upgrade.sh`／`rollback.sh`、`set-admin.sh`）共用同一把 `flock`，所以手動操作和 CD 不會同時執行；遇到時回傳結束碼 75。
 
 **SSH 中途斷線：** 主機上的流程是用 `setsid nohup` 在背景跑的，不受影響。runner 那邊最多重試輪詢 30 次。如果 workflow 逾時或失聯，到主機查 `deploy-logs/<run>.log` 和 `<run>.exit`。
 
@@ -77,7 +82,7 @@
 |---|---|---|
 | 2，`Not confirmed` 或 `40-character` | 輸入不對，什麼都沒做 | 修正輸入後重跑 |
 | 1，`Activity: WAIT`（preflight 或第 5 階段） | 有進行中的場次、上傳或轉檔，舊後端照常服務 | 等活動結束後重跑 |
-| 75 | 另一個部署或回退正在主機上跑 | 等它結束 |
+| 75 | 另一個部署、回退或管理員設定正在主機上跑（CD 或手動都一樣） | 等它結束 |
 | 1，`passwordless sudo` | 部署帳號的 sudo 需要密碼 | 修正主機設定 |
 | 1，在第 1–5 階段失敗 | **舊後端仍在服務**，`current` 沒動 | 看 log 找原因，修正後重跑同一個 commit；解開過的 release 只有內容一致時才會沿用 |
 | 1，在第 6–7 階段失敗（`Run rollback.sh`） | 新容器**可能**已在跑，`current` 仍指舊版 | 先看實際狀態，再執行 **Backend rollback**，確認恢復後才重試 |
@@ -92,17 +97,24 @@
 
 ## 手動部署（不經 CD，備援用）
 
-把 `make-release.sh` 產生的三個 release 檔，加上 `release-info.sh`、`preflight.sh`、`activity-check.sh`、`upgrade.sh`、`rollback.sh` 放到主機的同一個目錄，然後：
+把 `make-release.sh` 產生的三個 release 檔，加上 `release-info.sh`、`preflight.sh`、`activity-check.sh`、`upgrade.sh`、`rollback.sh`、`set-admin.sh` 放到主機的同一個目錄，然後：
 
 ```bash
 export MP_TMP=<那個目錄>
 bash $MP_TMP/preflight.sh && bash $MP_TMP/upgrade.sh --maintenance-confirmed
 ```
 
+直接執行 `upgrade.sh`／`rollback.sh` 時，如果 CD 或另一個操作正在跑，會回傳 75 並且什麼都不改。
+
 ## 管理員帳密（人手）
 
-第一次啟用 OP 登入，或要更換密碼時，在主機上執行 `bash set-admin.sh`：
+第一次啟用 OP 登入，或要更換密碼時，在主機上執行**這次部署上傳的那一份** `set-admin.sh`。CD 部署成功後，log 結尾會印出完整路徑，位置是 `/tmp/mindprobe-deploy-<run id>/set-admin.sh`（`<run id>` 是 Actions 的 run id 和 attempt）：
 
+```bash
+bash /tmp/mindprobe-deploy-<run id>/set-admin.sh
+```
+
+不要用主機上其他地方留下來的舊版。這份是從審過的 kit 上傳的，即使這次部署的 commit 早於 `deploy/backend`（tar 裡沒有 `set-admin.sh`）也一樣會有。帳密一律由你在提示時手動輸入，CD 不會執行它，也不會經手任何帳密。
 - 帳號輸入時會顯示，密碼不會；密碼要 12–1024 字元，輸入兩次。
 - 它會先備份 `runtime.env`，只替換管理員那兩行，重啟 server，然後實際登入一次再登出。
 

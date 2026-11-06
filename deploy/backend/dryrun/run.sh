@@ -177,9 +177,32 @@ admin admin "$SECRET" "$SECRET"
 ok 'a 200 without a token is refused and its body is not printed' '[ $rc = 1 ] && grep -q "without an operator token" "$STATE/out" && ! grep -q "$SECRET" "$STATE/out"'
 rm "$STATE/login_response"
 
-echo '# S: the public API still serves the old routes after the swap'
+echo '# S: the public API still serves the old release after the swap'
 fresh s; touch "$STATE/stale_proxy"; up --maintenance-confirmed
-expect 'route mismatch stops before current switches' 1 'differs from the routes of the new container' "running=img-new from=$NEW current=9579475 pre-tag=img-old"
+expect 'stale public proxy stops before current switches' 1 'did not reach the new container' "running=img-new from=$NEW current=9579475 pre-tag=img-old"
+fresh s2; touch "$STATE/stale_proxy"; OLD_PATHS="$NEW_PATHS" up --maintenance-confirmed
+expect 'stale proxy is caught even when both releases have the same routes' 1 'did not reach the new container' "running=img-new from=$NEW current=9579475 pre-tag=img-old"
+fresh s3; touch "$STATE/stale_routes"; up --maintenance-confirmed
+expect 'route mismatch is still a supplemental stop' 1 'differs from the routes of the new container' "running=img-new from=$NEW current=9579475 pre-tag=img-old"
+fresh s4; touch "$STATE/stale_image"; up --maintenance-confirmed
+expect 'an image not built from this release stops before current switches' 1 'was built from' "running=img-new from=$NEW current=9579475 pre-tag=img-old"
+fresh s5; up --maintenance-confirmed
+ok 'release identity is confirmed and the marker is in the build context' 'grep -q "Release $NEW confirmed" "$STATE/out" && [ "$(cat "$MP_ROOT/releases/$NEW/server/RELEASE_COMMIT")" = "$commit" ]'
+
+echo '# L: one host lock for every mutating entry point'
+holdlock() { exec 8>"$MP_ROOT/.deploy.lock"; flock -n 8; }
+freelock() { exec 8>&-; }
+fresh l1; holdlock; up --maintenance-confirmed; freelock
+expect 'direct upgrade.sh refuses while the lock is held' 75 'Another deploy, rollback or admin change' "$OLD pre-tag=none"
+ok 'direct upgrade.sh changed nothing (no build, no tag, no start)' '[ ! -e "$STATE/ups" ] && ! grep -q "docker tag" "$STATE/log"'
+fresh l2; up --maintenance-confirmed; holdlock; rb; freelock
+expect 'direct rollback.sh refuses while the lock is held' 75 'Another deploy, rollback or admin change' "$NEWST"
+fresh l3; up --maintenance-confirmed > /dev/null; ups_l3="$(wc -l < "$STATE/ups")"; holdlock; admin admin "$PW" "$PW"; freelock
+ok 'direct set-admin.sh refuses while the lock is held and changes nothing' '[ $rc = 75 ] && [ "$(admin_lines)" = 0 ] && [ ! -e "$STATE/hashed_pw" ] && [ "$(wc -l < "$STATE/ups")" = "$ups_l3" ]'
+fresh l4; holdlock; MP_LOCK_HELD=1 up --maintenance-confirmed; freelock
+expect 'MP_LOCK_HELD alone does not bypass a lock held by someone else' 75 'Another deploy, rollback or admin change' "$OLD pre-tag=none"
+fresh l5; up --maintenance-confirmed > /dev/null; rb
+expect 'the lock is released after each direct run (rollback right after upgrade)' 0 'Rolling back to' "$OLD pre-tag=img-old"
 
 echo '# CD: ci-deploy.sh -> fake ssh/scp -> remote-run.sh'
 cd_env() {  # cd_env <name> [extra VAR=value ...]
@@ -197,6 +220,8 @@ expect 'CD deploy: preflight, upgrade, exit 0' 0 "Upgrade to $NEW done" "$NEWST"
 ok 'CD deploy: preflight ran on the host first' 'grep -q "Preflight passed" "$STATE/out"'
 ok 'CD deploy: host log kept and copied for the artifact' 'grep -q "== exit 0" "$MP_ROOT/deploy-logs/run-cd1.log" && cmp -s "$MP_ROOT/deploy-logs/run-cd1.log" "$CD_OUT/deploy-run-cd1.log"'
 ok 'CD deploy: staging directory is 0700 and holds the release' '[ "$(stat -c %a "$work/remote-cd1/mindprobe-deploy-run-cd1")" = 700 ] && [ -f "$work/remote-cd1/mindprobe-deploy-run-cd1/mindprobe-release.tar" ]'
+ok 'CD deploy: reviewed set-admin.sh is staged byte for byte, and not run' 'cmp -s "$kit/set-admin.sh" "$work/remote-cd1/mindprobe-deploy-run-cd1/set-admin.sh" && [ "$(admin_lines)" = 0 ] && [ ! -e "$STATE/hashed_pw" ]'
+ok 'CD deploy: the log says where set-admin.sh is and that it is run by hand' 'grep -q "mindprobe-deploy-run-cd1/set-admin.sh" "$STATE/out" && grep -q "by hand" "$STATE/out"'
 ACTION=rollback cd_env cd1-rb
 expect 'CD rollback restores the old release' 0 'health passed' "$OLD pre-tag=img-old"
 
@@ -222,6 +247,13 @@ fresh cd6; touch "$STATE/unhealthy"; cd_env cd6
 expect 'CD reports an unhealthy cutover and leaves current alone' 1 'Run rollback.sh' "running=img-new from=$NEW current=9579475 pre-tag=img-old"
 rm "$STATE/unhealthy"; ACTION=rollback cd_env cd6-rb
 expect 'CD rollback after a failed cutover' 0 'health passed' "$OLD pre-tag=img-old"
+
+fresh cd7; rel_old="$work/release-old"; mkdir -p "$rel_old/x"
+tar -xf "$rel/mindprobe-release.tar" -C "$rel_old/x" && rm -rf "$rel_old/x/deploy" && tar -cf "$rel_old/mindprobe-release.tar" -C "$rel_old/x" .
+cp "$rel/mindprobe-release.env" "$rel_old/"; (cd "$rel_old" && sha256sum mindprobe-release.tar mindprobe-release.env > mindprobe-release.sha256)
+rel_keep="$rel"; rel="$rel_old"; cd_env cd7; rel="$rel_keep"
+expect 'CD deploys a target commit that predates deploy/backend' 0 "Upgrade to $NEW done" "$NEWST"
+ok 'older target: its tar has no set-admin.sh, yet the kit stages the reviewed one' '! tar -tf "$rel_old/mindprobe-release.tar" | grep -q "set-admin.sh" && cmp -s "$kit/set-admin.sh" "$work/remote-cd7/mindprobe-deploy-run-cd7/set-admin.sh"'
 
 echo "passed=$pass failed=$fail"
 [ "$fail" = 0 ]

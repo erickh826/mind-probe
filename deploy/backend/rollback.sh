@@ -10,6 +10,12 @@ set -euo pipefail
 root="${MP_ROOT:-/opt/mindprobe}"
 api="${MP_API:-https://95-41-69-24.sslip.io}"
 compose=(sudo docker compose -p mindprobe-prod -f docker-compose.prod.yml)
+# One mutating operation at a time on this host. remote-run.sh already holds
+# the lock on fd 9 and says so; any other entry point takes it here.
+if [ "${MP_LOCK_HELD:-}" != 1 ] || ! [ /proc/self/fd/9 -ef "$root/.deploy.lock" ]; then
+  exec 9>"$root/.deploy.lock"
+  flock -n 9 || { echo 'Another deploy, rollback or admin change is running on this host. Nothing was changed.'; exit 75; }
+fi
 target="$(cat "$root/rollback-target")"
 image="$(cat "$root/rollback-image")"
 test -d "$target"

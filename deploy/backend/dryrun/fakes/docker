@@ -13,6 +13,10 @@ if [ "$1" = compose ]; then
     build)
       if [ -e "$STATE/fail_build" ]; then echo 'fake: build failed' >&2; exit 1; fi
       test -f "$PWD/server/Dockerfile" || { echo 'fake: no server/Dockerfile here' >&2; exit 1; }
+      test -f "$PWD/server/RELEASE_COMMIT" || { echo 'fake: no server/RELEASE_COMMIT in the build context' >&2; exit 1; }
+      # What COPY . . would bake into the image; $STATE/stale_image fakes a cached old layer.
+      if [ -e "$STATE/stale_image" ]; then echo 0000000000000000000000000000000000000000 > "$STATE/image_commit_new"
+      else cp "$PWD/server/RELEASE_COMMIT" "$STATE/image_commit_new"; fi
       echo img-new > "$(img mind-probe-server:latest)" ;;
     config) ;;
     up)
@@ -21,8 +25,16 @@ if [ "$1" = compose ]; then
       # What the container would read from .env at this start.
       cp "$MP_ROOT/runtime.env" "$STATE/env_at_up"
       echo up >> "$STATE/ups" ;;
+    logs)
+      # The access log of the container that is running now.
+      cat "$STATE/server_log" 2>/dev/null || true ;;
     exec)
       while [ "$1" = -T ] || [ "$1" = server ]; do shift; done
+      if [ "${1:-}" = cat ] && [ "${2:-}" = /app/RELEASE_COMMIT ]; then
+        if [ "$(cat "$STATE/running_image")" = img-new ]; then cat "$STATE/image_commit_new"
+        else echo 9579475868dfefd460031fa45bf1d1ac1348ba45; fi
+        exit 0
+      fi
       [ "$1" = python ] && shift
       new=no; [ "$(cat "$STATE/running_image")" = img-new ] && new=yes
       if [ "${1:-}" = -c ]; then

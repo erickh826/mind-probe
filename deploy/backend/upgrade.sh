@@ -15,12 +15,20 @@ here="$(cd "$(dirname "$0")" && pwd)"
 # MP_TMP: staging directory (see release-info.sh). MP_ROOT / MP_API exist only
 # for the local dry run; leave them unset on the host.
 api="${MP_API:-https://95-41-69-24.sslip.io}"
+root="${MP_ROOT:-/opt/mindprobe}"
 compose=(sudo docker compose -p mindprobe-prod -f docker-compose.prod.yml)
 
 if [ "${1:-}" != "--maintenance-confirmed" ]; then
   echo 'Confirm the maintenance window first (no new sessions, uploads finished), then run:'
   echo '  bash upgrade.sh --maintenance-confirmed'
   exit 2
+fi
+
+# One mutating operation at a time on this host. remote-run.sh already holds
+# the lock on fd 9 and says so; any other entry point takes it here.
+if [ "${MP_LOCK_HELD:-}" != 1 ] || ! [ /proc/self/fd/9 -ef "$root/.deploy.lock" ]; then
+  exec 9>"$root/.deploy.lock"
+  flock -n 9 || { echo 'Another deploy, rollback or admin change is running on this host. Nothing was changed.'; exit 75; }
 fi
 
 phase='start'
@@ -79,6 +87,9 @@ else
   printf '%s\n' "$commit" > "$release/RELEASE_COMMIT"
 fi
 ln -sfn "$root/runtime.env" "$release/.env"
+# Baked into the image (server/ is the build context), so the running container
+# can say which release it was built from. Rewritten on every run, also on reuse.
+printf '%s\n' "$commit" > "$release/server/RELEASE_COMMIT"
 
 step '4/7 Build the new image (the old container keeps serving)'
 (cd "$release" && "${compose[@]}" build server)
@@ -125,8 +136,31 @@ server_id="$("${compose[@]}" ps -q server)"
 serving_dir="$(readlink -f "$(sudo docker inspect --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$server_id")")"
 [ "$serving_dir" = "$(readlink -f "$release")" ] \
   || { echo "The server container came from $serving_dir, not $release. Run rollback.sh." >&2; exit 1; }
-# The routes the new container reports for itself must be what the public
-# HTTPS endpoint serves, so Caddy really reaches the new code.
+# 1) The container runs an image built from this release's files.
+image_commit="$("${compose[@]}" exec -T server cat /app/RELEASE_COMMIT </dev/null 2>/dev/null | tr -d '\r\n' || true)"
+if [ "$image_commit" != "$commit" ]; then
+  echo "The running image was built from '${image_commit:-unknown}', not $commit. Run rollback.sh." >&2
+  exit 1
+fi
+# 2) A public request reaches that container: a unique probe sent to the public
+# HTTPS URL must show up in the new container's own access log. A proxy still
+# serving the old release never shows it, whatever routes the two versions share.
+probe="$(python3 -c 'import secrets; print(secrets.token_hex(12))')"
+curl --fail --silent --max-time 10 "$api/health?mp_release_probe=$probe" > /dev/null \
+  || { echo 'The public release probe request failed. Run rollback.sh.' >&2; exit 1; }
+reached=no
+for attempt in 1 2 3 4 5; do
+  server_log="$("${compose[@]}" logs --no-color --tail 200 server </dev/null 2>/dev/null || true)"
+  if grep -q -- "mp_release_probe=$probe" <<<"$server_log"; then
+    reached=yes; break
+  fi
+  sleep 1
+done
+if [ "$reached" != yes ]; then
+  echo "The public HTTPS endpoint did not reach the new container ($short). It may still serve the previous release. Run rollback.sh." >&2
+  exit 1
+fi
+# 3) Supplemental: same routes publicly as the new container reports for itself.
 own="$("${compose[@]}" exec -T server python -c \
   'import json; from app.main import app; print(json.dumps(sorted(app.openapi()["paths"])))' </dev/null)"
 public="$(curl --fail --silent --max-time 10 "$api/openapi.json" \
@@ -135,7 +169,7 @@ if [ "$own" != "$public" ]; then
   echo 'The public /openapi.json differs from the routes of the new container. Run rollback.sh.' >&2
   exit 1
 fi
-echo "Public API serves the new release: $(python3 -c 'import json, sys; print(len(json.loads(sys.argv[1])))' "$own") routes match."
+echo "Release $short confirmed: image built from $commit, the public endpoint reached the new container, $(python3 -c 'import json, sys; print(len(json.loads(sys.argv[1])))' "$own") routes match."
 "${compose[@]}" exec -T server python -c \
   'import os; print("OP admin login:", "configured" if os.environ.get("MINDPROBE_ADMIN_USERNAME") and os.environ.get("MINDPROBE_ADMIN_PASSWORD_HASH") else "not configured (set-admin.sh)")' </dev/null
 ln -sfn "$release" "$root/current"

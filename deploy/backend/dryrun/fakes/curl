@@ -5,12 +5,19 @@
 url="${*: -1}"
 printf 'curl %s\n' "$url" >> "$STATE/log"
 case "$url" in
+  */health\?mp_release_probe=*)
+    [ -e "$STATE/unhealthy" ] && { echo 'curl: (22) fake 502' >&2; exit 22; }
+    # Only the container the public proxy really reaches logs the request.
+    # $STATE/stale_proxy: that is still the old release, so the running (new) container never sees it.
+    if [ ! -e "$STATE/stale_proxy" ]; then printf 'INFO: GET %s HTTP/1.1 200 OK\n' "${url#*/health}" >> "$STATE/server_log"; fi
+    echo '{"status":"ok"}' ;;
   */health)
     [ -e "$STATE/unhealthy" ] && { echo 'curl: (22) fake 502' >&2; exit 22; }
     echo '{"status":"ok"}' ;;
   */openapi.json)
-    # $STATE/stale_proxy: the public endpoint still serves the old routes.
-    if [ "$(cat "$STATE/running_image")" = img-new ] && [ ! -e "$STATE/stale_proxy" ]; then
+    # $STATE/stale_proxy: the public endpoint still serves the old routes;
+    # $STATE/stale_routes: only the public routes are stale (the probe still arrives).
+    if [ "$(cat "$STATE/running_image")" = img-new ] && [ ! -e "$STATE/stale_proxy" ] && [ ! -e "$STATE/stale_routes" ]; then
       echo "{\"paths\": $(python3 -c 'import json,sys; print(json.dumps({p: {} for p in json.loads(sys.argv[1])}))' "$NEW_PATHS")}"
     else
       echo "{\"paths\": $(python3 -c 'import json,sys; print(json.dumps({p: {} for p in json.loads(sys.argv[1])}))' "$OLD_PATHS")}"
