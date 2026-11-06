@@ -32,6 +32,8 @@ interface SessionDetailProps {
   onUploadCode: (sessionId: string, issued: UploadReissueResponse) => void;
   onReviewCodes: (sessionId: string, codes: ReviewCodesResponse) => void;
   onJoinCodes: (sessionId: string, codes: JoinCodesResponse) => void;
+  /** A 401 means the login expired or was revoked: sign out with this message. */
+  onAuthFailure: (message: string) => void;
 }
 
 type Confirming = "upload" | "review" | "join" | null;
@@ -50,6 +52,10 @@ function describeError(error: unknown): string {
   return errorMessage(0, "");
 }
 
+function isAuthFailure(error: unknown): boolean {
+  return error instanceof OpApiError && error.status === 401;
+}
+
 const MISSING_PREVIEW = 20;
 
 export function SessionDetail({
@@ -61,6 +67,7 @@ export function SessionDetail({
   onUploadCode,
   onReviewCodes,
   onJoinCodes,
+  onAuthFailure,
 }: SessionDetailProps) {
   const sessionId = row.session_id;
   const [status, setStatus] = useState<RecordingStatus | null>(null);
@@ -85,16 +92,30 @@ export function SessionDetail({
         }
       },
       (error: unknown) => {
-        if (!cancelled) {
-          setStatus(null);
-          setStatusError(describeError(error));
+        if (cancelled) {
+          return;
         }
+        if (isAuthFailure(error)) {
+          onAuthFailure(describeError(error));
+          return;
+        }
+        setStatus(null);
+        setStatusError(describeError(error));
       },
     );
     return () => {
       cancelled = true;
     };
-  }, [client, sessionId, readAtMs]);
+  }, [client, sessionId, readAtMs, onAuthFailure]);
+
+  /** Show an action's error, or sign out when the login is no longer valid. */
+  function actionFailed(error: unknown) {
+    if (isAuthFailure(error)) {
+      onAuthFailure(describeError(error));
+      return;
+    }
+    setActionError(describeError(error));
+  }
 
   // The parent keys this component by session, so a code that arrives after the
   // operator switched away is still filed under the session it was issued for.
@@ -111,7 +132,7 @@ export function SessionDetail({
       setConfirming(null);
     } catch (error) {
       if (live()) {
-        setActionError(describeError(error));
+        actionFailed(error);
       }
     } finally {
       setActionBusy(false);
@@ -152,7 +173,7 @@ export function SessionDetail({
       );
     } catch (error) {
       if (live()) {
-        setActionError(describeError(error));
+        actionFailed(error);
       }
     } finally {
       setActionBusy(false);
@@ -172,7 +193,7 @@ export function SessionDetail({
       setConfirming(null);
     } catch (error) {
       if (live()) {
-        setActionError(describeError(error));
+        actionFailed(error);
       }
     } finally {
       setActionBusy(false);
