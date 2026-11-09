@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import { createOpClient, OpApiError, type OpClient } from "./api";
+import { createOpClient, OpApiError, operatorLogin, type OpClient } from "./api";
 import { CodesPanel } from "./components/CodesPanel";
 import { CreateSessionForm } from "./components/CreateSessionForm";
 import { SessionDetail } from "./components/SessionDetail";
 import { SessionTable } from "./components/SessionTable";
-import { TokenGate } from "./components/TokenGate";
+import { LoginGate } from "./components/LoginGate";
 import { API_BASE_URL } from "./config";
 import {
   addFirstReads,
@@ -13,6 +13,7 @@ import {
   createGeneration,
   errorMessage,
   formatServerTime,
+  loginExpired,
   nextReads,
   type ProgressReads,
 } from "./opLogic";
@@ -34,8 +35,10 @@ function isAuthFailure(error: unknown): boolean {
 }
 
 export default function App() {
-  // The operator token lives only in React state: never in storage or a URL.
+  // The login token lives only in React state: never in storage or a URL.
   const [token, setToken] = useState<string | null>(null);
+  /** The token's `expires_at`, unix seconds. */
+  const [expiresAt, setExpiresAt] = useState<number | null>(null);
   const client = useMemo<OpClient | null>(
     () => (token ? createOpClient({ baseUrl: API_BASE_URL, token }) : null),
     [token],
@@ -75,6 +78,7 @@ export default function App() {
       auth.advance();
       listGen.advance();
       setToken(null);
+      setExpiresAt(null);
       setRows([]);
       setNextCursor(null);
       setReads({});
@@ -90,6 +94,20 @@ export default function App() {
     },
     [auth, listGen],
   );
+
+  // Sign out the moment the login runs out, not at the next failing request.
+  useEffect(() => {
+    if (token !== null && expiresAt !== null && loginExpired(expiresAt, nowMs)) {
+      signOut(errorMessage(401, "expired_session_token"));
+    }
+  }, [expiresAt, nowMs, signOut, token]);
+
+  function logOut() {
+    const signedIn = client;
+    signOut(null);
+    // Best effort: this tab has already dropped the token either way.
+    void signedIn?.logout().catch(() => undefined);
+  }
 
   const listFailed = useCallback(
     (error: unknown) => {
@@ -175,12 +193,16 @@ export default function App() {
     }
   }
 
-  async function signIn(candidate: string) {
+  async function signIn(username: string, password: string) {
     const live = auth.advance();
     setGateBusy(true);
     setGateError(null);
-    const probe = createOpClient({ baseUrl: API_BASE_URL, token: candidate });
     try {
+      const login = await operatorLogin({ baseUrl: API_BASE_URL, username, password });
+      if (!live()) {
+        return;
+      }
+      const probe = createOpClient({ baseUrl: API_BASE_URL, token: login.access_token });
       const [page, caseList] = await Promise.all([
         probe.listSessions({ limit: PAGE_SIZE }),
         probe.listCases(),
@@ -194,7 +216,8 @@ export default function App() {
       setReads(nextReads({}, page.sessions, readAtMs));
       setLastReadAt(new Date(readAtMs).toISOString());
       setCases(caseList.cases);
-      setToken(candidate);
+      setToken(login.access_token);
+      setExpiresAt(login.expires_at);
     } catch (error) {
       if (live()) {
         setGateError(describeError(error));
@@ -256,7 +279,7 @@ export default function App() {
   }, [holdsCodes]);
 
   if (!client) {
-    return <TokenGate busy={gateBusy} error={gateError} onSubmit={signIn} />;
+    return <LoginGate busy={gateBusy} error={gateError} onSubmit={signIn} />;
   }
 
   const selectedRow = rows.find((row) => row.session_id === selectedId) ?? null;
@@ -267,8 +290,13 @@ export default function App() {
       <header className="topbar">
         <h1>mind-probe · OP 管理</h1>
         <span className="hint">API：{API_BASE_URL || "（同源）"}</span>
-        <button type="button" className="secondary" onClick={() => signOut(null)}>
-          清除 token 並離開
+        {expiresAt !== null && (
+          <span className="hint">
+            登入有效至 {formatServerTime(new Date(expiresAt * 1000).toISOString())}
+          </span>
+        )}
+        <button type="button" className="secondary" onClick={logOut}>
+          登出
         </button>
       </header>
 
@@ -347,6 +375,7 @@ export default function App() {
                 },
               }))
             }
+            onAuthFailure={signOut}
             onReviewCodes={(sessionId, codes) =>
               setHeld((current) => ({
                 ...current,

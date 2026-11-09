@@ -2,6 +2,7 @@ import type {
   CreatedSession,
   JoinCodeRole,
   JoinCodesResponse,
+  OperatorLogin,
   RecordingStatus,
   ReviewCodesResponse,
   SessionListResponse,
@@ -23,7 +24,7 @@ export class OpApiError extends Error {
 
 export interface OpClientOptions {
   baseUrl: string;
-  /** The operator token. Held by the caller in memory only. */
+  /** The operator login token. Held by the caller in memory only. */
   token: string;
   fetchImpl?: typeof fetch;
 }
@@ -46,6 +47,37 @@ async function readDetail(response: Response): Promise<string> {
   } catch {
     return "";
   }
+}
+
+export interface OperatorLoginOptions {
+  baseUrl: string;
+  username: string;
+  password: string;
+  fetchImpl?: typeof fetch;
+}
+
+/** Exchange the admin username and password for an operator token. Body only, never a URL. */
+export async function operatorLogin({
+  baseUrl,
+  username,
+  password,
+  fetchImpl,
+}: OperatorLoginOptions): Promise<OperatorLogin> {
+  const doFetch = fetchImpl ?? ((input: RequestInfo | URL, init?: RequestInit) => fetch(input, init));
+  const response = await doFetch(`${baseUrl}/op/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+    credentials: "omit",
+    cache: "no-store",
+    referrerPolicy: "no-referrer",
+  });
+  if (!response.ok) {
+    // Only a bare reason code: a validation error can quote the submitted password.
+    const detail = await readDetail(response);
+    throw new OpApiError(response.status, /^[a-z_]{1,64}$/.test(detail) ? detail : "");
+  }
+  return (await response.json()) as OperatorLogin;
 }
 
 export function createOpClient({ baseUrl, token, fetchImpl }: OpClientOptions) {
@@ -99,6 +131,8 @@ export function createOpClient({ baseUrl, token, fetchImpl }: OpClientOptions) {
       }),
     regenerateReviewCodes: (sessionId: string) =>
       request<ReviewCodesResponse>(sessionPath(sessionId, "/review-codes"), { method: "POST" }),
+    /** Revoke this login token on the server. */
+    logout: () => request<{ status: string }>("/op/logout", { method: "POST" }),
   };
 }
 
