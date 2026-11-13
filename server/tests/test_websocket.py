@@ -733,6 +733,49 @@ def test_clock_offset_report_increments_version_and_applies_to_subsequent_events
         assert forwarded["payload"]["normalized_server_timestamp_ms"] == 1000 + 42
 
 
+def test_recording_failed_is_stored_and_broadcast_without_changing_session_state():
+    """A student write/start failure is visible to the Wizard. It is not a lifecycle event."""
+    session_id = _fresh_session_id()
+    with _connect(session_id, "wizard") as wizard, _connect(session_id, "student") as student:
+        student.send_json(
+            {
+                "sequence": 1,
+                "client_timestamp_ms": 0,
+                "event_type": "recording_failed",
+                "payload": {
+                    "event_id": "evt-recording-failed",
+                    "phase": "write",
+                    "step": "write_chunk",
+                    "error_name": "QuotaExceededError",
+                    "message": "此裝置的儲存空間不足",
+                },
+            }
+        )
+        ack = student.receive_json()
+        assert ack["status"] == "accepted"
+        assert ack["event_id"] == "evt-recording-failed"
+
+        forwarded = wizard.receive_json()
+        assert forwarded["event_type"] == "recording_failed"
+        assert forwarded["source"] == "student"
+        assert forwarded["payload"]["error_name"] == "QuotaExceededError"
+        assert forwarded["payload"]["step"] == "write_chunk"
+
+        wizard.send_json(
+            {
+                "type": "reconnect_hello",
+                "session_id": session_id,
+                "role": "wizard",
+                "last_snapshot_revision": 0,
+                "last_acked_sequence": -1,
+                "pending_event_ids": [],
+            }
+        )
+        snapshot = wizard.receive_json()
+        assert snapshot["type"] == "session_snapshot"
+        assert snapshot["session_state"] == "created"
+
+
 def test_session_started_broadcasts_scheduled_start_two_seconds_ahead():
     session_id = _fresh_session_id()
     with _connect(session_id, "wizard") as wizard, \

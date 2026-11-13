@@ -55,8 +55,24 @@ def _bearer(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-def _open_session(client: TestClient) -> tuple[str, str]:
-    """A live session and its student's live token."""
+def _with_db(fn):
+    gen = app.dependency_overrides[models.get_db]()
+    db = next(gen)
+    try:
+        return fn(db)
+    finally:
+        try:
+            next(gen)
+        except StopIteration:
+            pass
+
+
+def _open_session(client: TestClient, *, started: bool = True) -> tuple[str, str]:
+    """A session and its student's live token.
+
+    ``started`` moves the row to ``active``. A claim is refused until the
+    server session is in progress, so the older claim cases opt in.
+    """
     session_id = f"S-{uuid4().hex[:8]}"
     created = client.post(
         "/sessions",
@@ -70,6 +86,8 @@ def _open_session(client: TestClient) -> tuple[str, str]:
     )
     assert joined.status_code == 200, joined.text
     client.cookies.clear()
+    if started:
+        _with_db(lambda db: models.start_session(db, session_id))
     return session_id, joined.json()["access_token"]
 
 
@@ -110,6 +128,61 @@ def _take(db_factory, session_id: str) -> models.Recording | None:
 
 TAKE_A = "take-aaaaaaaa"
 TAKE_B = "take-bbbbbbbb"
+
+
+def test_claim_is_refused_until_the_server_session_is_in_progress(client, db_factory):
+    session_id, token = _open_session(client, started=False)
+    with _socket(client, session_id, token):
+        refused = _claim(client, session_id, token, TAKE_A)
+    assert refused.status_code == 409
+    assert refused.json()["detail"] == "session_not_started"
+    assert _take(db_factory, session_id) is None
+    assert _status(client, session_id, token)["take_claimed"] is False
+
+
+def test_a_scheduled_start_cannot_be_claimed_until_it_is_due(client, db_factory):
+    from app.websocket import _monotonic_ms
+
+    session_id, token = _open_session(client, started=False)
+    future = _monotonic_ms() + 60_000
+    _with_db(lambda db: models.start_session(db, session_id, start_at_ms=future))
+    with _socket(client, session_id, token):
+        early = _claim(client, session_id, token, TAKE_A)
+    assert early.status_code == 409
+    assert early.json()["detail"] == "session_not_started"
+    assert _take(db_factory, session_id) is None
+
+    def make_due(db):
+        session = models.get_session(db, session_id)
+        assert session is not None
+        session.start_at_ms = 0
+        db.commit()
+
+    _with_db(make_due)
+    with _socket(client, session_id, token):
+        claimed = _claim(client, session_id, token, TAKE_A)
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["status"] == "claimed"
+
+    def status(db):
+        session = models.get_session(db, session_id)
+        assert session is not None
+        return session.status
+
+    assert _with_db(status) == "active"
+
+
+def test_a_paused_session_can_still_claim_its_one_take(client, db_factory):
+    session_id, token = _open_session(client, started=True)
+
+    def pause(db):
+        models.pause_session(db, session_id, "manual", actor_role="wizard")
+
+    _with_db(pause)
+    with _socket(client, session_id, token):
+        claimed = _claim(client, session_id, token, TAKE_A)
+    assert claimed.status_code == 200, claimed.text
+    assert _take(db_factory, session_id) is not None
 
 
 def test_claim_reserves_the_take_before_any_chunk(client, db_factory):

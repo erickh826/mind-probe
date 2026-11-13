@@ -54,6 +54,7 @@ export const EVENT_TYPES = [
   // Recording (§10)
   "recording_started",
   "recording_stopped",
+  "recording_failed",
   "chunk_uploaded",
 ] as const;
 
@@ -320,4 +321,19 @@ export interface UncoveredQuestionPayload extends BaseEventPayload {
   timestamp_ms?: number;
   /** Optional link to the student question segment (ADR-0002 §7). */
   question_segment_id?: string;
+}
+
+/**
+ * `recording_failed`: the student could not start recording, or a local write
+ * failed mid-take. The server stores and broadcasts it. It does not change
+ * session state by itself; a later finalize with `recorder_lost` still marks
+ * the take incomplete.
+ */
+export interface RecordingFailedPayload extends BaseEventPayload {
+  phase?: "start" | "write";
+  /** `open_db`, `write_chunk`, `read_chunk`, `update_meta`, `finalize`, `camera`, `recorder`, or `claim`. */
+  step?: string;
+  /** DOMException name when there is one, for example `QuotaExceededError`. */
+  error_name?: string;
+  message?: string;
 }
