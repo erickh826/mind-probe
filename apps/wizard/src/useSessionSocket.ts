@@ -49,6 +49,7 @@ import {
   startRejectionMessage,
 } from "./sessionStart";
 import { INITIAL_SESSION_VIEW } from "./types";
+import { recordingAlertFromNotice } from "./recordingAlert";
 import type {
   ConnectionStatus,
   ConsoleLogEntry,
@@ -179,6 +180,8 @@ export interface SessionSocket {
   startInFlight: boolean;
   /** Last start failure, or null once the server has left `created`. */
   startError: string | null;
+  /** Student could not start or keep writing the recording. */
+  recordingAlert: string | null;
   sendRequestFallback: (
     category: FallbackCategory,
     reason?: FallbackReasonValue,
@@ -216,6 +219,7 @@ export function useSessionSocket(
   );
   const [startInFlight, setStartInFlight] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
+  const [recordingAlert, setRecordingAlert] = useState<string | null>(null);
 
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
@@ -611,6 +615,7 @@ export function useSessionSocket(
         consecutive_fallbacks: message.consecutive_fallbacks,
         start_at_server_ms: message.start_at_server_ms ?? null,
       });
+      setRecordingAlert(recordingAlertFromNotice(message.recording_failure));
       if (
         message.session_state === "starting" &&
         typeof message.start_at_server_ms === "number"
@@ -947,6 +952,21 @@ export function useSessionSocket(
       }
 
       if (isEventEnvelope(parsed)) {
+        if (parsed.event_type === "recording_started") {
+          setRecordingAlert(null);
+        }
+        if (parsed.event_type === "recording_failed") {
+          const payload = parsed.payload as Record<string, unknown>;
+          setRecordingAlert(
+            recordingAlertFromNotice({
+              phase: typeof payload.phase === "string" ? payload.phase : null,
+              step: typeof payload.step === "string" ? payload.step : null,
+              error_name: typeof payload.error_name === "string" ? payload.error_name : null,
+              message: typeof payload.message === "string" ? payload.message : null,
+            }),
+          );
+          appendLog("error", "學生錄影失敗");
+        }
         applyBroadcastEnvelope(parsed);
         if (REVISION_BUMPING_EVENTS.has(parsed.event_type)) {
           scheduleSnapshotResync();
@@ -1160,6 +1180,10 @@ export function useSessionSocket(
   const dismissThresholdAlert = useCallback(() => setThresholdAlert(null), []);
 
   useEffect(() => {
+    setRecordingAlert(null);
+  }, [sessionId]);
+
+  useEffect(() => {
     if (session.session_state === "created") {
       return;
     }
@@ -1192,6 +1216,7 @@ export function useSessionSocket(
       sendSessionStarted,
       startInFlight,
       startError,
+      recordingAlert,
       sendRequestFallback,
       sendUncoveredQuestion,
     }),
@@ -1215,6 +1240,7 @@ export function useSessionSocket(
       session,
       startError,
       startInFlight,
+      recordingAlert,
       status,
       thresholdAlert,
     ],

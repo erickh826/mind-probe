@@ -54,6 +54,7 @@ class EventType(str, Enum):
     # Recording (spec §10)
     RECORDING_STARTED = "recording_started"
     RECORDING_STOPPED = "recording_stopped"
+    RECORDING_FAILED = "recording_failed"
     CHUNK_UPLOADED = "chunk_uploaded"
 
 

@@ -16,6 +16,7 @@ import {
 } from "./api";
 import { useSessionSocket } from "./useSessionSocket";
 import { startControl } from "./sessionStart";
+import { planWizardLeave } from "./leaveSession";
 import {
   CATEGORY_KEYS,
   EMPTY_SELECTION,
@@ -294,6 +295,19 @@ export default function App() {
     socket.sendSessionStarted();
   }, [socket, startUi.enabled]);
 
+  const leavePlan = planWizardLeave(sessionEnded);
+  const leaveSession = useCallback(() => {
+    if (joined) {
+      clearJoinedSession(joined.sessionId);
+    }
+    setEndedLocally(false);
+    setEndOpen(false);
+    setEndError(null);
+    setPauseOpen(false);
+    setUncoveredOpen(false);
+    setJoined(null);
+  }, [joined]);
+
   // 全域快捷鍵（spec §8）。輸入框聚焦時一律不攔截。
   useEffect(() => {
     if (joined === null) {
@@ -465,7 +479,15 @@ export default function App() {
         startSessionTitle={startUi.title}
         startPending={startUi.pending}
         onStartSession={requestStart}
+        leaveSessionTitle={leavePlan.detail}
+        onLeaveSession={leaveSession}
       />
+
+      {socket.recordingAlert !== null && (
+        <div role="alert" style={{ padding: "10px 16px", background: "#4a2020", color: "#ffd0d0" }}>
+          學生錄影失敗：{socket.recordingAlert}。請不要繼續以為錄影正常。已保存的片段不會被清除。
+        </div>
+      )}
 
       {socket.startError !== null && (
         <div

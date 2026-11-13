@@ -100,6 +100,16 @@ export interface SessionSnapshotMessage {
   server_timestamp_ms: number;
   /** Server **monotonic** ms of the pending unified start (ADR-0003 §5). */
   start_at_server_ms?: number | null;
+  /**
+   * Latest student recording failure, or null once a claim or
+   * `recording_started` cleared it. Absent only on servers that predate it.
+   */
+  recording_failure?: {
+    phase?: string | null;
+    step?: string | null;
+    error_name?: string | null;
+    message?: string | null;
+  } | null;
 }
 
 /**

@@ -8,12 +8,15 @@ import {
 import { fetchClipManifest, fetchSession, fetchUploadStatus, joinSession, uploadLogin } from "./api";
 import { restoreStudentSession, UNAVAILABLE_RESTORE_MESSAGE } from "./restoreSession";
 import { mediaUrl } from "./config";
+import { shouldAutoStartRecording } from "./sessionGate";
 import { JoinSessionModal } from "./components/JoinSessionModal";
 import { UploadCodeForm } from "./components/UploadCodeForm";
 import {
   interruptRecording,
   isRevokedCloseReason,
+  releaseLocalMedia,
   resumeUnauthorizedUploads,
+  setRecordingArmed,
   setSocketAdmitted,
   stopReplacedRecording,
 } from "./recordingController";
@@ -66,9 +69,15 @@ export default function App() {
     joined?.uploadOnly ? null : (joined?.sessionId ?? null),
     joined?.uploadOnly ? null : (joined?.accessToken ?? null),
   );
+  const mayRecord =
+    joined !== null &&
+    !joined.uploadOnly &&
+    socket.session.session_state === "active";
   const recorder = useMediaRecorder({
     sessionId: joined?.sessionId ?? null,
     onChunkUploaded: socket.sendChunkUploaded,
+    mayRecord,
+    preview: joined !== null && !joined.uploadOnly,
   });
 
   const clipLookup = useMemo(() => {
@@ -239,8 +248,8 @@ export default function App() {
   const liveSessionId = joined && !joined.uploadOnly ? joined.sessionId : null;
 
   // Only an admitted socket may start a take: an open transport is not
-  // admission, and neither is holding a live token. The controller checks
-  // this itself, so its camera retry loop is gated too.
+  // admission, and neither is holding a live token. Recording itself waits
+  // until the server snapshot is `active`, which is a separate gate.
   useEffect(() => {
     if (liveSessionId === null) {
       return;
@@ -249,22 +258,56 @@ export default function App() {
     return () => setSocketAdmitted(liveSessionId, false);
   }, [liveSessionId, socket.admitted]);
 
-  // Auto-start once, and only when every gate holds. The attempt is not used
-  // up while the socket is unadmitted or the take check has not answered.
+  useEffect(() => {
+    if (liveSessionId === null) {
+      return;
+    }
+    setRecordingArmed(liveSessionId, mayRecord);
+  }, [liveSessionId, mayRecord]);
+
+  // Auto-start once the server session is in progress. The attempt is not
+  // used up while the socket is unadmitted, the take check has not answered,
+  // or the snapshot is still created/starting.
   useEffect(() => {
     if (
-      joined === null ||
-      joined.restoredFromStorage ||
-      !socket.admitted ||
-      recorder.takeCheck !== "free" ||
-      !recorder.canStart ||
-      autoRecordingAttemptedRef.current
+      !shouldAutoStartRecording({
+        uploadOnly: joined?.uploadOnly === true,
+        admitted: socket.admitted,
+        sessionState: socket.session.session_state,
+        takeCheck: recorder.takeCheck,
+        canStart: recorder.canStart,
+        recorderStatus: recorder.status,
+        alreadyAttempted: autoRecordingAttemptedRef.current,
+        hasLocalTake: recorder.takeCheck === "claimed",
+      })
     ) {
       return;
     }
     autoRecordingAttemptedRef.current = true;
     void recorder.start();
-  }, [joined, recorder.canStart, recorder.start, recorder.takeCheck, socket.admitted]);
+  }, [
+    joined,
+    recorder.canStart,
+    recorder.start,
+    recorder.status,
+    recorder.takeCheck,
+    socket.admitted,
+    socket.session.session_state,
+  ]);
+
+  const reportedProblemRef = useRef<string | null>(null);
+  useEffect(() => {
+    const problem = recorder.problem;
+    if (problem === null || !socket.admitted) {
+      return;
+    }
+    const key = `${problem.phase}:${problem.step}:${problem.errorName}:${problem.message}`;
+    if (reportedProblemRef.current === key) {
+      return;
+    }
+    reportedProblemRef.current = key;
+    socket.sendRecordingFailed(problem);
+  }, [recorder.problem, socket]);
 
   // Another device took the student role over: stop this take, keep uploading.
   useEffect(() => {
@@ -299,6 +342,19 @@ export default function App() {
       socket.sendRecordingStopped(recorder.status);
     }
   }, [recorder.status, socket.sendRecordingStarted, socket.sendRecordingStopped]);
+
+  const handleLeave = useCallback(() => {
+    releaseLocalMedia();
+    if (joined) {
+      clearJoinedSession(joined.sessionId);
+    }
+    autoRecordingAttemptedRef.current = false;
+    reportedProblemRef.current = null;
+    setJoined(null);
+    setPreferJoin(false);
+    setRestoreError(null);
+    setJoinError(null);
+  }, [joined]);
 
   if (restorePending || joined === null) {
     if (restorePending && joined === null) {
@@ -383,9 +439,8 @@ export default function App() {
           void recorder.start();
         }}
         onStopRecording={recorder.stop}
-        allowStartRecording={
-          !joined.restoredFromStorage && recorder.canStart && socket.admitted
-        }
+        onLeave={handleLeave}
+        allowStartRecording={mayRecord && recorder.canStart && socket.admitted}
       />
     </div>
   );

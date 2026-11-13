@@ -1,5 +1,7 @@
 import type { StudentRecorder } from "../useMediaRecorder";
 import type { StudentSocket } from "../useStudentSocket";
+import { planStudentLeave } from "../leaveSession";
+import { waitingForWizardCopy } from "../sessionGate";
 import { permanentBlockMessage } from "../uploadQueue";
 
 interface StudentOverlayProps {
@@ -9,7 +11,8 @@ interface StudentOverlayProps {
   onToggleCamera: () => void;
   onStartRecording: () => void;
   onStopRecording: () => void;
-  /** False after a reload: the student re-uploads, and does not start a new take. */
+  onLeave: () => void;
+  /** False until the server session is active, and after a reload. */
   allowStartRecording?: boolean;
 }
 
@@ -43,10 +46,18 @@ export function StudentOverlay({
   onToggleCamera,
   onStartRecording,
   onStopRecording,
-  allowStartRecording = true,
+  onLeave,
+  allowStartRecording = false,
 }: StudentOverlayProps) {
   const paused = socket.session.session_state === "paused";
   const banner = recorder.banner;
+  const recording = recorder.status === "recording" || recorder.status === "stopping";
+  const waiting = waitingForWizardCopy(socket.session.session_state, recording);
+  const leave = planStudentLeave({
+    banner,
+    recorderStatus: recorder.status,
+    pendingCount: recorder.pendingCount,
+  });
 
   return (
     <>
@@ -123,15 +134,32 @@ export function StudentOverlay({
         </div>
         <div className="button-row">
           {recorder.status === "recording" ? (
-            <button onClick={onStopRecording}>Stop REC</button>
+            <button
+              onClick={onStopRecording}
+              title="Stop REC：停止錄影，留在此頁並繼續上傳。不會結束場次，也不會離開。"
+            >
+              Stop REC
+            </button>
           ) : allowStartRecording && recorder.canStart ? (
-            <button onClick={onStartRecording}>Start REC</button>
+            <button
+              onClick={onStartRecording}
+              title="開始錄影。只有伺服器已進入進行中才會出現。"
+            >
+              Start REC
+            </button>
           ) : null}
+          <button onClick={onLeave} title={leave.title}>
+            {leave.buttonLabel}
+          </button>
           <button onClick={recorder.retryFailed} disabled={recorder.failedCount === 0}>
             Retry
           </button>
           <button onClick={onToggleCamera}>{cameraVisible ? "Hide cam" : "Show cam"}</button>
         </div>
+        <p className="leave-note">{leave.detail}</p>
+        <p className="leave-note">
+          Stop REC 停止錄影並留在此頁。結束場次由 Wizard 操作。離開場次回到加入頁，不刪除已保存的片段。
+        </p>
       </aside>
 
       {cameraVisible && recorder.stream ? (
@@ -146,6 +174,13 @@ export function StudentOverlay({
             }
           }}
         />
+      ) : null}
+
+      {waiting ? (
+        <div className="wait-banner" role="status">
+          <p className="eyebrow">尚未錄影</p>
+          <p>{waiting}</p>
+        </div>
       ) : null}
 
       {paused ? (

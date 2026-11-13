@@ -59,7 +59,8 @@ export default function EndSessionDialog({
         </h2>
         <p style={{ fontSize: 13, color: "#e8e8ea", lineHeight: 1.6, marginTop: 0 }}>
           確定要結束目前場次嗎？結束後無法從 Wizard 恢復。學生端會看到
-          session_ended，Stop REC 仍由學生自行按下。
+          session_ended，Stop REC 仍由學生自行按下。這不是「離開場次」：離開只會
+          回到加入頁，不會結束場次。
         </p>
 
         {error !== null && (

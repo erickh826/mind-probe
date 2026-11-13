@@ -4,6 +4,13 @@
 
 import { ApiError } from "./apiError.ts";
 import {
+  classifyIdbError,
+  idbErrorName,
+  problemFromIdb,
+  selfCheckIndexedDb,
+  type RecordingProblem,
+} from "./idbHealth.ts";
+import {
   deleteChunk,
   deleteUnstartedMeta,
   listChunks,
@@ -61,6 +68,8 @@ export interface RecordingView {
    * lets a fresh tab start, `unknown` (not loaded or failed) does not.
    */
   takeCheck: TakeState;
+  /** Set when recording cannot start, or a write failed. Null while healthy. */
+  problem: RecordingProblem | null;
 }
 
 export type TakeState = "unknown" | "free" | "claimed";
@@ -168,6 +177,30 @@ let pendingTake: { sessionId: string; takeId: string } | null = null;
 /** The one start attempt in flight; concurrent starts join it. */
 let startTask: Promise<void> | null = null;
 let takeCheck: { sessionId: string; state: TakeState } | null = null;
+let recordingProblem: RecordingProblem | null = null;
+/** Camera preview before MediaRecorder starts. Not a take. */
+let preview: { sessionId: string; stream: MediaStream } | null = null;
+/**
+ * Bumped by leave and unmount. A getUserMedia that resolves afterwards must
+ * stop its stream instead of becoming the preview.
+ */
+let captureToken = 0;
+/** So a second preview does not stack permission listeners after a reset. */
+let permissionWatchStarted = false;
+/**
+ * Null until the page reports server session state. Tests that never report
+ * it keep the previous "admitted may record" behaviour. Production sets this
+ * false until the server snapshot is `active`.
+ */
+let armedSessions: Set<string> | null = null;
+let lastPersistFailure: RecordingProblem | null = null;
+
+async function defaultStorageCheck(): Promise<RecordingProblem | null> {
+  const failure = await selfCheckIndexedDb();
+  return failure ? problemFromIdb("start", failure) : null;
+}
+
+let storageCheck: () => Promise<RecordingProblem | null> = defaultStorageCheck;
 const CLAIM_ATTEMPTS = 3;
 const CLAIM_RETRY_MS = 500;
 /**
@@ -186,6 +219,8 @@ const REPLACED_MESSAGE =
 const ALREADY_CLAIMED_MESSAGE =
   "此場次已有錄影，換裝置不會接續；如需重新錄影請建立新場次。";
 const NOT_ADMITTED_MESSAGE = "尚未連上場次。連線完成後才能開始錄影。";
+const SESSION_NOT_STARTED_MESSAGE =
+  "伺服器尚未將場次標為進行中，錄影還沒開始。請等待 Wizard 按下「開始場次」。";
 const TAKE_UNKNOWN_MESSAGE = "無法確認此場次的錄影狀態，請稍後再按 Start REC。";
 const SESSION_ENDED_MESSAGE = "場次已結束，無法開始錄影。";
 const UNAUTHORIZED_MESSAGE = "此裝置的登入已失效，無法開始錄影。請重新加入場次。";
@@ -253,7 +288,7 @@ function db(): Promise<IDBDatabase> {
 function view(): RecordingView {
   return {
     status,
-    stream: active?.stream ?? null,
+    stream: active?.stream ?? (preview?.sessionId === boundSession ? preview.stream : null),
     error: errorMessage,
     uploadedCount,
     failedCount,
@@ -266,6 +301,7 @@ function view(): RecordingView {
       !(boundSession !== null && replacedSessions.has(boundSession)) &&
       currentTakeState() !== "claimed",
     takeCheck: currentTakeState(),
+    problem: recordingProblem,
   };
 }
 
@@ -301,6 +337,210 @@ export function setSocketAdmitted(sessionId: string, admitted: boolean): void {
       showClaimedElsewhere(sessionId);
       emit();
     });
+  }
+  emit();
+}
+
+/** The page reports whether the server snapshot is in progress (`active`). */
+export function setRecordingArmed(sessionId: string, armed: boolean): void {
+  armedSessions ??= new Set();
+  if (armed) {
+    armedSessions.add(sessionId);
+  } else {
+    armedSessions.delete(sessionId);
+  }
+  emit();
+}
+
+export function setStorageCheckForTests(
+  check: (() => Promise<RecordingProblem | null>) | null,
+): void {
+  storageCheck = check ?? defaultStorageCheck;
+}
+
+function recordingNotArmed(sessionId: string): boolean {
+  return armedSessions !== null && !armedSessions.has(sessionId);
+}
+
+/** Camera and microphone preview. Does not claim a take or start MediaRecorder. */
+export async function openCameraPreview(sessionId: string): Promise<void> {
+  cancelRelease();
+  const token = captureToken;
+  if (active?.sessionId === sessionId && active.stream) {
+    emit();
+    return;
+  }
+  if (
+    preview?.sessionId === sessionId &&
+    preview.stream.getTracks().some((track) => track.readyState === "live")
+  ) {
+    emit();
+    return;
+  }
+  const storageProblem = await storageCheck();
+  if (token !== captureToken) {
+    emit();
+    return;
+  }
+  if (storageProblem) {
+    recordingProblem = storageProblem;
+    rememberHeldFailure(storageProblem.message);
+    canStart = false;
+    retryable = false;
+    if (status !== "recording" && status !== "stopping") {
+      status = "error";
+    }
+    emit();
+  }
+  if (!navigator.mediaDevices?.getUserMedia) {
+    if (!storageProblem && status !== "recording") {
+      status = "unavailable";
+      rememberHeldFailure("此瀏覽器無法使用攝影機或麥克風。");
+    }
+    emit();
+    return;
+  }
+  let stream: MediaStream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+  } catch (cause) {
+    if (token !== captureToken) {
+      return;
+    }
+    if (!storageProblem) {
+      const described = describeMediaError(cause);
+      recordingProblem = {
+        phase: "start",
+        step: "camera",
+        errorName: cause instanceof DOMException ? cause.name : "Error",
+        message: described.message,
+      };
+      rememberHeldFailure(described.message);
+      retryable = described.retryable;
+      if (status !== "recording" && status !== "stopping") {
+        status = "error";
+      }
+    }
+    emit();
+    return;
+  }
+  if (!adoptPreviewStream(sessionId, stream, token)) {
+    emit();
+    return;
+  }
+  if (!storageProblem && status !== "recording" && status !== "stopping") {
+    if (recordingProblem?.step === "camera") {
+      recordingProblem = null;
+      forgetError();
+    }
+    status = "idle";
+    retryable = false;
+  }
+  emit();
+  await watchCapturePermissions();
+}
+
+/**
+ * Keep a stream only if leave/unmount has not invalidated this request.
+ * A late stream is stopped immediately and never shown.
+ */
+function adoptPreviewStream(sessionId: string, stream: MediaStream, token: number): boolean {
+  if (token !== captureToken) {
+    stopTracks(stream);
+    return false;
+  }
+  if (preview && preview.stream !== stream) {
+    stopTracks(preview.stream);
+  }
+  watchPreviewTracks(stream);
+  preview = { sessionId, stream };
+  return true;
+}
+
+function watchPreviewTracks(stream: MediaStream): void {
+  const onEnded = () => {
+    if (preview?.stream !== stream) {
+      return;
+    }
+    retirePreview("ended");
+  };
+  for (const track of stream.getTracks()) {
+    if (typeof track.addEventListener === "function") {
+      track.addEventListener("ended", onEnded);
+    }
+  }
+}
+
+function retirePreview(reason: "ended" | "permission"): void {
+  const current = preview;
+  preview = null;
+  if (current) {
+    stopTracks(current.stream);
+  }
+  if (status === "recording" || status === "stopping") {
+    emit();
+    return;
+  }
+  const message =
+    reason === "permission"
+      ? "攝影機或麥克風權限已關閉。請重新允許後再試。預覽已停止。"
+      : "攝影機或麥克風已中斷。預覽已停止，請再試。";
+  recordingProblem = {
+    phase: "start",
+    step: "camera",
+    errorName: reason === "permission" ? "NotAllowedError" : "AbortError",
+    message,
+  };
+  rememberHeldFailure(message);
+  retryable = reason === "ended";
+  status = "error";
+  emit();
+}
+
+async function watchCapturePermissions(): Promise<void> {
+  if (permissionWatchStarted) {
+    return;
+  }
+  const permissions = navigator.permissions;
+  if (!permissions?.query) {
+    return;
+  }
+  permissionWatchStarted = true;
+  for (const name of ["camera", "microphone"] as const) {
+    try {
+      const status = await permissions.query({ name: name as PermissionName });
+      const onChange = () => {
+        if (status.state === "denied") {
+          retirePreview("permission");
+        }
+      };
+      if (typeof status.addEventListener === "function") {
+        status.addEventListener("change", onChange);
+      }
+    } catch {
+      // Some browsers reject camera/microphone permission queries.
+    }
+  }
+}
+
+/**
+ * Stop the camera and, if a recorder is running, stop it as incomplete.
+ * Does not delete IndexedDB chunks or saved join info.
+ * In-flight getUserMedia calls see the new token and stop the stream they receive.
+ */
+export function releaseLocalMedia(): void {
+  captureToken += 1;
+  const recorder = active?.recorder;
+  if (recorder && recorder.state !== "inactive") {
+    stopAsLost = true;
+    stopRecording();
+  } else if (active?.stream) {
+    stopTracks(active.stream);
+    active = null;
+  }
+  if (preview) {
+    stopTracks(preview.stream);
+    preview = null;
   }
   emit();
 }
@@ -361,23 +601,24 @@ function describeMediaError(cause: unknown): { message: string; retryable: boole
     case "NotFoundError":
     case "OverconstrainedError":
       return {
-        message: "No camera/microphone found. Connect one and recording will start automatically.",
+        message:
+          "找不到攝影機或麥克風。接上之後會再試預覽。錄影要等伺服器進入進行中才會開始。",
         retryable: true,
       };
     case "NotReadableError":
     case "AbortError":
       return {
-        message: "Camera is busy or unavailable (used by another app/tab?). Close it; retrying automatically.",
+        message: "攝影機忙碌或無法使用（可能被其他 App 或分頁占用）。關閉後會再試。",
         retryable: true,
       };
     case "NotAllowedError":
     case "SecurityError":
       return {
-        message: "Camera/microphone permission denied. Allow access in the browser address bar, then press Start.",
+        message: "攝影機或麥克風權限被拒絕。請在瀏覽器允許存取，然後再試。",
         retryable: false,
       };
     default:
-      return { message: `Unable to start recording: ${String(cause)}`, retryable: false };
+      return { message: `無法使用攝影機或麥克風：${String(cause)}`, retryable: false };
   }
 }
 
@@ -390,6 +631,7 @@ function cancelRelease(): void {
 
 export function scheduleRelease(): void {
   cancelRelease();
+  captureToken += 1;
   const sessionId = boundSession;
   releaseTimer = window.setTimeout(() => {
     releaseTimer = null;
@@ -634,7 +876,9 @@ export async function bindSession(sessionId: string): Promise<void> {
     await refreshPending(sessionId);
     ensurePump(sessionId);
   } catch (cause) {
-    rememberHeldFailure(`錄影佇列無法開啟：${cause instanceof Error ? cause.message : String(cause)}`);
+    const failure = problemFromIdb("start", classifyIdbError(cause, "open_db"));
+    recordingProblem = failure;
+    rememberHeldFailure(failure.message);
     status = "error";
   }
   emit();
@@ -682,7 +926,12 @@ async function retainChunk(sessionId: string, blob: Blob): Promise<void> {
     }
   }
   chunkPersistLost = true;
-  await markDurableChunkLoss(sessionId);
+  lastPersistFailure = problemFromIdb("write", classifyIdbError(last, "write_chunk"));
+  try {
+    await markDurableChunkLoss(sessionId);
+  } catch (cause) {
+    lastPersistFailure = problemFromIdb("write", classifyIdbError(cause, "update_meta"));
+  }
   throw last instanceof Error ? last : new Error(String(last));
 }
 
@@ -691,16 +940,29 @@ function attachRecorder(sessionId: string, recorder: MediaRecorder, stream: Medi
   persistChain = Promise.resolve();
   recorder.ondataavailable = (event) => {
     const blob = event.data;
-    if (blob.size === 0) {
+    if (blob.size === 0 || chunkPersistLost) {
       return;
     }
     persistChain = persistChain
       .then(() => retainChunk(sessionId, blob))
       .catch((cause: unknown) => {
         // The chain stays usable for a later slice, but the take is already
-        // marked lost. A normal stop must not advertise the missing slice.
+        // marked lost. Stop the recorder so it does not keep looking healthy
+        // or appending slices that cannot be stored. Stored slices stay.
         chunkPersistLost = true;
-        rememberHeldFailure(`無法保存錄影片段：${String(cause)}`);
+        const failure =
+          lastPersistFailure ??
+          problemFromIdb("write", classifyIdbError(cause, "write_chunk"));
+        recordingProblem = failure;
+        rememberHeldFailure(failure.message);
+        status = "error";
+        if (recorder.state !== "inactive") {
+          try {
+            recorder.stop();
+          } catch {
+            // Already stopping. onstop still sees the lost take.
+          }
+        }
         emit();
       });
   };
@@ -798,6 +1060,21 @@ async function startRecordingOnce(sessionId: string): Promise<void> {
       return;
     }
   }
+  if (recordingNotArmed(sessionId)) {
+    // The server snapshot is not `active`. Do not prompt, claim, or record.
+    emit();
+    return;
+  }
+  const storageProblem = await storageCheck();
+  if (storageProblem) {
+    recordingProblem = storageProblem;
+    rememberHeldFailure(storageProblem.message);
+    canStart = false;
+    retryable = false;
+    status = "error";
+    emit();
+    return;
+  }
   if (typeof MediaRecorder === "undefined" || !navigator.mediaDevices?.getUserMedia) {
     status = "unavailable";
     rememberHeldFailure("MediaRecorder is not available in this browser.");
@@ -809,20 +1086,45 @@ async function startRecordingOnce(sessionId: string): Promise<void> {
   retryable = false;
   emit();
   let stream: MediaStream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-  } catch (cause) {
-    if (revokedSessions.has(sessionId)) {
-      // The prompt failed after the revocation. Keep the revocation in view, no retry.
-      status = "idle";
-    } else {
-      const described = describeMediaError(cause);
-      rememberHeldFailure(described.message);
-      retryable = described.retryable;
-      status = "error";
+  const token = captureToken;
+  const livePreview =
+    preview?.sessionId === sessionId &&
+    preview.stream.getTracks().some((track) => track.readyState === "live")
+      ? preview.stream
+      : null;
+  if (livePreview) {
+    stream = livePreview;
+    preview = null;
+  } else {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    } catch (cause) {
+      if (token !== captureToken) {
+        return;
+      }
+      if (revokedSessions.has(sessionId)) {
+        // The prompt failed after the revocation. Keep the revocation in view, no retry.
+        status = "idle";
+      } else {
+        const described = describeMediaError(cause);
+        recordingProblem = {
+          phase: "start",
+          step: "camera",
+          errorName: cause instanceof DOMException ? cause.name : "Error",
+          message: described.message,
+        };
+        rememberHeldFailure(described.message);
+        retryable = described.retryable;
+        status = "error";
+      }
+      emit();
+      return;
     }
-    emit();
-    return;
+    if (token !== captureToken) {
+      stopTracks(stream);
+      emit();
+      return;
+    }
   }
   const blockedAfterPrompt = startBlocked(sessionId);
   if (blockedAfterPrompt !== null) {
@@ -881,7 +1183,14 @@ async function startRecordingOnce(sessionId: string): Promise<void> {
     // Nothing was captured. The claim is kept and this tab may retry it.
     dropRecorderLock();
     stopTracks(stream);
-    rememberHeldFailure(`${START_FAILED_MESSAGE}（${String(cause)}）`);
+    const message = `${START_FAILED_MESSAGE}（${String(cause)}）`;
+    recordingProblem = {
+      phase: "start",
+      step: "recorder",
+      errorName: cause instanceof DOMException ? cause.name : idbErrorName(cause),
+      message,
+    };
+    rememberHeldFailure(message);
     status = "error";
     emit();
     return;
@@ -893,13 +1202,23 @@ async function startRecordingOnce(sessionId: string): Promise<void> {
     recorder.start(2_000);
   } catch (cause) {
     await abandonUnstartedRecorder(sessionId, recorder, stream, created);
-    rememberHeldFailure(`${START_FAILED_MESSAGE}（${String(cause)}）`);
+    const message = `${START_FAILED_MESSAGE}（${String(cause)}）`;
+    recordingProblem = {
+      phase: "start",
+      step: "recorder",
+      errorName: cause instanceof DOMException ? cause.name : "Error",
+      message,
+    };
+    rememberHeldFailure(message);
     status = "error";
     emit();
     return;
   }
   // start() returned: from here on any failure is a lost take, never a restart.
   pendingTake = null;
+  if (recordingProblem?.phase === "start") {
+    recordingProblem = null;
+  }
   status = "recording";
   ensurePump(sessionId);
   if (revokedSessions.has(sessionId)) {
@@ -969,6 +1288,7 @@ type ClaimOutcome =
   | "legacy"
   | "already_claimed"
   | "ended"
+  | "not_started"
   | "not_admitted"
   | "revoked"
   | "unauthorized"
@@ -999,6 +1319,8 @@ function classifyClaimError(cause: unknown): ClaimOutcome {
         return "already_claimed";
       case "session_ended":
         return "ended";
+      case "session_not_started":
+        return "not_started";
       case "role_not_admitted":
         return "not_admitted";
       default:
@@ -1026,6 +1348,20 @@ async function refuseClaim(sessionId: string, outcome: ClaimOutcome): Promise<vo
       pendingTake = null;
       canStart = false;
       holdStartRefusal(SESSION_ENDED_MESSAGE);
+      return;
+    case "not_started":
+      // The row may still be `starting` for a moment after the client clock
+      // says active. Keep the pending id and let the retry ask again.
+      recordingProblem = {
+        phase: "start",
+        step: "claim",
+        errorName: "session_not_started",
+        message: SESSION_NOT_STARTED_MESSAGE,
+      };
+      rememberHeldFailure(SESSION_NOT_STARTED_MESSAGE);
+      retryable = true;
+      canStart = true;
+      status = "error";
       return;
     case "not_admitted":
       // Keep the pending id: the next admission may confirm it.
@@ -1332,6 +1668,11 @@ async function sendFinalizeIfDue(sessionId: string): Promise<void> {
       rememberHeldFailure(REPLACED_MESSAGE);
     }
   } catch (cause) {
+    if (cause instanceof DOMException) {
+      const failure = problemFromIdb("write", classifyIdbError(cause, "finalize"));
+      recordingProblem = failure;
+      rememberHeldFailure(failure.message);
+    }
     const block = cause instanceof ApiError ? permanentUploadBlock(cause.status, cause.code) : null;
     // Chunk retries must not move finalize_persisted_at. Only the attempt clock moves.
     let updated: RecordingMeta | null = null;
@@ -1479,6 +1820,16 @@ export async function resetRecordingControllerForTests(
   chunkTask = null;
   finalizeTask = null;
   chunkPersistLost = false;
+  lastPersistFailure = null;
+  recordingProblem = null;
+  if (preview) {
+    stopTracks(preview.stream);
+    preview = null;
+  }
+  armedSessions = null;
+  storageCheck = defaultStorageCheck;
+  captureToken = 0;
+  permissionWatchStarted = false;
   // Let an in-flight finalize write finish before the database is closed.
   await Promise.allSettled(inFlightWork);
   const pending = databasePromise;

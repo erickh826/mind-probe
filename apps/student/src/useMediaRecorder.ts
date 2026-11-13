@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   bindSession,
   errorIsRetryable,
+  openCameraPreview,
   recordingView,
   retryFailed,
   scheduleRelease,
@@ -12,12 +13,17 @@ import {
   type RecordingView,
   type TakeState,
 } from "./recordingController";
+import type { RecordingProblem } from "./idbHealth";
 import type { RecorderStatus } from "./types";
 import type { CloseBanner } from "./uploadQueue";
 
 interface UseMediaRecorderOptions {
   sessionId: string | null;
   onChunkUploaded: (chunkIndex: number, timestampMs: number) => void;
+  /** Server snapshot is `active` and this tab may start a new take. */
+  mayRecord: boolean;
+  /** Ask for a camera preview without starting MediaRecorder. */
+  preview: boolean;
 }
 
 export interface StudentRecorder {
@@ -32,6 +38,7 @@ export interface StudentRecorder {
   canStart: boolean;
   /** Whether the server says this session's take is free; only `free` auto-starts. */
   takeCheck: TakeState;
+  problem: RecordingProblem | null;
   start: () => Promise<void>;
   stop: () => void;
   retryFailed: () => void;
@@ -40,6 +47,8 @@ export interface StudentRecorder {
 export function useMediaRecorder({
   sessionId,
   onChunkUploaded,
+  mayRecord,
+  preview,
 }: UseMediaRecorderOptions): StudentRecorder {
   const [view, setView] = useState<RecordingView>(recordingView);
 
@@ -59,17 +68,30 @@ export function useMediaRecorder({
   }, [sessionId]);
 
   useEffect(() => {
+    if (sessionId === null || !preview) {
+      return;
+    }
+    void openCameraPreview(sessionId);
+  }, [preview, sessionId]);
+
+  useEffect(() => {
     if (sessionId === null || view.status !== "error" || !errorIsRetryable()) {
       return;
     }
-    const retry = () => void startRecording(sessionId);
+    const retry = () => {
+      if (mayRecord) {
+        void startRecording(sessionId);
+      } else {
+        void openCameraPreview(sessionId);
+      }
+    };
     navigator.mediaDevices?.addEventListener("devicechange", retry);
     const timer = window.setInterval(retry, 5_000);
     return () => {
       navigator.mediaDevices?.removeEventListener("devicechange", retry);
       window.clearInterval(timer);
     };
-  }, [sessionId, view.status]);
+  }, [mayRecord, sessionId, view.status]);
 
   const start = useCallback(async () => {
     if (sessionId === null) {
@@ -89,6 +111,7 @@ export function useMediaRecorder({
     storageWarning: view.storageWarning,
     canStart: view.canStart,
     takeCheck: view.takeCheck,
+    problem: view.problem,
     start,
     stop: stopRecording,
     retryFailed: () => {

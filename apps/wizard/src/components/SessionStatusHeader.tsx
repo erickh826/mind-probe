@@ -26,6 +26,9 @@ interface Props {
   startSessionTitle: string;
   startPending: boolean;
   onStartSession: () => void;
+  /** Always available. Clears this device's join info and does not end the session. */
+  leaveSessionTitle: string;
+  onLeaveSession: () => void;
 }
 
 const NOTICE_LABEL: Record<CloseKind, string | null> = {
@@ -90,6 +93,8 @@ export default function SessionStatusHeader({
   startSessionTitle,
   startPending,
   onStartSession,
+  leaveSessionTitle,
+  onLeaveSession,
 }: Props) {
   return (
     <header
@@ -190,6 +195,23 @@ export default function SessionStatusHeader({
           }}
         >
           結束場次
+        </button>
+        <button
+          type="button"
+          onClick={onLeaveSession}
+          title={leaveSessionTitle}
+          style={{
+            padding: "8px 14px",
+            fontFamily: "inherit",
+            fontWeight: 700,
+            color: "#e8e8ea",
+            background: "#2a3140",
+            border: "1px solid #6d788a",
+            borderRadius: 6,
+            cursor: "pointer",
+          }}
+        >
+          離開場次
         </button>
       </div>
     </header>

@@ -921,6 +921,23 @@ async def upload_chunk(
     }
 
 
+def _promote_due_scheduled_start(db: DBSession, session: models.Session) -> models.Session:
+    """Move a due ``starting`` row to ``active`` before a take is claimed.
+
+    ``start_at_ms`` is server monotonic time (ADR-0003). The flip to ``active``
+    is derived, not its own broadcast, so a student that waited for that instant
+    can claim while the row still says ``starting``. A start that is not due
+    yet stays ``starting`` and the claim is refused.
+    """
+    if session.status != "starting" or session.start_at_ms is None:
+        return session
+    from .websocket import _monotonic_ms
+
+    if _monotonic_ms() < session.start_at_ms:
+        return session
+    return models.start_session(db, session.id)
+
+
 class FinalizeRequest(BaseModel):
     """Student declaration of the last sequence in this take (ADR-0005 §7.2)."""
 
@@ -965,6 +982,10 @@ def claim_recording(
     - 409 ``session_ended``: nothing more may be recorded.
     - 409 ``role_not_admitted``: this token does not hold the student socket
       (refused 4429, replaced 4409, or not connected). Nothing is written.
+    - 409 ``session_not_started``: the session is still ``created`` or the
+      scheduled start is not due. Being admitted is not enough; the server
+      session must be ``active`` or ``paused`` (a due ``starting`` row is
+      promoted to ``active`` first). Nothing is written.
     - 409 ``recording_already_claimed``: the take exists already.
     """
     from . import websocket
@@ -980,7 +1001,16 @@ def claim_recording(
         raise HTTPException(status_code=409, detail="session_ended")
     if not websocket.manager.holds_role(session_id, "student", actor.token_hash):
         raise HTTPException(status_code=409, detail="role_not_admitted")
-    return recording_integrity.claim_take(db, session_id, body.take_id)
+    session = _promote_due_scheduled_start(db, session)
+    if session.status not in {"active", "paused"}:
+        raise HTTPException(status_code=409, detail="session_not_started")
+    result = recording_integrity.claim_take(db, session_id, body.take_id)
+    # A successful claim means this device is starting cleanly. Drop a failure
+    # left over from an earlier attempt so a late Wizard does not keep the banner.
+    models.set_recording_failure(db, session_id, None)
+    if session_id in websocket.manager._snapshots:
+        websocket.manager.snapshot_for(session_id).recording_failure = None
+    return result
 
 
 @router.get("/{session_id}/status")

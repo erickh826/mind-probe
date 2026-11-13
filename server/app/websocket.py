@@ -251,6 +251,9 @@ class SessionSnapshot:
     # same category can avoid an immediate repeat (ADR-0002 §4). Server-internal
     # -- clients never need it, so it stays out of `to_message`.
     last_fallback_clip_id: str | None = None
+    # Latest recording_failed notice. None once a claim or recording_started
+    # clears it. Included on every snapshot, including null.
+    recording_failure: dict | None = None
 
     def bump(self) -> None:
         self.snapshot_revision += 1
@@ -283,6 +286,7 @@ class SessionSnapshot:
         }
         if self.start_at_server_ms is not None:
             message["start_at_server_ms"] = self.start_at_server_ms
+        message["recording_failure"] = self.recording_failure
         return message
 
 
@@ -1507,6 +1511,7 @@ async def _handle_message(
         manager.touch_heartbeat(session_id, role, websocket)
         snapshot = manager.snapshot_for(session_id)
         _resolve_scheduled_start(websocket, session_id, snapshot)
+        _hydrate_recording_failure(websocket, session_id, snapshot)
         await websocket.send_json(snapshot.to_message())
         return
 
@@ -1699,6 +1704,10 @@ async def _handle_message(
         _adopt_db_revision(snapshot, db_revision)
 
     manager.mark_processed(session_id, dedup_key)
+    if envelope.event_type is EventType.RECORDING_FAILED:
+        _remember_recording_failure(websocket, session_id, snapshot, envelope.payload)
+    elif envelope.event_type is EventType.RECORDING_STARTED:
+        _remember_recording_failure(websocket, session_id, snapshot, None)
     await websocket.send_json(
         {
             "type": "event_ack",
@@ -1736,6 +1745,64 @@ async def _handle_message(
         manager.schedule_close_live_sockets(
             session_id, code=4401, reason="session_ended"
         )
+
+
+def _notice_text(value: object, limit: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    return text[:limit]
+
+
+def _notice_from_payload(payload: dict) -> dict:
+    notice = {
+        "phase": _notice_text(payload.get("phase"), 32),
+        "step": _notice_text(payload.get("step"), 64),
+        "error_name": _notice_text(payload.get("error_name"), 64),
+        "message": _notice_text(payload.get("message"), 500),
+    }
+    if not any(notice.values()):
+        return {"message": "學生端錄影失敗"}
+    return notice
+
+
+def _remember_recording_failure(
+    websocket: WebSocket,
+    session_id: str,
+    snapshot: SessionSnapshot,
+    payload: dict | None,
+) -> None:
+    """Store the latest recording failure on the row and the snapshot.
+
+    ``payload is None`` clears it (a successful ``recording_started``).
+    The snapshot revision is not bumped.
+    """
+    notice = None if payload is None else _notice_from_payload(payload)
+    snapshot.recording_failure = notice
+    try:
+        with _db_scope(websocket) as db:
+            models.set_recording_failure(db, session_id, notice)
+    except _PERSISTENCE_ERRORS:
+        logger.exception("session %s: could not store recording_failure", session_id)
+
+
+def _hydrate_recording_failure(
+    websocket: WebSocket, session_id: str, snapshot: SessionSnapshot
+) -> None:
+    """Copy the persisted failure onto the snapshot before it is served.
+
+    The in-memory snapshot is empty after a process restart. The row is what
+    a late Wizard must see.
+    """
+    try:
+        with _db_scope(websocket) as db:
+            session = models.get_session(db, session_id)
+            if session is not None:
+                snapshot.recording_failure = session.recording_failure
+    except _PERSISTENCE_ERRORS:
+        logger.exception("session %s: could not read recording_failure", session_id)
 
 
 async def _reject_upgrade(websocket: WebSocket, *, code: int, reason: str) -> None:
