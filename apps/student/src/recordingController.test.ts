@@ -611,6 +611,55 @@ test("an IndexedDB failure fail-closes the take across stop and reload", async (
   assert.equal(recordingView().banner.kind, "interrupted");
 });
 
+test("a durable IndexedDB write stops the recorder and keeps earlier chunks", async () => {
+  await resetRecordingControllerForTests();
+  const sessionId = "S-quota-stop";
+  await seed(sessionId, emptyMeta(sessionId, 1));
+  await persistBlob(sessionId, blob("kept"));
+
+  const restorePuts = failChunkStorePuts(-1);
+  let stops = 0;
+  try {
+    const recorder = {
+      state: "recording",
+      ondataavailable: null as ((event: { data: Blob }) => void) | null,
+      onstop: null as (() => void) | null,
+      onerror: null as (() => void) | null,
+      stop() {
+        stops += 1;
+        this.state = "inactive";
+        this.onstop?.();
+      },
+    };
+    attachRecorderForTests(sessionId, recorder as unknown as MediaRecorder);
+    recorder.ondataavailable?.({ data: blob("lost") });
+    for (let i = 0; i < 50 && stops === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(stops, 1);
+    await recorderStopPromiseForTests();
+  } finally {
+    restorePuts();
+  }
+
+  const stopped = await load(sessionId);
+  assert.equal(stopped?.recorder_state, "lost");
+  assert.equal(stopped?.needs_operator, true);
+  assert.equal(stopped?.next_sequence, 1);
+  assert.equal(recordingView().problem?.errorName, "QuotaExceededError");
+  assert.equal(recordingView().problem?.step, "write_chunk");
+  assert.notEqual(recordingView().status, "recording");
+  assert.equal(recordingView().banner.kind, "interrupted");
+  const database = await openRecordingDb();
+  try {
+    const chunks = await listChunks(database, sessionId);
+    assert.equal(chunks.length, 1);
+    assert.equal(await chunks[0].blob.text(), "kept");
+  } finally {
+    database.close();
+  }
+});
+
 test("upload-login reopens only unauthorized chunks and leaves conflict and lost state", async () => {
   const sessionId = "S-reauth";
   const stopped = persistStop(
@@ -876,7 +925,8 @@ test("a successful upload does not clear a storage failure or recorder_lost", as
   }
 
   const storageError = recordingView().error ?? "";
-  assert.match(storageError, /^無法保存錄影片段：/);
+  assert.match(storageError, /QuotaExceededError/);
+  assert.match(storageError, /不要清除網站資料/);
   const lost = await load(sessionId);
   assert.equal(lost?.recorder_state, "lost");
   assert.equal(lost?.needs_operator, true);

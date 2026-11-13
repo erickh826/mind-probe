@@ -87,6 +87,12 @@ export interface StudentSocket {
   sendClipEnded: (clipId: string) => void;
   sendRecordingStarted: () => void;
   sendRecordingStopped: (reason?: string) => void;
+  sendRecordingFailed: (problem: {
+    phase: string;
+    step: string;
+    errorName: string;
+    message: string;
+  }) => void;
   sendChunkUploaded: (chunkIndex: number, timestampMs: number) => void;
 }
 
@@ -255,6 +261,18 @@ export function useStudentSocket(
   const sendRecordingStopped = useCallback(
     (reason?: string) => {
       sendEnvelope("recording_stopped", reason ? { reason } : {});
+    },
+    [sendEnvelope],
+  );
+
+  const sendRecordingFailed = useCallback(
+    (problem: { phase: string; step: string; errorName: string; message: string }) => {
+      sendEnvelope("recording_failed", {
+        phase: problem.phase,
+        step: problem.step,
+        error_name: problem.errorName,
+        message: problem.message,
+      });
     },
     [sendEnvelope],
   );
@@ -812,6 +830,7 @@ export function useStudentSocket(
       sendClipEnded,
       sendRecordingStarted,
       sendRecordingStopped,
+      sendRecordingFailed,
       sendChunkUploaded,
     }),
     [
@@ -827,6 +846,7 @@ export function useStudentSocket(
       sendClipStarted,
       sendRecordingStarted,
       sendRecordingStopped,
+      sendRecordingFailed,
       session,
       status,
     ],

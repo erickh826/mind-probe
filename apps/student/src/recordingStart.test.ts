@@ -15,8 +15,11 @@ import {
   recorderStopPromiseForTests,
   recordingView,
   resetRecordingControllerForTests,
+  releaseLocalMedia,
+  setRecordingArmed,
   setRecordingTransport,
   setSocketAdmitted,
+  setStorageCheckForTests,
   startRecording,
   stopReplacedRecording,
 } from "./recordingController.ts";
@@ -208,6 +211,67 @@ test("an admitted fresh tab claims once after the camera and records", async () 
   assert.equal((await load(sessionId))?.recorder_state, "recording");
 });
 
+test("recording does not start until the server session is armed", async () => {
+  const env = install();
+  const sessionId = "S-not-armed";
+  await admitted(sessionId);
+  setRecordingArmed(sessionId, false);
+  await startRecording(sessionId);
+  assert.equal(env.prompts, 0);
+  assert.deepEqual(env.claims, []);
+  assert.equal(FakeRecorder.instances.length, 0);
+
+  setRecordingArmed(sessionId, true);
+  await startRecording(sessionId);
+  assert.equal(env.claims.length, 1);
+  assert.equal(FakeRecorder.instances.length, 1);
+  assert.equal(FakeRecorder.instances[0].state, "recording");
+});
+
+test("a failed storage self-check blocks the claim", async () => {
+  const env = install();
+  const sessionId = "S-idb-blocked";
+  setStorageCheckForTests(async () => ({
+    phase: "start",
+    step: "open_db",
+    errorName: "QuotaExceededError",
+    message: "此裝置的儲存空間不足（QuotaExceededError，開啟資料庫）。不要清除網站資料。",
+  }));
+  await admitted(sessionId);
+  await startRecording(sessionId);
+  assert.equal(env.prompts, 0);
+  assert.deepEqual(env.claims, []);
+  assert.equal(recordingView().canStart, false);
+  assert.equal(recordingView().problem?.errorName, "QuotaExceededError");
+  assert.equal(recordingView().problem?.step, "open_db");
+  assert.match(recordingView().error ?? "", /不要清除網站資料/);
+});
+
+test("leaving an in-progress take keeps stored chunks and does not delete the database", async () => {
+  install();
+  const sessionId = "S-leave";
+  await admitted(sessionId);
+  await startRecording(sessionId);
+  const deleted: string[] = [];
+  const original = indexedDB.deleteDatabase.bind(indexedDB);
+  indexedDB.deleteDatabase = ((name: string) => {
+    deleted.push(name);
+    return original(name);
+  }) as typeof indexedDB.deleteDatabase;
+  try {
+    releaseLocalMedia();
+    await recorderStopPromiseForTests();
+  } finally {
+    indexedDB.deleteDatabase = original;
+  }
+  assert.equal(deleted.includes("mindprobe-recording"), false);
+  const meta = await load(sessionId);
+  assert.equal(meta?.recorder_state, "lost");
+  assert.ok((meta?.next_sequence ?? 0) >= 1);
+  const rows = await chunkRows(sessionId);
+  assert.ok(rows.length >= 1);
+});
+
 test("a session whose take exists elsewhere never opens the camera", async () => {
   for (const status of [
     { ...free(), take_claimed: true },
@@ -299,6 +363,7 @@ test("claim refusals each have their own outcome", async () => {
     { error: new ApiError(401, "revoked_session_token", "revoked_session_token"), message: /已被撤銷/, canStart: false },
     { error: new ApiError(401, "expired_session_token", "expired_session_token"), message: /登入已失效/, canStart: false },
     { error: conflict("role_not_admitted"), message: /尚未連上場次/, canStart: true },
+    { error: conflict("session_not_started"), message: /尚未將場次標為進行中/, canStart: true },
   ];
   for (const { error, message, canStart } of cases) {
     await resetRecordingControllerForTests();
@@ -676,7 +741,7 @@ test("a revocation's lost declaration also waits for the recorder's last slices"
   assert.equal((await load(sessionId))?.needs_operator, true);
 });
 
-test("a slice that could not be stored holds the lost declaration until the recorder stops", async () => {
+test("a slice that could not be stored stops the recorder and keeps earlier slices", async () => {
   const env = install();
   const sessionId = "S-chunk-lost";
   await admitted(sessionId);
@@ -687,20 +752,22 @@ test("a slice that could not be stored holds the lost declaration until the reco
 
   failSliceWrites("bad");
   recorder.ondataavailable?.({ data: new Blob(["bad"], { type: "video/webm" }) });
-  await waitFor(async () => (await load(sessionId))?.recorder_state === "lost", "loss declared");
-  assert.equal(recorder.state, "recording", "the recorder keeps running");
-  await pumpPastDeadline(sessionId, 4);
-  assert.deepEqual(env.finalizes, [], "no finalize while the recorder still adds slices");
+  await waitFor(async () => recorder.state === "inactive", "recorder stopped after the write failure");
+  await recorderStopPromiseForTests();
+  assert.equal((await load(sessionId))?.recorder_state, "lost");
+  assert.equal((await load(sessionId))?.next_sequence, 1, "the failed slice was not stored");
+  assert.notEqual(recordingView().status, "recording");
+  assert.match(recordingView().error ?? "", /不要清除網站資料|UnknownError|QuotaExceededError/);
 
   recorder.ondataavailable?.({ data: new Blob(["s1"], { type: "video/webm" }) });
-  recorder.stop();
-  await recorderStopPromiseForTests();
+  assert.equal((await load(sessionId))?.next_sequence, 1, "no further slice is appended");
+
   for (let i = 0; i < 6; i += 1) {
     await pumpSession(sessionId);
   }
-  assert.deepEqual([...env.uploads].sort(), [0, 1, 2]);
+  assert.deepEqual([...env.uploads].sort(), [0]);
   assert.deepEqual(env.pastFinal, []);
-  assert.deepEqual(env.finalizes, [{ final_sequence: 2, reason: "recorder_lost" }]);
+  assert.deepEqual(env.finalizes, [{ final_sequence: 0, reason: "recorder_lost" }]);
   assert.equal((await load(sessionId))?.needs_operator, true);
 });
 

@@ -179,6 +179,8 @@ export interface SessionSocket {
   startInFlight: boolean;
   /** Last start failure, or null once the server has left `created`. */
   startError: string | null;
+  /** Student could not start or keep writing the recording. */
+  recordingAlert: string | null;
   sendRequestFallback: (
     category: FallbackCategory,
     reason?: FallbackReasonValue,
@@ -216,6 +218,7 @@ export function useSessionSocket(
   );
   const [startInFlight, setStartInFlight] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
+  const [recordingAlert, setRecordingAlert] = useState<string | null>(null);
 
   const socketRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
@@ -947,6 +950,21 @@ export function useSessionSocket(
       }
 
       if (isEventEnvelope(parsed)) {
+        if (parsed.event_type === "recording_started") {
+          setRecordingAlert(null);
+        }
+        if (parsed.event_type === "recording_failed") {
+          const payload = parsed.payload as Record<string, unknown>;
+          const message =
+            typeof payload.message === "string" && payload.message.trim().length > 0
+              ? payload.message
+              : "學生端錄影未能開始或無法繼續寫入。";
+          const errorName = typeof payload.error_name === "string" ? payload.error_name : "";
+          const step = typeof payload.step === "string" ? payload.step : "";
+          const detail = [errorName, step].filter((part) => part.length > 0).join(" · ");
+          setRecordingAlert(detail.length > 0 ? `${message}（${detail}）` : message);
+          appendLog("error", `學生錄影失敗：${message}`);
+        }
         applyBroadcastEnvelope(parsed);
         if (REVISION_BUMPING_EVENTS.has(parsed.event_type)) {
           scheduleSnapshotResync();
@@ -1160,6 +1178,10 @@ export function useSessionSocket(
   const dismissThresholdAlert = useCallback(() => setThresholdAlert(null), []);
 
   useEffect(() => {
+    setRecordingAlert(null);
+  }, [sessionId]);
+
+  useEffect(() => {
     if (session.session_state === "created") {
       return;
     }
@@ -1192,6 +1214,7 @@ export function useSessionSocket(
       sendSessionStarted,
       startInFlight,
       startError,
+      recordingAlert,
       sendRequestFallback,
       sendUncoveredQuestion,
     }),
@@ -1215,6 +1238,7 @@ export function useSessionSocket(
       session,
       startError,
       startInFlight,
+      recordingAlert,
       status,
       thresholdAlert,
     ],
