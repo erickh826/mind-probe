@@ -190,6 +190,9 @@ class Session(Base):
     # Set while status == "paused"; always one of PAUSE_REASONS (ADR-0004 §2).
     pause_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     start_at_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Latest student recording_failed notice, or null once a claim or
+    # recording_started clears it. Served on the session snapshot.
+    recording_failure: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
@@ -494,6 +497,9 @@ def init_db() -> None:
             for name, sql_type in additions.items():
                 if name not in columns:
                     conn.exec_driver_sql(f"ALTER TABLE recordings ADD COLUMN {name} {sql_type}")
+            session_columns = {c["name"] for c in inspect(conn).get_columns("sessions")}
+            if "recording_failure" not in session_columns:
+                conn.exec_driver_sql("ALTER TABLE sessions ADD COLUMN recording_failure JSON")
 
 
 # ---------------------------------------------------------------------------
@@ -995,6 +1001,20 @@ def end_session(db: DBSession, session_id: str, *, commit: bool = True) -> Sessi
     else:
         db.flush()
     return session
+
+
+def set_recording_failure(db: DBSession, session_id: str, notice: dict | None) -> None:
+    """Remember or clear the latest student recording failure.
+
+    This is not a lifecycle transition: ``snapshot_revision`` stays put so an
+    in-flight clip command is not marked stale. The snapshot includes the
+    same value so a Wizard that joins later still sees it.
+    """
+    session = get_session(db, session_id)
+    if session is None:
+        return
+    session.recording_failure = notice
+    db.commit()
 
 
 # ---------------------------------------------------------------------------

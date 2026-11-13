@@ -172,6 +172,31 @@ def test_a_scheduled_start_cannot_be_claimed_until_it_is_due(client, db_factory)
     assert _with_db(status) == "active"
 
 
+def test_a_successful_claim_clears_a_stored_recording_failure(client):
+    from app import websocket as websocket_module
+
+    session_id, token = _open_session(client)
+    notice = {
+        "phase": "start",
+        "step": "camera",
+        "error_name": "NotAllowedError",
+        "message": "權限被拒",
+    }
+    _with_db(lambda db: models.set_recording_failure(db, session_id, notice))
+    websocket_module.manager.snapshot_for(session_id).recording_failure = dict(notice)
+    with _socket(client, session_id, token):
+        claimed = _claim(client, session_id, token, TAKE_A)
+    assert claimed.status_code == 200, claimed.text
+
+    def failure(db):
+        session = models.get_session(db, session_id)
+        assert session is not None
+        return session.recording_failure
+
+    assert _with_db(failure) is None
+    assert websocket_module.manager.snapshot_for(session_id).recording_failure is None
+
+
 def test_a_paused_session_can_still_claim_its_one_take(client, db_factory):
     session_id, token = _open_session(client, started=True)
 

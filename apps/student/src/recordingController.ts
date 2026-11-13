@@ -181,6 +181,13 @@ let recordingProblem: RecordingProblem | null = null;
 /** Camera preview before MediaRecorder starts. Not a take. */
 let preview: { sessionId: string; stream: MediaStream } | null = null;
 /**
+ * Bumped by leave and unmount. A getUserMedia that resolves afterwards must
+ * stop its stream instead of becoming the preview.
+ */
+let captureToken = 0;
+/** So a second preview does not stack permission listeners after a reset. */
+let permissionWatchStarted = false;
+/**
  * Null until the page reports server session state. Tests that never report
  * it keep the previous "admitted may record" behaviour. Production sets this
  * false until the server snapshot is `active`.
@@ -358,6 +365,7 @@ function recordingNotArmed(sessionId: string): boolean {
 /** Camera and microphone preview. Does not claim a take or start MediaRecorder. */
 export async function openCameraPreview(sessionId: string): Promise<void> {
   cancelRelease();
+  const token = captureToken;
   if (active?.sessionId === sessionId && active.stream) {
     emit();
     return;
@@ -370,6 +378,10 @@ export async function openCameraPreview(sessionId: string): Promise<void> {
     return;
   }
   const storageProblem = await storageCheck();
+  if (token !== captureToken) {
+    emit();
+    return;
+  }
   if (storageProblem) {
     recordingProblem = storageProblem;
     rememberHeldFailure(storageProblem.message);
@@ -388,21 +400,13 @@ export async function openCameraPreview(sessionId: string): Promise<void> {
     emit();
     return;
   }
+  let stream: MediaStream;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-    if (preview && preview.stream !== stream) {
-      stopTracks(preview.stream);
-    }
-    preview = { sessionId, stream };
-    if (!storageProblem && status !== "recording" && status !== "stopping") {
-      if (recordingProblem?.step === "camera") {
-        recordingProblem = null;
-        forgetError();
-      }
-      status = "idle";
-      retryable = false;
-    }
+    stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
   } catch (cause) {
+    if (token !== captureToken) {
+      return;
+    }
     if (!storageProblem) {
       const described = describeMediaError(cause);
       recordingProblem = {
@@ -417,15 +421,115 @@ export async function openCameraPreview(sessionId: string): Promise<void> {
         status = "error";
       }
     }
+    emit();
+    return;
+  }
+  if (!adoptPreviewStream(sessionId, stream, token)) {
+    emit();
+    return;
+  }
+  if (!storageProblem && status !== "recording" && status !== "stopping") {
+    if (recordingProblem?.step === "camera") {
+      recordingProblem = null;
+      forgetError();
+    }
+    status = "idle";
+    retryable = false;
   }
   emit();
+  await watchCapturePermissions();
+}
+
+/**
+ * Keep a stream only if leave/unmount has not invalidated this request.
+ * A late stream is stopped immediately and never shown.
+ */
+function adoptPreviewStream(sessionId: string, stream: MediaStream, token: number): boolean {
+  if (token !== captureToken) {
+    stopTracks(stream);
+    return false;
+  }
+  if (preview && preview.stream !== stream) {
+    stopTracks(preview.stream);
+  }
+  watchPreviewTracks(stream);
+  preview = { sessionId, stream };
+  return true;
+}
+
+function watchPreviewTracks(stream: MediaStream): void {
+  const onEnded = () => {
+    if (preview?.stream !== stream) {
+      return;
+    }
+    retirePreview("ended");
+  };
+  for (const track of stream.getTracks()) {
+    if (typeof track.addEventListener === "function") {
+      track.addEventListener("ended", onEnded);
+    }
+  }
+}
+
+function retirePreview(reason: "ended" | "permission"): void {
+  const current = preview;
+  preview = null;
+  if (current) {
+    stopTracks(current.stream);
+  }
+  if (status === "recording" || status === "stopping") {
+    emit();
+    return;
+  }
+  const message =
+    reason === "permission"
+      ? "攝影機或麥克風權限已關閉。請重新允許後再試。預覽已停止。"
+      : "攝影機或麥克風已中斷。預覽已停止，請再試。";
+  recordingProblem = {
+    phase: "start",
+    step: "camera",
+    errorName: reason === "permission" ? "NotAllowedError" : "AbortError",
+    message,
+  };
+  rememberHeldFailure(message);
+  retryable = reason === "ended";
+  status = "error";
+  emit();
+}
+
+async function watchCapturePermissions(): Promise<void> {
+  if (permissionWatchStarted) {
+    return;
+  }
+  const permissions = navigator.permissions;
+  if (!permissions?.query) {
+    return;
+  }
+  permissionWatchStarted = true;
+  for (const name of ["camera", "microphone"] as const) {
+    try {
+      const status = await permissions.query({ name: name as PermissionName });
+      const onChange = () => {
+        if (status.state === "denied") {
+          retirePreview("permission");
+        }
+      };
+      if (typeof status.addEventListener === "function") {
+        status.addEventListener("change", onChange);
+      }
+    } catch {
+      // Some browsers reject camera/microphone permission queries.
+    }
+  }
 }
 
 /**
  * Stop the camera and, if a recorder is running, stop it as incomplete.
  * Does not delete IndexedDB chunks or saved join info.
+ * In-flight getUserMedia calls see the new token and stop the stream they receive.
  */
 export function releaseLocalMedia(): void {
+  captureToken += 1;
   const recorder = active?.recorder;
   if (recorder && recorder.state !== "inactive") {
     stopAsLost = true;
@@ -527,6 +631,7 @@ function cancelRelease(): void {
 
 export function scheduleRelease(): void {
   cancelRelease();
+  captureToken += 1;
   const sessionId = boundSession;
   releaseTimer = window.setTimeout(() => {
     releaseTimer = null;
@@ -981,6 +1086,7 @@ async function startRecordingOnce(sessionId: string): Promise<void> {
   retryable = false;
   emit();
   let stream: MediaStream;
+  const token = captureToken;
   const livePreview =
     preview?.sessionId === sessionId &&
     preview.stream.getTracks().some((track) => track.readyState === "live")
@@ -993,6 +1099,9 @@ async function startRecordingOnce(sessionId: string): Promise<void> {
     try {
       stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
     } catch (cause) {
+      if (token !== captureToken) {
+        return;
+      }
       if (revokedSessions.has(sessionId)) {
         // The prompt failed after the revocation. Keep the revocation in view, no retry.
         status = "idle";
@@ -1008,6 +1117,11 @@ async function startRecordingOnce(sessionId: string): Promise<void> {
         retryable = described.retryable;
         status = "error";
       }
+      emit();
+      return;
+    }
+    if (token !== captureToken) {
+      stopTracks(stream);
       emit();
       return;
     }
@@ -1714,6 +1828,8 @@ export async function resetRecordingControllerForTests(
   }
   armedSessions = null;
   storageCheck = defaultStorageCheck;
+  captureToken = 0;
+  permissionWatchStarted = false;
   // Let an in-flight finalize write finish before the database is closed.
   await Promise.allSettled(inFlightWork);
   const pending = databasePromise;

@@ -29,7 +29,6 @@ export function waitingForWizardCopy(state: SessionState, recording: boolean): s
 }
 
 export function shouldAutoStartRecording(input: {
-  restoredFromStorage: boolean;
   uploadOnly: boolean;
   admitted: boolean;
   sessionState: SessionState;
@@ -37,8 +36,10 @@ export function shouldAutoStartRecording(input: {
   canStart: boolean;
   recorderStatus: string;
   alreadyAttempted: boolean;
+  /** This device already has a take. A refresh must not start a second one. */
+  hasLocalTake: boolean;
 }): boolean {
-  if (input.restoredFromStorage || input.uploadOnly || input.alreadyAttempted) {
+  if (input.uploadOnly || input.alreadyAttempted || input.hasLocalTake) {
     return false;
   }
   if (!input.admitted || !serverSessionInProgress(input.sessionState)) {

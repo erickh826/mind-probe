@@ -49,6 +49,7 @@ import {
   startRejectionMessage,
 } from "./sessionStart";
 import { INITIAL_SESSION_VIEW } from "./types";
+import { recordingAlertFromNotice } from "./recordingAlert";
 import type {
   ConnectionStatus,
   ConsoleLogEntry,
@@ -614,6 +615,7 @@ export function useSessionSocket(
         consecutive_fallbacks: message.consecutive_fallbacks,
         start_at_server_ms: message.start_at_server_ms ?? null,
       });
+      setRecordingAlert(recordingAlertFromNotice(message.recording_failure));
       if (
         message.session_state === "starting" &&
         typeof message.start_at_server_ms === "number"
@@ -955,15 +957,15 @@ export function useSessionSocket(
         }
         if (parsed.event_type === "recording_failed") {
           const payload = parsed.payload as Record<string, unknown>;
-          const message =
-            typeof payload.message === "string" && payload.message.trim().length > 0
-              ? payload.message
-              : "學生端錄影未能開始或無法繼續寫入。";
-          const errorName = typeof payload.error_name === "string" ? payload.error_name : "";
-          const step = typeof payload.step === "string" ? payload.step : "";
-          const detail = [errorName, step].filter((part) => part.length > 0).join(" · ");
-          setRecordingAlert(detail.length > 0 ? `${message}（${detail}）` : message);
-          appendLog("error", `學生錄影失敗：${message}`);
+          setRecordingAlert(
+            recordingAlertFromNotice({
+              phase: typeof payload.phase === "string" ? payload.phase : null,
+              step: typeof payload.step === "string" ? payload.step : null,
+              error_name: typeof payload.error_name === "string" ? payload.error_name : null,
+              message: typeof payload.message === "string" ? payload.message : null,
+            }),
+          );
+          appendLog("error", "學生錄影失敗");
         }
         applyBroadcastEnvelope(parsed);
         if (REVISION_BUMPING_EVENTS.has(parsed.event_type)) {

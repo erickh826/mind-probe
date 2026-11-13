@@ -72,7 +72,6 @@ export default function App() {
   const mayRecord =
     joined !== null &&
     !joined.uploadOnly &&
-    !joined.restoredFromStorage &&
     socket.session.session_state === "active";
   const recorder = useMediaRecorder({
     sessionId: joined?.sessionId ?? null,
@@ -272,7 +271,6 @@ export default function App() {
   useEffect(() => {
     if (
       !shouldAutoStartRecording({
-        restoredFromStorage: joined?.restoredFromStorage === true,
         uploadOnly: joined?.uploadOnly === true,
         admitted: socket.admitted,
         sessionState: socket.session.session_state,
@@ -280,6 +278,7 @@ export default function App() {
         canStart: recorder.canStart,
         recorderStatus: recorder.status,
         alreadyAttempted: autoRecordingAttemptedRef.current,
+        hasLocalTake: recorder.takeCheck === "claimed",
       })
     ) {
       return;

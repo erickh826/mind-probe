@@ -11,6 +11,7 @@ import {
   bindSession,
   interruptRecording,
   notePageHide,
+  openCameraPreview,
   pumpSession,
   recorderStopPromiseForTests,
   recordingView,
@@ -28,7 +29,10 @@ import type { RecordingMeta, ServerUploadStatus } from "./uploadQueue.ts";
 
 interface FakeTrack {
   stopped: boolean;
+  readyState: string;
   stop: () => void;
+  addEventListener: (type: string, listener: () => void) => void;
+  end: () => void;
 }
 
 class FakeRecorder {
@@ -109,10 +113,22 @@ function install(): Env {
       getUserMedia: async () => {
         env.prompts += 1;
         await env.prompt();
+        const listeners = new Set<() => void>();
         const track: FakeTrack = {
+          readyState: "live",
           stopped: false,
           stop() {
             this.stopped = true;
+            this.readyState = "ended";
+          },
+          addEventListener(_type: string, listener: () => void) {
+            listeners.add(listener);
+          },
+          end() {
+            this.readyState = "ended";
+            for (const listener of listeners) {
+              listener();
+            }
           },
         };
         env.tracks.push(track);
@@ -270,6 +286,79 @@ test("leaving an in-progress take keeps stored chunks and does not delete the da
   assert.ok((meta?.next_sequence ?? 0) >= 1);
   const rows = await chunkRows(sessionId);
   assert.ok(rows.length >= 1);
+});
+
+test("a preview stream that resolves after leave is stopped immediately", async () => {
+  const env = install();
+  let releasePrompt: () => void = () => {};
+  env.prompt = () =>
+    new Promise<void>((resolve) => {
+      releasePrompt = resolve;
+    });
+  const sessionId = "S-late-preview";
+  await bindSession(sessionId);
+  const opening = openCameraPreview(sessionId);
+  await waitFor(async () => env.prompts === 1, "camera prompt");
+  releaseLocalMedia();
+  releasePrompt();
+  await opening;
+  assert.equal(env.tracks.length, 1);
+  assert.equal(env.tracks[0].stopped, true);
+  assert.equal(recordingView().stream, null);
+});
+
+test("an ended preview track tears the preview down", async () => {
+  const env = install();
+  const sessionId = "S-track-ended";
+  await bindSession(sessionId);
+  await openCameraPreview(sessionId);
+  assert.equal(recordingView().stream === null, false);
+  env.tracks[0].end();
+  assert.equal(env.tracks[0].stopped, true);
+  assert.equal(recordingView().stream, null);
+  assert.match(recordingView().error ?? "", /預覽已停止/);
+});
+
+test("revoking camera permission stops an open preview", async () => {
+  const env = install();
+  let state: PermissionState = "granted";
+  const listeners = new Set<() => void>();
+  const previous = Object.getOwnPropertyDescriptor(navigator, "permissions");
+  Object.defineProperty(navigator, "permissions", {
+    configurable: true,
+    value: {
+      query: async () => ({
+        get state() {
+          return state;
+        },
+        addEventListener(_type: string, listener: () => void) {
+          listeners.add(listener);
+        },
+        removeEventListener(_type: string, listener: () => void) {
+          listeners.delete(listener);
+        },
+      }),
+    },
+  });
+  try {
+    const sessionId = "S-permission";
+    await bindSession(sessionId);
+    await openCameraPreview(sessionId);
+    assert.equal(env.tracks[0].stopped, false);
+    state = "denied";
+    for (const listener of listeners) {
+      listener();
+    }
+    assert.equal(env.tracks[0].stopped, true);
+    assert.equal(recordingView().stream, null);
+    assert.match(recordingView().error ?? "", /權限已關閉/);
+  } finally {
+    if (previous) {
+      Object.defineProperty(navigator, "permissions", previous);
+    } else {
+      delete (navigator as unknown as { permissions?: unknown }).permissions;
+    }
+  }
 });
 
 test("a session whose take exists elsewhere never opens the camera", async () => {

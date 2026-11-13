@@ -1004,7 +1004,13 @@ def claim_recording(
     session = _promote_due_scheduled_start(db, session)
     if session.status not in {"active", "paused"}:
         raise HTTPException(status_code=409, detail="session_not_started")
-    return recording_integrity.claim_take(db, session_id, body.take_id)
+    result = recording_integrity.claim_take(db, session_id, body.take_id)
+    # A successful claim means this device is starting cleanly. Drop a failure
+    # left over from an earlier attempt so a late Wizard does not keep the banner.
+    models.set_recording_failure(db, session_id, None)
+    if session_id in websocket.manager._snapshots:
+        websocket.manager.snapshot_for(session_id).recording_failure = None
+    return result
 
 
 @router.get("/{session_id}/status")

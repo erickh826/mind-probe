@@ -11,7 +11,6 @@ import {
 import type { CloseBanner } from "./uploadQueue.ts";
 
 const ready = {
-  restoredFromStorage: false,
   uploadOnly: false,
   admitted: true,
   sessionState: "active" as const,
@@ -19,6 +18,7 @@ const ready = {
   canStart: true,
   recorderStatus: "idle",
   alreadyAttempted: false,
+  hasLocalTake: false,
 };
 
 test("recording starts only after the server session is active", () => {
@@ -32,11 +32,20 @@ test("recording starts only after the server session is active", () => {
   assert.equal(shouldAutoStartRecording({ ...ready, sessionState: "created" }), false);
   assert.equal(shouldAutoStartRecording({ ...ready, sessionState: "starting" }), false);
   assert.equal(shouldAutoStartRecording({ ...ready, admitted: false }), false);
-  assert.equal(shouldAutoStartRecording({ ...ready, restoredFromStorage: true }), false);
   assert.equal(shouldAutoStartRecording({ ...ready, recorderStatus: "recording" }), false);
   assert.match(waitingForWizardCopy("created", false) ?? "", /等待 Wizard/);
   assert.match(waitingForWizardCopy("starting", false) ?? "", /尚未開始/);
   assert.equal(waitingForWizardCopy("active", true), null);
+});
+
+test("refresh while waiting still starts once the session is active if this device never recorded", () => {
+  assert.equal(shouldAutoStartRecording({ ...ready, hasLocalTake: false }), true);
+  assert.equal(
+    shouldAutoStartRecording({ ...ready, sessionState: "created", hasLocalTake: false }),
+    false,
+  );
+  assert.equal(shouldAutoStartRecording({ ...ready, hasLocalTake: true }), false);
+  assert.equal(shouldAutoStartRecording({ ...ready, takeCheck: "claimed", hasLocalTake: true }), false);
 });
 
 test("reconnect continues a take instead of starting another", () => {

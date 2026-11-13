@@ -776,6 +776,64 @@ def test_recording_failed_is_stored_and_broadcast_without_changing_session_state
         assert snapshot["session_state"] == "created"
 
 
+def test_a_late_wizard_restores_recording_failure_from_the_snapshot_until_recording_starts():
+    session_id = _fresh_session_id()
+    with _connect(session_id, "student") as student:
+        student.send_json(
+            {
+                "sequence": 1,
+                "client_timestamp_ms": 0,
+                "event_type": "recording_failed",
+                "payload": {
+                    "event_id": "evt-fail-late",
+                    "phase": "start",
+                    "step": "open_db",
+                    "error_name": "QuotaExceededError",
+                    "message": "空間不足",
+                },
+            }
+        )
+        assert student.receive_json()["status"] == "accepted"
+
+    with models.session_scope() as db:
+        stored = models.get_session(db, session_id)
+        assert stored is not None
+        assert stored.recording_failure["error_name"] == "QuotaExceededError"
+        assert stored.recording_failure["step"] == "open_db"
+
+    hello = {
+        "type": "reconnect_hello",
+        "session_id": session_id,
+        "role": "wizard",
+        "last_snapshot_revision": 0,
+        "last_acked_sequence": -1,
+        "pending_event_ids": [],
+    }
+    with _connect(session_id, "wizard") as wizard:
+        wizard.send_json(hello)
+        snapshot = wizard.receive_json()
+        assert snapshot["type"] == "session_snapshot"
+        assert snapshot["recording_failure"]["message"] == "空間不足"
+        assert snapshot["recording_failure"]["error_name"] == "QuotaExceededError"
+        assert snapshot["session_state"] == "created"
+
+    with _connect(session_id, "student") as student:
+        student.send_json(
+            {
+                "sequence": 2,
+                "client_timestamp_ms": 1,
+                "event_type": "recording_started",
+                "payload": {"event_id": "evt-started-after-fail"},
+            }
+        )
+        assert student.receive_json()["status"] == "accepted"
+
+    with _connect(session_id, "wizard") as wizard:
+        wizard.send_json(hello)
+        cleared = wizard.receive_json()
+        assert cleared["recording_failure"] is None
+
+
 def test_session_started_broadcasts_scheduled_start_two_seconds_ahead():
     session_id = _fresh_session_id()
     with _connect(session_id, "wizard") as wizard, \
