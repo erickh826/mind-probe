@@ -15,7 +15,7 @@ _Updated: 2026-11-27。對應 [`roadmap.md`](roadmap.md) 第零、一節。完�
 
 | # | 項目 | 範圍 | 備註 |
 |---|---|---|---|
-| P0-1 | **完成 PR #27**：伺服器宣布場次開始後才錄影、Leave 按鈕、IndexedDB 錯誤說明 | Student、Server、Wizard | 來自試用回報。最新審查仍有一項 P2 未修好：場次 token 被撤銷或被接管時，相機預覽沒有清除。修好、複審通過後才合併。這個 PR 有新增資料庫欄位，部署時前端先行（或同時），先處理仍開著的舊分頁 |
+| P0-1 | **完成 PR #27**：伺服器宣布場次開始後才錄影、Leave 按鈕、IndexedDB 錯誤說明 | Student、Server、Wizard | 來自試用回報。完成審查意見的修正、複審通過後才合併。這個 PR 有新增資料庫欄位，部署時前端先行（或同時），先處理仍開著的舊分頁 |
 
 ## P1 — M4 之前
 
@@ -33,7 +33,7 @@ _Updated: 2026-11-27。對應 [`roadmap.md`](roadmap.md) 第零、一節。完�
 
 | # | 項目 | 範圍 | 備註 |
 |---|---|---|---|
-| P2-1 | 老師頁的存取紀錄時間慢 8 小時 | Server 或 Teacher | `GET /sessions/{id}/audit` 回傳沒有時區的 ISO 時間（SQLite 存 UTC），瀏覽器當成本地時間 |
+| P2-1 | 老師頁的存取紀錄時間慢 8 小時 | Server 或 Teacher | 相信是因為 `GET /sessions/{id}/audit` 回傳沒有時區的 ISO 時間（SQLite 存 UTC），瀏覽器當成本地時間；修正前先確認老師頁的解析方式 |
 | P2-2 | 重新連線後學生端顯示 MANUAL（issue #4） | Student | 伺服器實際原因是 `recording_failure` |
 | P2-3 | 各 app 統一處理 401：自動登出 | 四個前端 | OP 詳細面板收到 401 時不會登出 |
 | P2-4 | 未覆蓋問題（M 鍵）集中檢視及匯出 | Teacher 或 OP、Server | 事件已有記錄；pilot 要用它計算覆蓋率及整理問題清單（spec §十四） |
