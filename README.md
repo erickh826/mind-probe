@@ -21,12 +21,13 @@ See the full specification (source of truth) in [`docs/spec.md`](docs/spec.md).
 
 ## Architecture
 
-Everything runs on a single LAN (see `docs/spec.md` §4–5):
+The spec (`docs/spec.md` §4–5) describes a single-LAN setup. The current trial deployment puts the four frontends on Vercel, the server on one Lightsail host behind Caddy, and recordings on Cloudflare R2 (ADR-0005, [`mindprobe-deploy-design.md`](mindprobe-deploy-design.md)). The logical layout is the same:
 
 ```
 apps/student  (React+TS) ──WS/HTTP──┐
 apps/wizard   (React+TS) ──WS───────┼──▶  server/ (FastAPI)  ──▶  SQLite + local FS
-apps/teacher  (React+TS) ──REST─────┘         │  (cases/, sessions/, FFmpeg remux)
+apps/teacher  (React+TS) ──REST/WS──┤
+apps/op       (React+TS) ──REST─────┘         │  (cases/, sessions/, FFmpeg remux)
                                               └──▶ cases/CASE001/*.json + media/
 packages/shared (TS event/clip types, mirrors server/app/events.py)
 ```
@@ -35,6 +36,7 @@ packages/shared (TS event/clip types, mirrors server/app/events.py)
 - **apps/student/** — Fullscreen suspect video player, `getUserMedia` + `MediaRecorder` capture/upload.
 - **apps/wizard/** — 3-tier hotkey control console (F1–F8 categories, see §8).
 - **apps/teacher/** — Dual-view playback + timeline + rubric review.
+- **apps/op/** — Operator page: admin login, create sessions, hand out codes, upload codes, recording status.
 - **packages/shared/** — Shared TypeScript types for the event envelope (§9) and clip manifest (§12).
 - **cases/CASE001/** — Single MVP case: metadata, ground truth, disclosure rules, decision tree, clip manifest, rubric.
 - **sessions/** — Runtime recordings / events / Wizard logs (gitignored).
@@ -47,10 +49,13 @@ server/                   # FastAPI backend (Python)
 apps/student/             # Vite + React + TS
 apps/wizard/              # Vite + React + TS
 apps/teacher/             # Vite + React + TS
+apps/op/                  # Vite + React + TS (operator page)
 packages/shared/          # Shared TS types
 cases/CASE001/            # Example case data
 sessions/                 # Runtime data (gitignored)
 docker-compose.yml        # server service + frontend dev notes
+docker-compose.prod.yml   # production stack (Caddy + server)
+deploy/backend/           # backend release, upgrade, rollback and CD kit
 ```
 
 ## Development
@@ -104,35 +109,44 @@ Deploying `apps/op` requires a backend that already serves operator-only `GET /s
 
 多個 AI agent（Claude／GPT-5.5／Gemini）針對關鍵架構問題（WebSocket 斷線重連、Fallback 機制、時間同步）各自獨立提出的意見，以及整合後的分歧點與建議決定，記錄在 [docs/adr/](docs/adr/README.md)。
 
-## Roadmap
+## 文件索引
 
-完整的 M0–M8 里程碑、Phase 0–7 開發階段、建議的 12 個 Agent 分工與協作規則，詳見 [`docs/roadmap.md`](docs/roadmap.md)。
+| 文件 | 內容 |
+|---|---|
+| [`docs/spec.md`](docs/spec.md) | 功能規格（權威來源） |
+| [`docs/adr/`](docs/adr/README.md) | 架構決策 |
+| [`docs/roadmap.md`](docs/roadmap.md) | 里程碑、目前進度、分工與協作規則 |
+| [`docs/todo.md`](docs/todo.md) | 待辦（P0–P3） |
+| [`mindprobe-deploy-design.md`](mindprobe-deploy-design.md) | 部署設計、端點權限、保留政策 |
+| [`deploy/backend/README.md`](deploy/backend/README.md) | 後端發佈、升級、回滾及 CD |
+| [`docs/recording-operations.md`](docs/recording-operations.md) | 錄影與補傳操作手冊 |
+| [`docs/backup-operations.md`](docs/backup-operations.md) | 備份與還原 |
+| [`docs/jobs-storage-delete.md`](docs/jobs-storage-delete.md) | 錄影工作佇列、刪除及儲存合約 |
+| [`docs/archive/`](docs/archive/README.md) | 已過時、只作歷史參考的文件 |
+
+## Roadmap
 
 | 里程碑 | 名稱 | 狀態 |
 |---|---|---|
-| M0 | Scaffold & Contract Lock | 進行中 |
-| M1 | 核心即時管線 E2E（依 ADR-0004：0001→0003→0002） | 未開始 |
-| M2 | 錄影與教師回看 MVP | 未開始 |
-| M3 | CASE001 內容完整化 | 未開始 |
-| M4 | 內部 Go/No-go 關卡 | 未開始 |
-| M5 | Mini-pilot（真實學生） | 未開始 |
+| M0 | Scaffold & Contract Lock | ✅ 完成 |
+| M1 | 核心即時管線 E2E | ✅ 完成 |
+| M2 | 錄影與教師回看 MVP | ✅ 完成 |
+| D1 | 雲端部署與安全（原部署設計 Phase 1） | ✅ 試行環境已上線；正式上線前需自有網域 |
+| D2 | 營運管理功能（原部署設計 Phase 2） | 🟡 OP 管理頁及管理員登入已完成；建立案件、監控頁未做 |
+| M3 | CASE001 內容完整化 | 🟡 影片及決策樹已有；伺服器端揭露規則、rubric 分級描述未做 |
+| M4 | 內部 Go/No-go 關卡 | ⬜ 下一步 |
+| M5 | Mini-pilot（真實學生） | ⬜ |
 
-完整 M0–M8 與後續 Phase 詳情見 [`docs/roadmap.md`](docs/roadmap.md)。
+M6–M8、V2 及各項的證據見 [`docs/roadmap.md`](docs/roadmap.md)。
 
 ## Status
 
-**當前里程碑：M0（Scaffold & Contract Lock）—— 進行中。**
+**2026-11-27：雲端試行中，下一個關卡是 M4 內部 Go/No-go。** 詳見 [`docs/roadmap.md`](docs/roadmap.md) 第零節及 [`docs/todo.md`](docs/todo.md)。Implement against `docs/spec.md`.
 
-file structure, schemas, and skeletons are in place；ADR-0001～0004 已定案；business logic 仍為 stub，尚未開始 M1 實作。
+### Windows 本機執行備註
 
-M0 驗收條件：
-- [x] repo 結構符合本 README 所描述的 monorepo 佈局
-- [x] `packages/shared` 與 `server/app/events.py` 事件封套 schema 一致
-- [x] ADR-0001～0004 狀態均為「已接受」，且已寫回 `docs/spec.md`
-- [x] `docs/roadmap.md` 建立，並與本 README、`docs/adr/README.md` 保持同步
-- [ ] 進入 Phase 1，開始實作 ADR-0001（WebSocket）
+如 PowerShell 拒絕執行 npm／venv 的腳本，先在該視窗執行：
 
-完整里程碑定義、Agent 分工與驗收標準見 [`docs/roadmap.md`](docs/roadmap.md)。Implement against `docs/spec.md`.
-
-local run 
-(Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned) 
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+```

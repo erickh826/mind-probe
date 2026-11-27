@@ -1,25 +1,63 @@
 # mind-probe 開發路線圖（Roadmap）
 
-> 本文件定義 M0–M8 里程碑、對應的 Phase 0–7 開發階段、建議的多 Agent 分工方式，以及跨 Agent 協作規則。
+> 本文件定義里程碑（M0–M8，以及部署軌 D1–D2）、各 Phase 的目標、多 Agent 分工與跨 Agent 協作規則，並記錄目前的進度。
 > 與 [`docs/spec.md`](spec.md)（功能規格權威來源）及 [`docs/adr/`](adr/README.md)（架構決策）搭配閱讀——如有衝突，spec.md 與 ADR 的技術決定優先，本文件只定義「依什麼順序做」與「由誰做」。
+> 待辦事項及優先次序（P0–P3）見 [`docs/todo.md`](todo.md)。
 
-## 一、里程碑總覽（M0–M8）
+## 零、目前進度（2026-11-27）
 
-| 里程碑 | 名稱 | 目標 | 對應 Phase | 驗收條件摘要 | 狀態 |
+**一句話：** 核心系統（M0–M2）已完成，並已部署到雲端試行（D1）；管理功能（D2）及 CASE001 內容（M3）完成大部分；下一個關卡是 M4 內部 Go/No-go，之後才進入真實學生 mini-pilot（M5）。
+
+- `feat/m2` 是整合分支，最新為 `032e64e`（2026-11-06）。合併進 `feat/m2` 會自動部署四個前端到 Vercel Production；後端（Lightsail）需要手動部署，見 [`deploy/backend/README.md`](../deploy/backend/README.md)。
+- 雲端試行環境已有實際試用場次；PR #27 正是根據試用回報而開。
+- 未合併：PR #27（伺服器宣布場次開始後才錄影、Leave、IndexedDB 錯誤）、PR #19（有新版前端時提示重新載入）。
+
+### 兩套 Phase 名稱的對照
+
+過去有兩套編號，以下統一使用本文件的名稱：
+
+| 舊稱 | 出處 | 本文件名稱 |
+|---|---|---|
+| Phase 0–7 | 本文件 | M0–M7（Phase N 對應 M N，不變） |
+| 部署設計的「Phase 1：上線與安全」 | [`mindprobe-deploy-design.md`](../mindprobe-deploy-design.md) | **D1 雲端部署與安全** |
+| 部署設計的「Phase 2：Admin 管理頁面」（§17） | 同上 | **D2 營運管理功能** |
+| spec 的「第二版」（§十六之後） | [`docs/spec.md`](spec.md) | **V2 AI 協助**（M6 之後） |
+
+D1、D2 是與 M1–M3 並行的部署軌，不取代 M4 Go/No-go：部署驗收不等於 pilot 準備就緒。
+
+## 一、里程碑總覽
+
+狀態：✅ 完成　🟡 部分完成／進行中　⬜ 未開始
+
+| 里程碑 | 名稱 | 目標 | 驗收條件摘要 | 狀態 | 主要證據 |
 |---|---|---|---|---|---|
-| M0 | Scaffold & Contract Lock | 建立 monorepo 結構、事件／clip schema、ADR 全部定案、建立 roadmap 與協作規則 | Phase 0 | repo 結構符合本 README；`packages/shared` 與 `server/app/events.py` schema 一致；ADR-0001～0004 已接受；`docs/roadmap.md` 建立且 README／ADR README 已同步 | 進行中 |
-| M1 | 核心即時管線 E2E | 依 ADR-0004 決定的順序（0001→0003→0002）打通即時互動骨幹，CASE001 最小可玩流程跑通 | Phase 1 | 見 [ADR-0004 M1 通過標準](adr/0004-cross-cutting-rules.md) | 未開始（目前 server/apps 仍為 stub） |
-| M2 | 錄影與教師回看 MVP | chunk 上傳、FFmpeg remux、Teacher REST 回看、時間軸對齊 | Phase 2 | 教師端可依統一時間線完整重播一場 session | 未開始 |
-| M3 | CASE001 內容完整化 | 25–35 段影片、決策樹、揭露規則、rubric 全部串接 | Phase 3 | Wizard 可在 2–3 次按鍵內選出任一情境回答，無缺片 | 未開始 |
-| M4 | 內部 Go/No-go 關卡 | 無真實學生的內部乾跑，全流程壓力測試 | Phase 4 | 見「M4 Go/No-go 門檻表」全部綠燈 | 未開始 |
-| M5 | Mini-pilot（真實學生） | 小規模真人測試，收集操作與計時真實數據 | Phase 5 | 完成 spec 規劃的 mini-pilot，資料完整可用於調整影片配額 | 未開始 |
-| M6 | Pilot 後迭代 | 依 M5 數據調整影片配額／fallback／rubric | Phase 6 | 每個迭代項目對應到具體 pilot 發現，並有調整前後對比 | 未開始 |
-| M7 | 多場次／教室規模化準備 | 多 session 並行、Admin 工具、監控、審計完整 | Phase 7 | 符合 ADR-0004 審計與資料保留規定，可支撐多班同時使用 | 未開始 |
-| M8 | 正式上線／後續擴充 | 正式導入教學現場，規劃第二個案件 | Phase 7 之後，持續運作 | 至少一次完整學期使用無重大事故 | 未開始 |
+| M0 | Scaffold & Contract Lock | monorepo、事件／clip schema、ADR-0001～0004 定案、roadmap | schema 兩端一致；ADR 已接受並寫回 spec | ✅ | `9c4a2ac`、`b46057a`、`edda06d` |
+| M1 | 核心即時管線 E2E | 依 ADR-0004 的順序（0001→0003→0002）打通 CASE001 最小流程 | [ADR-0004 M1 通過標準](adr/0004-cross-cutting-rules.md) | ✅ | `5e50dd7`、`6e66e54`、PR #1；`server/tests/test_m1_e2e.py` 逐條對應通過標準 |
+| M2 | 錄影與教師回看 MVP | chunk 上傳、FFmpeg、Teacher 回看、時間軸對齊 | 教師端可依統一時間線完整重播一場 session | ✅ | PR #2（完整性、補傳）、#6／#7（review grant）、#8（工作佇列、刪除、儲存） |
+| D1 | 雲端部署與安全 | Vercel 前端、Lightsail 後端、R2 儲存；Bearer 認證、端點權限、錄影完整性 | 部署設計 §18 第 1–8 步 | ✅（試行網域） | PR #1、#2、#6–#9；2026-10-27 首次部署；CI #22、Tailscale CD #24。第 9 步（試用期間量度 CPU／RAM）未見紀錄；正式上線前仍要自有網域（第 10 步） |
+| D2 | 營運管理功能 | 取代 shell 指令：建場次、派碼、補傳、監察錄影、管理員登入 | 部署設計 §17 | 🟡 | 已完成：OP 管理頁 #13、join code 重發 #14、review code 限速 #18、管理員登入 #20／#21、Wizard 開始／結束 #11／#12。未完成：建立案件及上傳影片、監控頁、直接重新開始的捷徑 |
+| M3 | CASE001 內容完整化 | 影片庫、決策樹、揭露規則、rubric 全部串接 | 無缺片；Wizard 2–3 次按鍵內選出任一情境回答 | 🟡 | 30 段影片（在 25–35 上限內）、F1–F8 三層決策樹、9 項 rubric 已有。缺：揭露規則未在伺服器執行、rubric 未有分級描述、按鍵效率未實測 |
+| M4 | 內部 Go/No-go 關卡 | 無真實學生的內部乾跑，全流程壓力測試 | 「M4 Go/No-go 門檻表」全部綠燈 | ⬜ 下一步 | 試行場次不等於 Go/No-go；門檻表各項未正式量度 |
+| M5 | Mini-pilot（真實學生） | 小規模真人測試，收集操作與計時數據 | 完成 spec 規劃的 mini-pilot（3–5 人，再 15–30 人次） | ⬜ | 需先通過 M4，並備妥研究倫理文件 |
+| M6 | Pilot 後迭代 | 依 M5 數據調整影片配額／fallback／rubric | 每個迭代項目對應具體 pilot 發現 | ⬜ | |
+| M7 | 多場次／教室規模化 | 多 session 並行、監控、審計完整 | 符合 ADR-0004 審計與保留規定，可支撐多班同時使用 | ⬜ | 現為單機（部署設計 D7） |
+| V2 | AI 協助（第二版） | 依 spec：ASR 初稿 → 意圖分類 → 推薦影片 → Wizard 確認 | 進入條件：至少 15–30 次完整 session 及 spec §十六列出的資料 | ⬜ | 不得早於 M5／M6 的數據 |
+| M8 | 正式上線／後續擴充 | 正式導入教學現場，規劃第二個案件 | 至少一次完整學期使用無重大事故 | ⬜ | |
 
-> 說明：M0–M7 每個里程碑對應一個開發 Phase；M8 是 Phase 7 完成後的持續運作狀態，本身不對應單一 Phase。
+> 說明：M0–M7 各對應一個 Phase；D1、D2 為部署軌；V2 與 M8 是 Phase 7 之後的持續階段。
+
+### 下一步的次序
+
+1. 處理試用回報（PR #27）及影響資料可靠性的缺口（老師評分保存、伺服器端揭露規則）。
+2. 執行 M4 Go/No-go（門檻表見第三節），同時準備研究倫理文件。
+3. 通過後進入 M5 mini-pilot；D2 餘下項目視乎營運需要並行。
+4. 正式上線（M8）前完成自有網域等 D1 第 10 步。
+
+詳細項目及優先次序見 [`docs/todo.md`](todo.md)。
 
 ## 二、各 Phase 目標、Agent 分工與驗收條件
+
+> 本節保留原定的分工與驗收條件；各 Phase 的實際狀態以第一節為準。D1、D2 的內容見 [`mindprobe-deploy-design.md`](../mindprobe-deploy-design.md) §18、§17。
 
 ### Phase 0（對應 M0）— Scaffold & Contract Lock
 
@@ -117,7 +155,7 @@
 2. **目錄限定（Directory Scoping）**：每個 Agent 只在自己負責的目錄（見第四節表格）內修改程式碼；需要修改其他 Agent 負責目錄的內容時，先在對應目錄下開 issue／PR 說明理由，交由該目錄的負責 Agent 或 Integration Agent 處理，不直接跨目錄改動。
 3. **任務驗收條件（Task Acceptance Criteria）**：每個任務／ticket 開工前必須寫清楚可驗證的驗收條件，並明確對應到 `docs/spec.md` 或某份 ADR 的具體段落（例如「依 ADR-0001 第 X 項」）；沒有可驗證條件的任務不得標記為完成。
 4. **Integration Agent**：由 DevOps/Integration Agent（角色 11）擔任固定的整合把關者，負責：合併各分支、執行跨模組整合測試、在 Contract 有分歧或 schema drift 時協調並回報 Docs/ADR Agent、在每個 Phase 結束前跑一次全流程穩定性測試。
-5. **分支命名（Branch Naming）**：統一格式 `agent/<角色代號>/<milestone>-<簡述>`，角色代號對應第四節表格（例如 `server-realtime`、`wizard-app`、`case-content`）。範例：`agent/server-realtime/m1-ws-reconnect`、`agent/wizard-app/m3-decision-tree-f7`、`agent/docs-adr/m6-spec-sync`。
+5. **分支與合併（Branch & Merge）**：實際做法是每批工作開 `agent/<簡述>` 分支（例如 `agent/op-login-form`），以 PR 合併到整合分支 `feat/m2`；每個 PR 先經 reviewer 審查（報告以 `STATUS: PASSED／FAILED` 結尾），由負責人決定 squash-merge。`main` 只在需要時由 `feat/m2` 同步（用 merge commit，不 squash）。**合併進 `feat/m2` 等於部署四個前端**；後端只經手動部署或手動觸發的 CD，順序為前端先行（或同時），並先處理仍開著的舊分頁。
 
 ## 六、執行次序圖
 
@@ -161,6 +199,8 @@ Phase 7  DevOps/Integration + Server/API ──▶  規模化準備（M7）
          （持續運作）                    ──▶  正式上線／擴充（M8）
 ```
 
+> 部署軌 D1（雲端部署與安全）在 Phase 2 期間並行完成；D2（營運管理功能）與 Phase 3、Phase 4 並行。V2 位於 Phase 6 之後，進入條件見第一節。
+
 ## 七、範圍界線表
 
 | 角色 | 可直接修改 | 需經 Integration Agent 會簽 | 絕對禁止 |
@@ -175,9 +215,9 @@ Phase 7  DevOps/Integration + Server/API ──▶  規模化準備（M7）
 | Teacher App Agent | `apps/teacher` | REST API 合約變更 | 直接讀取本地檔案系統繞過 REST API |
 | Case Content Agent | `cases/CASE001` | 影片總量配額調整（依修訂 1，25–35 段為硬性上限） | 引入未經審核的疑犯回答內容 |
 | QA/Test Agent | `server/tests`、e2e 腳本 | M1／M4 驗收標準的解讀有疑義時 | 在測試不通過時修改驗收條件本身 |
-| DevOps/Integration Agent | `docker-compose.yml`、CI 設定 | （本身即為會簽角色） | 跳過驗收條件直接合併到 `main` |
+| DevOps/Integration Agent | `docker-compose.yml`、CI 設定 | （本身即為會簽角色） | 跳過驗收條件直接合併到 `feat/m2` 或 `main` |
 | Docs/ADR Agent | `docs/` | 任何會改變已定案 ADR 內容的修訂 | 在未經拍板前把「提案中」狀態的 ADR 當作已定案寫入 spec.md |
 
 ---
 
-*最後更新：2026-07-22。本文件與 [`docs/adr/README.md`](adr/README.md) 的「實作優先順序」章節保持一致；如兩者有出入，以 ADR-0004 為準並回頭修訂本文件。*
+*最後更新：2026-11-27（加入目前進度、D1／D2 部署軌及 V2；原文 2026-07-22）。本文件與 [`docs/adr/README.md`](adr/README.md) 的「實作優先順序」章節保持一致；如兩者有出入，以 ADR-0004 為準並回頭修訂本文件。*

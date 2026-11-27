@@ -5,6 +5,8 @@
 > **範圍：Phase 1（部署和安全）**。Admin 管理頁面放在 Phase 2，見 §17。
 > **過渡 OP 頁**（2026-10-29）：完整 Admin 認證仍在 §17。在那之前，`apps/op` 用 operator token 呼叫 `GET /sessions`。分頁合約見 §5，部署檢查見 §12。這不改變 Phase 1 的範圍結論，也不是部署驗收。
 
+> **實作現況（2026-11-27 補記）**：本文件的「Phase 1」即 roadmap 的 **D1 雲端部署與安全**，「Phase 2」（§17）即 **D2 營運管理功能**，見 [`docs/roadmap.md`](docs/roadmap.md)。§18 第 1–8 步已完成並部署到試行環境（PR #1、#2、#6–#9，2026-10-27 首次部署）；第 9 步的試用期資源量度未見紀錄；第 10 步（自有網域）未做。§17 已完成：過渡 OP 頁（#13）、join code 重發（#14）、管理員登入（#20、#21，合約見 spec 修訂 12，取代「把 operator token 貼進瀏覽器」的做法；靜態 token 只留給 CLI）。§16 第 3 項（observer review code）、第 5 項（學生可見的 clip 欄位）已按 spec 修訂 11 及 `main.py` 的 `_STUDENT_CLIP_FIELDS` 處理。下文保留設計原文；§3 的「程式碼現況」是 v0.4 當時的狀況。
+
 ## 0. 已定案決定
 
 | # | 決定 |
