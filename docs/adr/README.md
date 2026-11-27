@@ -29,6 +29,8 @@
 3. **ADR-0002**（Fallback 機制）—— 依賴前兩者提供的連線狀態與時間戳，才能正確判斷斷線提示與計時暫停。
 4. **CASE001 端到端 M1 測試** —— 前三者整合後，在 CASE001 上驗證 [ADR-0004 定義的 M1 通過標準](0004-cross-cutting-rules.md)。
 
+以上四項已於 M1 完成（2026-09，見 [`server/tests/test_m1_e2e.py`](../../server/tests/test_m1_e2e.py)）；ADR-0005 的雲端部署亦已實作（部署軌 D1）。目前進度見 [`docs/roadmap.md`](../roadmap.md) 第零節。
+
 此順序與整體開發路線圖的 Phase 1 對齊，完整的里程碑、Phase 目標與 Agent 分工見 [`docs/roadmap.md`](../roadmap.md)。
 
 ## 原始意見存檔

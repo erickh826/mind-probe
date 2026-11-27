@@ -5,6 +5,8 @@
 > **範圍：Phase 1（部署和安全）**。Admin 管理頁面放在 Phase 2，見 §17。
 > **過渡 OP 頁**（2026-10-29）：完整 Admin 認證仍在 §17。在那之前，`apps/op` 用 operator token 呼叫 `GET /sessions`。分頁合約見 §5，部署檢查見 §12。這不改變 Phase 1 的範圍結論，也不是部署驗收。
 
+> **實作現況（2026-11-27 補記）**：本文件的「Phase 1」即 roadmap 的 **D1 雲端部署與安全**，「Phase 2」（§17）即 **D2 營運管理功能**，見 [`docs/roadmap.md`](docs/roadmap.md)。§18 第 1–6、8 步已完成並部署到試行環境（PR #1、#2、#6–#9，2026-10-27 首次部署）；第 7 步已部署，但完整演練（寬限期補傳、刪除、重啟恢復）未見完整紀錄；第 9 步的試用期資源量度未見紀錄；第 10 步（自有網域）未做。§17 已完成：過渡 OP 頁（#13）、join code 重發（#14）、管理員登入（#20、#21，合約見 spec 修訂 12，取代「把 operator token 貼進瀏覽器」的做法；靜態 token 只留給 CLI）。§16 第 3 項（observer review code）、第 5 項（學生可見的 clip 欄位）已按 spec 修訂 11 及 `main.py` 的 `_STUDENT_CLIP_FIELDS` 處理。下文保留設計原文；§3 的「程式碼現況」是 v0.4 當時的狀況。
+
 ## 0. 已定案決定
 
 | # | 決定 |
@@ -20,6 +22,7 @@
 | D9 | **finalize 的 30 秒門檻**：錄影停止，而且 finalize 已經存進 IndexedDB 時開始計時。佇列清空就立刻送出；否則最遲 30 秒送出。chunk 重試**不會重設計時**。這只是「送出 finalize」的門檻，不是上傳逾時，也不是放棄遲到 chunk 的期限（§6.7、§7.2）。 |
 | D10 | **瀏覽器 meta 保留 7 天**：已 ACK 的影片 blob 照原本規則刪除；`recording_meta` 從伺服器確認 `complete` 起保留 7 天。**未確認或 incomplete 的資料不會因為這個期限被自動清除**。瀏覽器紀錄只用於恢復，**伺服器才是準確的資料來源**（§6.7）。 |
 | D11 | **重新開始的流程（Phase 1）**：wizard **不能**建立 session，只有 OP 可以。收到中斷通知時，wizard 可以暫停；由 OP 建立新的 session 和新的 join code；舊 session 保留為 incomplete。直接重新開始的捷徑留到 Phase 2（§17）。 |
+| D12 | **情境 d 採 (a)**（2026-10-21）：Phase 1 保留目前憑證方式。重新整理／還原原分頁且憑證仍在時可以補傳；關閉後從新分頁開啟不保證有原憑證，即使 IndexedDB 還有片段也可能無法補傳。限制及 OP 判讀卡住錄影的步驟寫入操作手冊；補傳專用憑證 (b) 安排在 Review Grant 之後的 Phase 2，不採 (c) 擴大 live token 的長期保存。 |
 
 ## 1. 目標 / 非目標
 **目標**：前端放 Vercel Pro；FastAPI、WS 和 FFmpeg 放 Lightsail 香港（Docker Compose + Caddy）；錄影和案件影片放 R2，瀏覽器直接從 R2 下載；**每個端點都有明確的權限**；錄影完整性可以驗證；session 結束後 teacher 仍能審閱。
@@ -289,7 +292,8 @@ transcoding ──(失敗)──▶ transcode_failed（可重試）
 
 ### 7.5 重新整理和錄影中斷（P1-3）
 **Phase 1 規則：一個 session 只有一段 MediaRecorder 錄影。**
-- 頁面重新整理、瀏覽器當掉或分頁被關閉之後，student app **只補傳原本錄影中還在 IndexedDB 的 pending chunk**，以及 pending 的 finalize，**不會再呼叫 `MediaRecorder.start()` 開始新的錄影**。
+- 頁面重新整理或還原原分頁，且仍保有有效憑證時，student app **只補傳原本錄影中還在 IndexedDB 的 pending chunk**，以及 pending 的 finalize，**不會再呼叫 `MediaRecorder.start()` 開始新的錄影**。關閉分頁後憑證是否還原不能保證；沒有憑證時不會只憑 IndexedDB 的 blob 放行上傳。D12 是原決定；之後加入的 OP 短期補傳碼可恢復授權（PR #2，已合併）。
+- **情境 d 的操作**：仍應等「可以安全關閉」才關閉分頁。若正常 Stop 後最後 chunk 及 finalize 已持久化、但未傳完便關頁，可在同瀏覽器／profile／origin 重新發碼補傳；錄影中直接關頁仍是 recorder_lost。OP 不應等待即時告警，應比對 session.ended_at、recording/finalize 狀態與兩次片段進度，依[錄影操作手冊](docs/recording-operations.md)處理。沒有 ended_at 時，600 秒上傳寬限期尚未開始。
 - 理由：W3C MediaStream Recording 規範只保證**同一次錄影**（同一個 MediaRecorder 從 start 到 stop）產生的 blob 依序串接後可以播放；新的 recorder 會產生新的檔頭和時間軸，接在後面的話，合併出來的 webm 可能無法播放，或者時間錯亂。
 - 如果原本的錄影已經遺失（`recording_meta.recorder_state` 是 `recording`，但頁面已經重新載入，recorder 不存在）：
   1. 前端把 `recorder_state` 設為 `lost`，並把**目前已經擁有的最後一段序號**（`next_sequence-1`）當作 `final_sequence`，送出 finalize，加上 `reason: "recorder_lost"`。
@@ -371,6 +375,7 @@ R2 CORS 只允許 GET 和 HEAD，`AllowedHeaders: Range`，並 expose `Content-R
 | `MINDPROBE_OPERATOR_TOKEN` | 長隨機字串 |
 | `MINDPROBE_REVIEW_ACCESS_TTL` / `MINDPROBE_REVIEW_REFRESH_TTL` | `1800` / `604800` |
 | `MINDPROBE_UPLOAD_GRACE_SECONDS` | `600` |
+| `MINDPROBE_UPLOAD_GRACE_SYNTHESIZE_AFTER` | 既有資料庫預設留空；全新資料庫可明確設 `fresh`，或使用實際部署 cutover 的 UTC instant。見[部署手冊](docs/deployment-readiness.md#recording-grace-on-an-existing-database)；不是寫死在原始碼的日期 |
 | `MINDPROBE_CORS_ORIGINS` | student、wizard、teacher 的 `https://<app>.vercel.app`；部署 `apps/op` 時加上該頁的 origin（§6.3、§12） |
 | `MINDPROBE_STORAGE_BACKEND` | `s3` |
 | `MINDPROBE_S3_ENDPOINT` / `_REGION` / `_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` | R2：`https://<acct>.r2.cloudflarestorage.com`、`auto` |
